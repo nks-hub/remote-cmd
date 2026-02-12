@@ -1,0 +1,27 @@
+# Build output
+bin/
+obj/
+publish/
+
+# Node
+node_modules/
+package-lock.json
+
+# IDE
+.vs/
+.idea/
+*.user
+*.suo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Local configs
+appsettings.Development.json
+cmd.json
+
+# Editor/IDE local configs
+.[a-z]*/
+!.git/
+!.github/
