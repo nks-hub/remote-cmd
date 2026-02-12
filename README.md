@@ -75,7 +75,7 @@ Add to your `.mcp.json` or Claude Code MCP settings:
       "command": "node",
       "args": ["<path-to>/mcp-server/index.mjs"],
       "env": {
-        "REMOTECMD_URL": "http://localhost:7890",
+        "REMOTECMD_URL": "https://localhost:7890",
         "REMOTECMD_TOKEN": "<TOKEN>"
       }
     }
@@ -223,6 +223,36 @@ netsh advfirewall firewall add rule name="RemoteCmd" dir=in action=allow protoco
   comment="RemoteCmd relay"
 ```
 
+## Security
+
+### Encryption Layers
+
+| Layer | Technology | Scope |
+|-------|-----------|-------|
+| **Transport** | TLS 1.2+ (self-signed certificate) | Server ↔ Client HTTPS |
+| **Payload** | AES-256-GCM | All commands, results, file data, metadata |
+| **Authentication** | Token-based | All API endpoints |
+
+### How it works
+
+1. **TLS**: Server auto-generates a self-signed X.509 certificate (RSA 2048, SHA256, valid 5 years). Client accepts self-signed certs.
+2. **AES-256-GCM**: Encryption key is derived from the shared token via `SHA256("RemoteCmd:v1:" + token)`. Every payload uses a random 12-byte nonce. GCM provides both confidentiality and integrity (16-byte auth tag).
+3. **What's encrypted**: Commands, command results, file transfer metadata (paths, sizes), file data. Status and auth endpoints use plaintext (no sensitive data).
+
+### Disabling TLS
+
+Use `--no-tls` flag on server for HTTP-only mode (AES payload encryption still active):
+
+```bash
+dotnet run --project RemoteCmd.Server -- myToken --no-tls
+```
+
+Client connects via HTTP when server URL starts with `http://`:
+
+```bash
+RemoteCmd.Client.exe http://192.168.1.100:7890 myToken
+```
+
 ## Technical Details
 
 | Parameter | Value |
@@ -235,6 +265,8 @@ netsh advfirewall firewall add rule name="RemoteCmd" dir=in action=allow protoco
 | Auto-reconnect | Exponential backoff (1s to 30s) |
 | Concurrency | Single command at a time (SemaphoreSlim) |
 | Shell | `powershell.exe -NoProfile -NonInteractive` |
+| Transport encryption | TLS 1.2+ (self-signed, auto-generated) |
+| Payload encryption | AES-256-GCM (key derived from token) |
 | Authentication | Token-based (query param or header) |
 | Client detection | Connected if last poll < 10 seconds ago |
 
@@ -250,10 +282,12 @@ netsh advfirewall firewall add rule name="RemoteCmd" dir=in action=allow protoco
 
 ```
 RemoteCmd.sln
-├── RemoteCmd.Server/        # HTTP relay server (.NET 9.0)
-│   └── Program.cs
+├── RemoteCmd.Server/        # HTTPS relay server (.NET 9.0)
+│   ├── Program.cs
+│   └── Crypto.cs            # AES-256-GCM encryption
 ├── RemoteCmd.Client/        # Target machine client (.NET 9.0)
-│   └── Program.cs
+│   ├── Program.cs
+│   └── Crypto.cs            # AES-256-GCM encryption
 ├── mcp-server/              # MCP bridge (Node.js)
 │   ├── index.mjs
 │   └── package.json

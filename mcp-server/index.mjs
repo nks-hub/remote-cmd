@@ -5,11 +5,17 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import http from "http";
+import https from "https";
 import fs from "fs";
 import path from "path";
 
-const SERVER_URL = process.env.REMOTECMD_URL || "http://localhost:7890";
-const TOKEN = process.env.REMOTECMD_TOKEN || "heslo123";
+const SERVER_URL = process.env.REMOTECMD_URL || "https://localhost:7890";
+const TOKEN = process.env.REMOTECMD_TOKEN || "";
+const isHttps = SERVER_URL.startsWith("https");
+const transport_module = isHttps ? https : http;
+
+// Accept self-signed certificates
+if (isHttps) process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
 function apiCall(method, endpoint, body = null, isBinary = false) {
   return new Promise((resolve, reject) => {
@@ -28,7 +34,7 @@ function apiCall(method, endpoint, body = null, isBinary = false) {
       options.headers = { "Content-Type": "application/json" };
     }
 
-    const req = http.request(options, (res) => {
+    const req = transport_module.request(options, (res) => {
       const chunks = [];
       res.on("data", (chunk) => chunks.push(chunk));
       res.on("end", () => {
@@ -77,7 +83,7 @@ function uploadFile(localPath, remotePath) {
       },
     };
 
-    const req = http.request(options, (res) => {
+    const req = transport_module.request(options, (res) => {
       const chunks = [];
       res.on("data", (chunk) => chunks.push(chunk));
       res.on("end", () => {
@@ -114,7 +120,7 @@ function downloadFile(remotePath, localPath) {
       timeout: 300000,
     };
 
-    const req = http.request(options, (res) => {
+    const req = transport_module.request(options, (res) => {
       const chunks = [];
       res.on("data", (chunk) => chunks.push(chunk));
       res.on("end", () => {

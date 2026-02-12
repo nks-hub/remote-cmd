@@ -1,12 +1,43 @@
-using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 var builder = WebApplication.CreateBuilder(args);
-builder.WebHost.UseUrls("http://0.0.0.0:7890");
 builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 200_000_000); // 200MB
+
+// Parse arguments: <token> [--no-tls]
+var token = args.Length > 0 && !args[0].StartsWith("-") ? args[0] : Guid.NewGuid().ToString("N")[..12];
+var noTls = args.Contains("--no-tls");
+
+if (noTls)
+{
+    builder.WebHost.UseUrls("http://0.0.0.0:7890");
+}
+else
+{
+    // Generate self-signed certificate for HTTPS
+    var cert = GenerateSelfSignedCert();
+    var certPath = Path.Combine(AppContext.BaseDirectory, "remotecmd.pfx");
+    var certPassword = Guid.NewGuid().ToString("N")[..16];
+    File.WriteAllBytes(certPath, cert.Export(X509ContentType.Pfx, certPassword));
+
+    builder.WebHost.UseUrls("https://0.0.0.0:7890");
+    builder.WebHost.ConfigureKestrel(o =>
+    {
+        o.Limits.MaxRequestBodySize = 200_000_000;
+        o.ConfigureHttpsDefaults(https =>
+        {
+            https.ServerCertificate = new X509Certificate2(certPath, certPassword);
+        });
+    });
+}
 
 var app = builder.Build();
 
-var token = args.Length > 0 ? args[0] : Guid.NewGuid().ToString("N")[..12];
+// Initialize AES-256-GCM encryption from token
+Crypto.Init(token);
 
 string? pendingCommand = null;
 TaskCompletionSource<CommandResult>? resultTcs = null;
@@ -19,21 +50,21 @@ TaskCompletionSource<bool>? uploadTcs = null;
 FileTransfer? pendingDownload = null;
 TaskCompletionSource<FileTransfer>? downloadTcs = null;
 
+var protocol = noTls ? "http" : "https";
 Console.WriteLine("=== Remote CMD Relay Server ===");
-Console.WriteLine($"Listening on: http://0.0.0.0:7890");
+Console.WriteLine($"Listening on: {protocol}://0.0.0.0:7890");
 Console.WriteLine($"Token: {token}");
+Console.WriteLine($"TLS: {(noTls ? "disabled" : "enabled (self-signed)")}");
+Console.WriteLine($"Encryption: AES-256-GCM (always on)");
 Console.WriteLine();
 Console.WriteLine("Client setup (run on target machine):");
 Console.WriteLine($"  RemoteCmd.Client.exe <THIS_SERVER_IP> {token}");
 Console.WriteLine();
-Console.WriteLine("Commands:");
-Console.WriteLine($"  curl -X POST http://localhost:7890/api/exec?token={token} -H \"Content-Type: application/json\" -d \"{{\\\"command\\\":\\\"hostname\\\"}}\"");
-Console.WriteLine();
-Console.WriteLine("File transfer:");
-Console.WriteLine($"  curl -X POST \"http://localhost:7890/api/upload?token={token}&path=C:\\dest\\file.zip\" --data-binary @local.zip");
-Console.WriteLine($"  curl -o local.zip \"http://localhost:7890/api/download?token={token}&path=C:\\remote\\file.zip\"");
+Console.WriteLine("API (local controller):");
+Console.WriteLine($"  curl -X POST {protocol}://localhost:7890/api/exec?token={token} -H \"Content-Type: application/json\" -d \"{{\\\"command\\\":\\\"hostname\\\"}}\"");
 Console.WriteLine();
 
+// Auth middleware - token required for /api/ endpoints
 app.Use(async (context, next) =>
 {
     var path = context.Request.Path.Value ?? "";
@@ -51,7 +82,7 @@ app.Use(async (context, next) =>
     await next();
 });
 
-// === Command execution ===
+// === Command execution (client-facing: encrypted) ===
 
 app.MapGet("/api/poll", () =>
 {
@@ -60,18 +91,25 @@ app.MapGet("/api/poll", () =>
     {
         var cmd = pendingCommand;
         pendingCommand = null;
-        return Results.Ok(new { command = cmd });
+        // Encrypt command for client
+        return Results.Ok(new { command = Crypto.EncryptString(cmd) });
     }
     return Results.Ok(new { command = (string?)null });
 });
 
 app.MapPost("/api/result", async (HttpRequest req) =>
 {
-    var result = await req.ReadFromJsonAsync<CommandResult>();
+    // Client sends AES-encrypted result bytes
+    using var ms = new MemoryStream();
+    await req.Body.CopyToAsync(ms);
+    var decryptedBytes = Crypto.Decrypt(ms.ToArray());
+    var result = JsonSerializer.Deserialize<CommandResult>(decryptedBytes, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
     if (result != null && resultTcs != null)
         resultTcs.TrySetResult(result);
     return Results.Ok();
 });
+
+// === Command execution (controller-facing: plaintext, localhost) ===
 
 app.MapPost("/api/exec", async (HttpRequest req) =>
 {
@@ -112,7 +150,7 @@ app.MapPost("/api/exec", async (HttpRequest req) =>
     }
 });
 
-// === File transfer: Upload (local → remote) ===
+// === File transfer: Upload (local → remote, encrypted) ===
 
 app.MapPost("/api/upload", async (HttpRequest req) =>
 {
@@ -146,31 +184,34 @@ app.MapPost("/api/upload", async (HttpRequest req) =>
     }
 });
 
-// Client polls for pending upload
+// Client polls for pending file transfers (encrypted metadata)
 app.MapGet("/api/file-poll", () =>
 {
     lastClientPoll = DateTime.UtcNow;
 
     if (pendingUpload != null)
-        return Results.Ok(new { action = "upload", path = pendingUpload.Path, size = pendingUpload.Data!.Length });
+    {
+        var meta = JsonSerializer.Serialize(new { action = "upload", path = pendingUpload.Path, size = pendingUpload.Data!.Length });
+        return Results.Ok(new { e = Crypto.EncryptString(meta) });
+    }
 
     if (downloadTcs != null)
     {
-        var path = pendingDownload?.Path;
-        return Results.Ok(new { action = "download", path, size = 0 });
+        var meta = JsonSerializer.Serialize(new { action = "download", path = pendingDownload?.Path ?? "", size = 0 });
+        return Results.Ok(new { e = Crypto.EncryptString(meta) });
     }
 
-    return Results.Ok(new { action = (string?)null, path = (string?)null, size = 0 });
+    return Results.Ok(new { e = (string?)null });
 });
 
-// Client downloads file data for upload-to-remote
+// Client downloads file data for upload-to-remote (encrypted bytes)
 app.MapGet("/api/file-data", () =>
 {
     if (pendingUpload?.Data == null)
         return Results.NotFound();
 
-    var data = pendingUpload.Data;
-    return Results.File(data, "application/octet-stream");
+    var encrypted = Crypto.Encrypt(pendingUpload.Data);
+    return Results.File(encrypted, "application/octet-stream");
 });
 
 // Client confirms upload complete
@@ -181,7 +222,7 @@ app.MapPost("/api/file-done", () =>
     return Results.Ok();
 });
 
-// === File transfer: Download (remote → local) ===
+// === File transfer: Download (remote → local, encrypted) ===
 
 app.MapGet("/api/download", async (HttpRequest req) =>
 {
@@ -214,7 +255,7 @@ app.MapGet("/api/download", async (HttpRequest req) =>
     }
 });
 
-// Client uploads file data for download-from-remote
+// Client uploads file data for download-from-remote (encrypted bytes)
 app.MapPost("/api/file-upload", async (HttpRequest req) =>
 {
     var error = req.Query["error"].FirstOrDefault();
@@ -228,13 +269,15 @@ app.MapPost("/api/file-upload", async (HttpRequest req) =>
 
     using var ms = new MemoryStream();
     await req.Body.CopyToAsync(ms);
-    downloadTcs?.TrySetResult(new FileTransfer { Data = ms.ToArray() });
+    // Decrypt file data from client
+    var decrypted = Crypto.Decrypt(ms.ToArray());
+    downloadTcs?.TrySetResult(new FileTransfer { Data = decrypted });
     pendingDownload = null;
     downloadTcs = null;
     return Results.Ok();
 });
 
-// === Status ===
+// === Status (plaintext) ===
 
 app.MapGet("/api/status", () =>
 {
@@ -243,12 +286,15 @@ app.MapGet("/api/status", () =>
     {
         clientConnected = connected,
         lastPoll = lastClientPoll,
-        secondsAgo = connected ? (int)(DateTime.UtcNow - lastClientPoll).TotalSeconds : -1
+        secondsAgo = connected ? (int)(DateTime.UtcNow - lastClientPoll).TotalSeconds : -1,
+        encryption = "AES-256-GCM",
+        tls = !noTls
     });
 });
 
 app.MapGet("/", () => Results.Text(
-    "Remote CMD Relay Server\n" +
+    "Remote CMD Relay Server v1.0.0\n" +
+    $"Encryption: AES-256-GCM | TLS: {(noTls ? "off" : "self-signed")}\n\n" +
     "GET  /api/status                    - Check client\n" +
     "POST /api/exec                      - Run command {\"command\":\"...\", \"timeoutSeconds\":30}\n" +
     "POST /api/upload?path=C:\\dest\\f.zip  - Upload file to remote (--data-binary @local.zip)\n" +
@@ -256,6 +302,39 @@ app.MapGet("/", () => Results.Text(
     "All endpoints need ?token=<TOKEN>", "text/plain"));
 
 app.Run();
+
+// === Self-signed certificate generation ===
+
+static X509Certificate2 GenerateSelfSignedCert()
+{
+    using var rsa = RSA.Create(2048);
+    var request = new CertificateRequest(
+        "CN=RemoteCmd, O=NKS Hub",
+        rsa,
+        HashAlgorithmName.SHA256,
+        RSASignaturePadding.Pkcs1);
+
+    request.CertificateExtensions.Add(
+        new X509BasicConstraintsExtension(false, false, 0, false));
+    request.CertificateExtensions.Add(
+        new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature, false));
+
+    // SAN: localhost + wildcard IPs
+    var sanBuilder = new SubjectAlternativeNameBuilder();
+    sanBuilder.AddDnsName("localhost");
+    sanBuilder.AddDnsName("*");
+    sanBuilder.AddIpAddress(System.Net.IPAddress.Loopback);
+    sanBuilder.AddIpAddress(System.Net.IPAddress.IPv6Loopback);
+    request.CertificateExtensions.Add(sanBuilder.Build());
+
+    var cert = request.CreateSelfSigned(
+        DateTimeOffset.UtcNow.AddDays(-1),
+        DateTimeOffset.UtcNow.AddYears(5));
+
+    return cert;
+}
+
+// === Models ===
 
 record CommandRequest(string Command, int TimeoutSeconds = 30);
 
