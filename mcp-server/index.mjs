@@ -14,13 +14,40 @@ const TOKEN = process.env.REMOTECMD_TOKEN || "";
 const isHttps = SERVER_URL.startsWith("https");
 const transport_module = isHttps ? https : http;
 
-// Accept self-signed certificates
-if (isHttps) process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+/** Build per-request TLS agent - avoids global NODE_TLS_REJECT_UNAUTHORIZED override */
+function buildAgent() {
+  if (!isHttps) return undefined;
+
+  const caCertPath = process.env.REMOTECMD_CA_CERT;
+  if (caCertPath) {
+    const ca = fs.readFileSync(caCertPath);
+    return new https.Agent({ ca });
+  }
+
+  // Self-signed relay server: disable rejection only for this agent
+  return new https.Agent({ rejectUnauthorized: false });
+}
+
+const tlsAgent = buildAgent();
+
+/** Validate remote path - reject relative and UNC paths */
+function validateRemotePath(p) {
+  if (!p || typeof p !== "string") throw new Error("Path must be a non-empty string");
+  const trimmed = p.trim();
+  if (trimmed.startsWith("..") || trimmed.includes("/../") || trimmed.includes("\\..\\"))
+    throw new Error("Relative paths are not allowed");
+  if (trimmed.startsWith("\\\\") || trimmed.startsWith("//"))
+    throw new Error("UNC paths are not allowed");
+  return trimmed;
+}
 
 function apiCall(method, endpoint, body = null, isBinary = false) {
   return new Promise((resolve, reject) => {
     const url = new URL(endpoint, SERVER_URL);
-    url.searchParams.set("token", TOKEN);
+
+    const baseHeaders = {
+      Authorization: `Bearer ${TOKEN}`,
+    };
 
     const options = {
       hostname: url.hostname,
@@ -28,10 +55,12 @@ function apiCall(method, endpoint, body = null, isBinary = false) {
       path: url.pathname + url.search,
       method,
       timeout: 300000,
+      agent: tlsAgent,
+      headers: baseHeaders,
     };
 
     if (body && !isBinary) {
-      options.headers = { "Content-Type": "application/json" };
+      options.headers["Content-Type"] = "application/json";
     }
 
     const req = transport_module.request(options, (res) => {
@@ -68,7 +97,6 @@ function uploadFile(localPath, remotePath) {
   return new Promise((resolve, reject) => {
     const fileData = fs.readFileSync(localPath);
     const url = new URL("/api/upload", SERVER_URL);
-    url.searchParams.set("token", TOKEN);
     url.searchParams.set("path", remotePath);
 
     const options = {
@@ -77,7 +105,9 @@ function uploadFile(localPath, remotePath) {
       path: url.pathname + url.search,
       method: "POST",
       timeout: 300000,
+      agent: tlsAgent,
       headers: {
+        Authorization: `Bearer ${TOKEN}`,
         "Content-Type": "application/octet-stream",
         "Content-Length": fileData.length,
       },
@@ -109,7 +139,6 @@ function uploadFile(localPath, remotePath) {
 function downloadFile(remotePath, localPath) {
   return new Promise((resolve, reject) => {
     const url = new URL("/api/download", SERVER_URL);
-    url.searchParams.set("token", TOKEN);
     url.searchParams.set("path", remotePath);
 
     const options = {
@@ -118,6 +147,10 @@ function downloadFile(remotePath, localPath) {
       path: url.pathname + url.search,
       method: "GET",
       timeout: 300000,
+      agent: tlsAgent,
+      headers: {
+        Authorization: `Bearer ${TOKEN}`,
+      },
     };
 
     const req = transport_module.request(options, (res) => {
@@ -234,9 +267,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case "remote_exec": {
+        const command = (args.command ?? "").trim();
+        if (!command) {
+          return {
+            content: [{ type: "text", text: "Error: command must not be empty" }],
+            isError: true,
+          };
+        }
+        if (command.length > 8192) {
+          return {
+            content: [{ type: "text", text: "Error: command exceeds maximum length of 8192 characters" }],
+            isError: true,
+          };
+        }
+
+        const timeout = Math.min(300, Math.max(1, args.timeoutSeconds || 30));
+
         const result = await apiCall("POST", "/api/exec", {
-          command: args.command,
-          timeoutSeconds: args.timeoutSeconds || 30,
+          command,
+          timeoutSeconds: timeout,
         });
         return {
           content: [
@@ -261,6 +310,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "remote_upload": {
+        validateRemotePath(args.remotePath);
+
         if (!fs.existsSync(args.localPath)) {
           return {
             content: [
@@ -278,13 +329,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: "text",
-              text: `Uploaded ${(stat.size / 1024 / 1024).toFixed(1)}MB: ${args.localPath} → ${args.remotePath}\n${JSON.stringify(result, null, 2)}`,
+              text: `Uploaded ${(stat.size / 1024 / 1024).toFixed(1)}MB: ${args.localPath} -> ${args.remotePath}\n${JSON.stringify(result, null, 2)}`,
             },
           ],
         };
       }
 
       case "remote_download": {
+        validateRemotePath(args.remotePath);
+
         const result = await downloadFile(args.remotePath, args.localPath);
         if (result.error) {
           return {
@@ -296,7 +349,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: "text",
-              text: `Downloaded ${(result.size / 1024 / 1024).toFixed(1)}MB: ${args.remotePath} → ${args.localPath}`,
+              text: `Downloaded ${(result.size / 1024 / 1024).toFixed(1)}MB: ${args.remotePath} -> ${args.localPath}`,
             },
           ],
         };
