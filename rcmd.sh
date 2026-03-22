@@ -1,11 +1,8 @@
 #!/bin/bash
-# RemoteCmd helper - usage: rcmd.sh "powershell command" [timeout]
-TOKEN="***REMOVED***"
-URL="http://localhost:7890"
+TOKEN="${REMOTECMD_TOKEN:?Error: REMOTECMD_TOKEN environment variable is not set}"
+URL="${REMOTECMD_URL:-http://localhost:7890}"
 TIMEOUT="${2:-30}"
-
-# Write command to temp json file to avoid escaping issues
-TMPFILE=$(mktemp /tmp/rcmd.XXXXXX.json)
-python3 -c "import json,sys; json.dump({'command':sys.argv[1],'timeoutSeconds':int(sys.argv[2])},open(sys.argv[3],'w'))" "$1" "$TIMEOUT" "$TMPFILE"
-curl -s -X POST "$URL/api/exec?token=$TOKEN" -H "Content-Type: application/json" -d @"$TMPFILE"
-rm -f "$TMPFILE"
+curl -s -X POST "$URL/api/exec" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $TOKEN" \
+    -d "{\"command\":\"$1\",\"timeoutSeconds\":$TIMEOUT}"
