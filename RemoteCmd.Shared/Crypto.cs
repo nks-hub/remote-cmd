@@ -3,23 +3,32 @@ using System.Text;
 
 public static class Crypto
 {
+    private const int MinTokenLength = 24;
+    private const string HkdfInfo = "RemoteCmd:v2:aes-gcm-key";
+
     private static byte[]? _key;
 
     /// <summary>
-    /// Derives AES-256 key from shared token using SHA256.
+    /// Derives AES-256 key from shared token using HKDF (RFC 5869).
+    /// Token must be at least 24 characters.
     /// </summary>
     public static void Init(string token)
     {
-        if (_key is null && token is null) throw new ArgumentNullException(nameof(token));
-        _key = SHA256.HashData(Encoding.UTF8.GetBytes("RemoteCmd:v1:" + token));
+        if (token.Length < MinTokenLength)
+            throw new ArgumentException($"Token must be at least {MinTokenLength} characters.", nameof(token));
+
+        var ikm = Encoding.UTF8.GetBytes(token);
+        var prk = HKDF.Extract(HashAlgorithmName.SHA256, ikm);
+        _key = HKDF.Expand(HashAlgorithmName.SHA256, prk, 32, Encoding.UTF8.GetBytes(HkdfInfo));
     }
 
     public static byte[] Encrypt(byte[] data)
     {
         if (_key is null) throw new InvalidOperationException("Crypto.Init() must be called before Encrypt.");
 
-        var nonce = new byte[12];
+        Span<byte> nonce = stackalloc byte[12];
         RandomNumberGenerator.Fill(nonce);
+
         var ciphertext = new byte[data.Length];
         var tag = new byte[16];
 
@@ -28,9 +37,9 @@ public static class Crypto
 
         // Format: nonce(12) + tag(16) + ciphertext(N)
         var result = new byte[28 + ciphertext.Length];
-        Buffer.BlockCopy(nonce, 0, result, 0, 12);
-        Buffer.BlockCopy(tag, 0, result, 12, 16);
-        Buffer.BlockCopy(ciphertext, 0, result, 28, ciphertext.Length);
+        nonce.CopyTo(result.AsSpan(0, 12));
+        tag.AsSpan().CopyTo(result.AsSpan(12, 16));
+        ciphertext.AsSpan().CopyTo(result.AsSpan(28));
         return result;
     }
 
@@ -39,13 +48,10 @@ public static class Crypto
         if (_key is null) throw new InvalidOperationException("Crypto.Init() must be called before Decrypt.");
         if (data.Length < 28) throw new CryptographicException("Invalid encrypted data");
 
-        var nonce = new byte[12];
-        var tag = new byte[16];
-        var ciphertext = new byte[data.Length - 28];
-
-        Buffer.BlockCopy(data, 0, nonce, 0, 12);
-        Buffer.BlockCopy(data, 12, tag, 0, 16);
-        Buffer.BlockCopy(data, 28, ciphertext, 0, ciphertext.Length);
+        var span = data.AsSpan();
+        var nonce = span[..12];
+        var tag = span[12..28];
+        var ciphertext = span[28..];
 
         var plaintext = new byte[ciphertext.Length];
         using var aes = new AesGcm(_key, 16);
