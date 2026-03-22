@@ -1,20 +1,23 @@
 using System.Security.Cryptography;
 using System.Text;
 
-static class Crypto
+public static class Crypto
 {
-    private static byte[] _key = null!;
+    private static byte[]? _key;
 
     /// <summary>
-    /// Derive AES-256 key from shared token using SHA256
+    /// Derives AES-256 key from shared token using SHA256.
     /// </summary>
     public static void Init(string token)
     {
+        if (_key is null && token is null) throw new ArgumentNullException(nameof(token));
         _key = SHA256.HashData(Encoding.UTF8.GetBytes("RemoteCmd:v1:" + token));
     }
 
     public static byte[] Encrypt(byte[] data)
     {
+        if (_key is null) throw new InvalidOperationException("Crypto.Init() must be called before Encrypt.");
+
         var nonce = new byte[12];
         RandomNumberGenerator.Fill(nonce);
         var ciphertext = new byte[data.Length];
@@ -33,6 +36,7 @@ static class Crypto
 
     public static byte[] Decrypt(byte[] data)
     {
+        if (_key is null) throw new InvalidOperationException("Crypto.Init() must be called before Decrypt.");
         if (data.Length < 28) throw new CryptographicException("Invalid encrypted data");
 
         var nonce = new byte[12];
