@@ -1,0 +1,11 @@
+{
+    "mode": "denylist",
+    "allowedPatterns": [],
+    "deniedPatterns": [
+        "Invoke-WebRequest", "Invoke-RestMethod", "Start-Process",
+        "-EncodedCommand", "net user", "Add-LocalGroupMember",
+        "Set-ExecutionPolicy", "New-Service"
+    ],
+    "allowedPaths": [],
+    "maxCommandLength": 4096
+}

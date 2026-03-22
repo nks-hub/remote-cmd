@@ -1,24 +1,24 @@
 [![GitHub Stars](https://img.shields.io/github/stars/nks-hub/remote-cmd?style=flat)](https://github.com/nks-hub/remote-cmd)
 [![.NET](https://img.shields.io/badge/.NET-9.0-512BD4)](https://dotnet.microsoft.com/)
 
-# RemoteCmd v1.0.0
+# RemoteCmd v2.0.0
 
 Remote command execution relay for AI agents. Execute PowerShell commands and transfer files on remote machines through NAT/firewalls via HTTP polling.
 
 ## Architecture
 
 ```
-┌─────────────────────┐     ┌──────────────────────┐     ┌─────────────────────┐
-│   MCP Client        │     │   Relay Server       │     │   Target Machine    │
-│   (Claude Code)     │     │   (.NET 9.0)         │     │   (.NET 9.0)        │
-│                     │     │                      │     │                     │
-│  ┌───────────────┐  │     │  HTTP API :7890       │     │  ┌───────────────┐  │
-│  │ MCP Server    │──┼─────┼─> /api/exec          │     │  │ Client        │  │
-│  │ (Node.js)     │  │     │   /api/upload        │◄────┼──│ (polling)     │  │
-│  │ stdio         │  │     │   /api/download      │     │  │               │  │
-│  └───────────────┘  │     │   /api/status        │     │  │ PowerShell    │  │
-│                     │     │                      │     │  │ execution     │  │
-└─────────────────────┘     └──────────────────────┘     └─────────────────────┘
++---------------------+     +----------------------+     +---------------------+
+|   MCP Client        |     |   Relay Server       |     |   Target Machine    |
+|   (Claude Code)     |     |   (.NET 9.0)         |     |   (.NET 9.0)        |
+|                     |     |                      |     |                     |
+|  +---------------+  |     |  HTTP API :7890       |     |  +---------------+  |
+|  | MCP Server    |--+-----+-> /api/exec          |     |  | Client        |  |
+|  | (Node.js)     |  |     |   /api/upload        |<----+--| (polling)     |  |
+|  | stdio         |  |     |   /api/download      |     |  |               |  |
+|  +---------------+  |     |   /api/status        |     |  | PowerShell    |  |
+|                     |     |                      |     |  | execution     |  |
++---------------------+     +----------------------+     +---------------------+
 ```
 
 ### Components
@@ -48,9 +48,15 @@ dotnet run --project RemoteCmd.Server -- <TOKEN>
 
 # Example:
 dotnet run --project RemoteCmd.Server -- mySecretToken
+
+# With custom bind address:
+dotnet run --project RemoteCmd.Server -- mySecretToken --bind http://0.0.0.0:7890
+
+# Show token hash on startup (for verification):
+dotnet run --project RemoteCmd.Server -- mySecretToken --show-token
 ```
 
-Server listens on `http://0.0.0.0:7890`. Token is used for authentication on all API endpoints.
+Server listens on `http://0.0.0.0:7890` by default. Token is required for all API endpoints via `Authorization: Bearer <TOKEN>` header.
 
 ### 2. Start Client on Target Machine
 
@@ -64,6 +70,9 @@ dotnet publish RemoteCmd.Client -c Release -r win-x64 --self-contained \
 
 # Then copy and run on target:
 RemoteCmd.Client.exe <SERVER_IP> <TOKEN>
+
+# With certificate pinning (recommended for HTTPS):
+RemoteCmd.Client.exe <SERVER_IP> <TOKEN> --cert-pin <SHA256_THUMBPRINT>
 ```
 
 ### 3. Configure MCP for Claude Code
@@ -90,20 +99,77 @@ Add to your `.mcp.json` or Claude Code MCP settings:
 
 ```bash
 # Execute command
-curl -X POST "http://localhost:7890/api/exec?token=<TOKEN>" \
+curl -X POST "http://localhost:7890/api/exec" \
+  -H "Authorization: Bearer <TOKEN>" \
   -H "Content-Type: application/json" \
   -d '{"command":"hostname","timeoutSeconds":30}'
 
 # Upload file to remote
-curl -X POST "http://localhost:7890/api/upload?token=<TOKEN>&path=C:\dest\file.zip" \
+curl -X POST "http://localhost:7890/api/upload?path=C:\dest\file.zip" \
+  -H "Authorization: Bearer <TOKEN>" \
   --data-binary @local.zip
 
 # Download file from remote
-curl -o local.zip "http://localhost:7890/api/download?token=<TOKEN>&path=C:\remote\file.zip"
+curl -o local.zip "http://localhost:7890/api/download?path=C:\remote\file.zip" \
+  -H "Authorization: Bearer <TOKEN>"
 
 # Check client status
-curl "http://localhost:7890/api/status?token=<TOKEN>"
+curl "http://localhost:7890/api/status" \
+  -H "Authorization: Bearer <TOKEN>"
 ```
+
+## Environment Variables
+
+### MCP Server (Node.js)
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `REMOTECMD_TOKEN` | Yes | - | Authentication token (Bearer) |
+| `REMOTECMD_URL` | No | `https://localhost:7890` | Relay server URL |
+| `REMOTECMD_CA_CERT` | No | - | Path to custom CA certificate file (.pem/.crt) for HTTPS verification |
+
+When `REMOTECMD_CA_CERT` is set, the MCP server validates the relay server's TLS certificate against that CA. Without it, the server accepts self-signed certificates (scoped to the relay agent only - does not affect global Node.js TLS).
+
+### rcmd.sh
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `REMOTECMD_TOKEN` | Yes | - | Authentication token |
+| `REMOTECMD_URL` | No | `http://localhost:7890` | Relay server URL |
+
+## Command Policy (commandpolicy.json)
+
+The client enforces a command policy loaded from `commandpolicy.json` in the working directory. Copy the example to get started:
+
+```bash
+cp RemoteCmd.Client/commandpolicy.json.example commandpolicy.json
+```
+
+**Example configuration:**
+
+```json
+{
+    "mode": "denylist",
+    "allowedPatterns": [],
+    "deniedPatterns": [
+        "Invoke-WebRequest", "Invoke-RestMethod", "Start-Process",
+        "-EncodedCommand", "net user", "Add-LocalGroupMember",
+        "Set-ExecutionPolicy", "New-Service"
+    ],
+    "allowedPaths": [],
+    "maxCommandLength": 4096
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `mode` | `denylist` (block specific patterns) or `allowlist` (allow only specific patterns) |
+| `allowedPatterns` | Regex patterns allowed in allowlist mode |
+| `deniedPatterns` | Regex patterns always blocked |
+| `allowedPaths` | File path prefixes permitted for upload/download |
+| `maxCommandLength` | Maximum command length in characters |
+
+`commandpolicy.json` is gitignored - each deployment configures its own policy.
 
 ## MCP Tools
 
@@ -118,7 +184,9 @@ When connected via MCP, Claude Code gets these tools:
 
 ## API Reference
 
-All endpoints require `?token=<TOKEN>` query parameter or `X-Token` header.
+All endpoints require `Authorization: Bearer <TOKEN>` header.
+
+> Note: `?token=` query parameter is no longer supported (removed in v2).
 
 ### Public Endpoints
 
@@ -149,7 +217,8 @@ All endpoints require `?token=<TOKEN>` query parameter or `X-Token` header.
 
 ### File Upload
 
-**Request:** `POST /api/upload?token=xxx&path=C:\Users\user\file.dll`
+**Request:** `POST /api/upload?path=C:\Users\user\file.dll`
+- Header: `Authorization: Bearer <TOKEN>`
 - Body: raw binary file data
 - Content-Type: `application/octet-stream`
 
@@ -163,7 +232,8 @@ All endpoints require `?token=<TOKEN>` query parameter or `X-Token` header.
 
 ### File Download
 
-**Request:** `GET /api/download?token=xxx&path=C:\Users\user\file.log`
+**Request:** `GET /api/download?path=C:\Users\user\file.log`
+- Header: `Authorization: Bearer <TOKEN>`
 
 **Response:** Binary file data with `Content-Disposition` header.
 
@@ -232,15 +302,30 @@ netsh advfirewall firewall add rule name="RemoteCmd" dir=in action=allow protoco
 
 | Layer | Technology | Scope |
 |-------|-----------|-------|
-| **Transport** | TLS 1.2+ (self-signed certificate) | Server ↔ Client HTTPS |
+| **Transport** | TLS 1.2+ (self-signed certificate) | Server <-> Client HTTPS |
 | **Payload** | AES-256-GCM | All commands, results, file data, metadata |
-| **Authentication** | Token-based | All API endpoints |
+| **Authentication** | Bearer token (Authorization header) | All API endpoints |
 
 ### How it works
 
-1. **TLS**: Server auto-generates a self-signed X.509 certificate (RSA 2048, SHA256, valid 5 years). Client accepts self-signed certs.
+1. **TLS**: Server auto-generates a self-signed X.509 certificate (RSA 2048, SHA256, valid 5 years). MCP server uses a per-request TLS agent scoped to the relay URL only.
 2. **AES-256-GCM**: Encryption key is derived from the shared token via `SHA256("RemoteCmd:v1:" + token)`. Every payload uses a random 12-byte nonce. GCM provides both confidentiality and integrity (16-byte auth tag).
-3. **What's encrypted**: Commands, command results, file transfer metadata (paths, sizes), file data. Status and auth endpoints use plaintext (no sensitive data).
+3. **Certificate pinning**: Client supports `--cert-pin <SHA256>` to pin the server certificate thumbprint.
+4. **What's encrypted**: Commands, command results, file transfer metadata (paths, sizes), file data. Status and auth endpoints use plaintext (no sensitive data).
+
+### Custom CA Certificate (MCP Server)
+
+For production deployments with a proper CA:
+
+```json
+{
+  "env": {
+    "REMOTECMD_URL": "https://myrelay.example.com:7890",
+    "REMOTECMD_TOKEN": "<TOKEN>",
+    "REMOTECMD_CA_CERT": "/path/to/ca.crt"
+  }
+}
+```
 
 ### Disabling TLS
 
@@ -270,31 +355,56 @@ RemoteCmd.Client.exe http://192.168.1.100:7890 myToken
 | Shell | `powershell.exe -NoProfile -NonInteractive` |
 | Transport encryption | TLS 1.2+ (self-signed, auto-generated) |
 | Payload encryption | AES-256-GCM (key derived from token) |
-| Authentication | Token-based (query param or header) |
+| Authentication | Bearer token (Authorization header) |
 | Client detection | Connected if last poll < 10 seconds ago |
 
 ## Shell Helper
 
 ```bash
-# rcmd.sh - quick command execution
+# Set token via environment variable
+export REMOTECMD_TOKEN=mySecretToken
+export REMOTECMD_URL=http://localhost:7890   # optional
+
 ./rcmd.sh "hostname"
 ./rcmd.sh "Get-Process" 60   # with 60s timeout
 ```
+
+## Migration Guide: v1 to v2
+
+### Breaking changes
+
+| Area | v1 | v2 |
+|------|----|----|
+| Authentication | `?token=` query parameter | `Authorization: Bearer <TOKEN>` header |
+| TLS (MCP server) | `NODE_TLS_REJECT_UNAUTHORIZED=0` (global) | Per-request agent (scoped) |
+| Token in rcmd.sh | Hardcoded in script | `REMOTECMD_TOKEN` env var |
+
+### Steps
+
+1. **Update curl commands** - replace `?token=<TOKEN>` with `-H "Authorization: Bearer <TOKEN>"`
+2. **Update rcmd.sh** - set `REMOTECMD_TOKEN` env var instead of editing the script
+3. **MCP config** - no change needed, `REMOTECMD_TOKEN` env var was already used
+4. **Server** - `Authorization: Bearer` header is now required; `?token=` query param no longer accepted
 
 ## Project Structure
 
 ```
 RemoteCmd.sln
-├── RemoteCmd.Server/        # HTTPS relay server (.NET 9.0)
-│   ├── Program.cs
-│   └── Crypto.cs            # AES-256-GCM encryption
-├── RemoteCmd.Client/        # Target machine client (.NET 9.0)
-│   ├── Program.cs
-│   └── Crypto.cs            # AES-256-GCM encryption
-├── mcp-server/              # MCP bridge (Node.js)
-│   ├── index.mjs
-│   └── package.json
-└── rcmd.sh                  # Shell helper script
++-- RemoteCmd.Server/        # HTTPS relay server (.NET 9.0)
+|   +-- Program.cs
+|   +-- Crypto.cs            # AES-256-GCM encryption
++-- RemoteCmd.Client/        # Target machine client (.NET 9.0)
+|   +-- Program.cs
+|   +-- Crypto.cs            # AES-256-GCM encryption
+|   +-- CommandPolicy.cs     # Command allow/denylist enforcement
+|   +-- PathValidator.cs     # Path validation helpers
+|   +-- commandpolicy.json.example
++-- RemoteCmd.Shared/        # Shared types
++-- mcp-server/              # MCP bridge (Node.js)
+|   +-- index.mjs
+|   +-- package.json
+|   +-- package-lock.json
++-- rcmd.sh                  # Shell helper script
 ```
 
 ## Contributing
@@ -309,15 +419,9 @@ Contributions are welcome! For major changes, please open an issue first.
 
 ## Support
 
-- 📧 **Email:** dev@nks-hub.cz
-- 🐛 **Bug reports:** [GitHub Issues](https://github.com/nks-hub/remote-cmd/issues)
+- **Email:** dev@nks-hub.cz
+- **Bug reports:** [GitHub Issues](https://github.com/nks-hub/remote-cmd/issues)
 
 ## License
 
-Private — NKS Development
-
----
-
-<p align="center">
-  Made with ❤️ by <a href="https://github.com/nks-hub">NKS Hub</a>
-</p>
+Private - NKS Development

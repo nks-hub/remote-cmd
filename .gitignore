@@ -18,7 +18,11 @@ Thumbs.db
 
 # Local configs
 appsettings.Development.json
+appsettings.*.local.json
 cmd.json
+commandpolicy.json
+*.pfx
+.env
 
 # Editor/IDE local configs
 .[a-z]*/
