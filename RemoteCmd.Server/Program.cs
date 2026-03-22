@@ -3,79 +3,117 @@ using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading.RateLimiting;
+using Microsoft.AspNetCore.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 200_000_000); // 200MB
 
-// Parse arguments: <token> [--no-tls]
-var token = args.Length > 0 && !args[0].StartsWith("-") ? args[0] : Guid.NewGuid().ToString("N")[..12];
+builder.Services.AddLogging();
+
+// Rate limiting: 60 req/min general, 5 auth failures/5min
+builder.Services.AddRateLimiter(options =>
+{
+    options.AddFixedWindowLimiter("general", o =>
+    {
+        o.PermitLimit = 60;
+        o.Window = TimeSpan.FromMinutes(1);
+        o.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
+        o.QueueLimit = 0;
+    });
+    options.AddFixedWindowLimiter("auth-failures", o =>
+    {
+        o.PermitLimit = 5;
+        o.Window = TimeSpan.FromMinutes(5);
+        o.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
+        o.QueueLimit = 0;
+    });
+    options.RejectionStatusCode = 429;
+});
+
+// Parse arguments: <token> [--no-tls] [--bind <addr>] [--show-token]
+var token = args.Length > 0 && !args[0].StartsWith('-') ? args[0] : Guid.NewGuid().ToString("N")[..12];
 var noTls = args.Contains("--no-tls");
+var showToken = args.Contains("--show-token");
+
+var bindIndex = Array.IndexOf(args, "--bind");
+var bindAddress = bindIndex >= 0 && bindIndex + 1 < args.Length ? args[bindIndex + 1] : "127.0.0.1";
+
+var port = 7890;
+var scheme = noTls ? "http" : "https";
+var listenUrl = $"{scheme}://{bindAddress}:{port}";
 
 if (noTls)
 {
-    builder.WebHost.UseUrls("http://0.0.0.0:7890");
+    builder.WebHost.UseUrls(listenUrl);
 }
 else
 {
-    // Generate self-signed certificate for HTTPS
+    // Generate self-signed certificate and load directly into memory (no disk write)
     var cert = GenerateSelfSignedCert();
-    var certPath = Path.Combine(AppContext.BaseDirectory, "remotecmd.pfx");
-    var certPassword = Guid.NewGuid().ToString("N")[..16];
-    File.WriteAllBytes(certPath, cert.Export(X509ContentType.Pfx, certPassword));
 
-    builder.WebHost.UseUrls("https://0.0.0.0:7890");
+    builder.WebHost.UseUrls(listenUrl);
     builder.WebHost.ConfigureKestrel(o =>
     {
         o.Limits.MaxRequestBodySize = 200_000_000;
         o.ConfigureHttpsDefaults(https =>
         {
-            https.ServerCertificate = new X509Certificate2(certPath, certPassword);
+            https.ServerCertificate = cert;
         });
     });
 }
 
 var app = builder.Build();
+var logger = app.Services.GetRequiredService<ILogger<Program>>();
+
+app.UseRateLimiter();
 
 // Initialize AES-256-GCM encryption from token
 Crypto.Init(token);
 
-string? pendingCommand = null;
-TaskCompletionSource<CommandResult>? resultTcs = null;
-DateTime lastClientPoll = DateTime.MinValue;
+// Thread-safe relay state
+var relay = new RelayState();
 var commandLock = new SemaphoreSlim(1, 1);
 
-// File transfer state
-FileTransfer? pendingUpload = null;
-TaskCompletionSource<bool>? uploadTcs = null;
-FileTransfer? pendingDownload = null;
-TaskCompletionSource<FileTransfer>? downloadTcs = null;
-
-var protocol = noTls ? "http" : "https";
+// Startup info - token masked unless --show-token
+var tokenDisplay = showToken ? token : token[..Math.Min(5, token.Length)] + "****";
 Console.WriteLine("=== Remote CMD Relay Server ===");
-Console.WriteLine($"Listening on: {protocol}://0.0.0.0:7890");
-Console.WriteLine($"Token: {token}");
+Console.WriteLine($"Listening on: {listenUrl}");
+Console.WriteLine($"Token: {tokenDisplay}");
+if (!showToken)
+    Console.WriteLine("(Use --show-token to display full token)");
 Console.WriteLine($"TLS: {(noTls ? "disabled" : "enabled (self-signed)")}");
 Console.WriteLine($"Encryption: AES-256-GCM (always on)");
+Console.WriteLine($"Bind address: {bindAddress}");
 Console.WriteLine();
 Console.WriteLine("Client setup (run on target machine):");
-Console.WriteLine($"  RemoteCmd.Client.exe <THIS_SERVER_IP> {token}");
-Console.WriteLine();
-Console.WriteLine("API (local controller):");
-Console.WriteLine($"  curl -X POST {protocol}://localhost:7890/api/exec?token={token} -H \"Content-Type: application/json\" -d \"{{\\\"command\\\":\\\"hostname\\\"}}\"");
+Console.WriteLine("  RemoteCmd.Client.exe <THIS_SERVER_IP> <TOKEN>");
 Console.WriteLine();
 
-// Auth middleware - token required for /api/ endpoints
+// Auth middleware - Bearer token required for /api/ endpoints
 app.Use(async (context, next) =>
 {
     var path = context.Request.Path.Value ?? "";
     if (path.StartsWith("/api/"))
     {
-        var reqToken = context.Request.Query["token"].FirstOrDefault()
-                       ?? context.Request.Headers["X-Token"].FirstOrDefault();
-        if (reqToken != token)
+        var authHeader = context.Request.Headers.Authorization.FirstOrDefault();
+        string? reqToken = null;
+        if (authHeader != null && authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+            reqToken = authHeader["Bearer ".Length..].Trim();
+
+        var tokenBytes = Encoding.UTF8.GetBytes(token);
+        var reqBytes = reqToken != null ? Encoding.UTF8.GetBytes(reqToken) : Array.Empty<byte>();
+
+        // Constant-time comparison to prevent timing attacks
+        var isValid = reqToken != null
+            && tokenBytes.Length == reqBytes.Length
+            && CryptographicOperations.FixedTimeEquals(tokenBytes, reqBytes);
+
+        if (!isValid)
         {
+            logger.LogWarning("Auth failure from {RemoteIp} for {Path}", context.Connection.RemoteIpAddress, path);
             context.Response.StatusCode = 401;
-            await context.Response.WriteAsync("Invalid token");
+            await context.Response.WriteAsync("Unauthorized");
             return;
         }
     }
@@ -86,30 +124,31 @@ app.Use(async (context, next) =>
 
 app.MapGet("/api/poll", () =>
 {
-    lastClientPoll = DateTime.UtcNow;
-    if (pendingCommand != null)
+    relay.UpdateLastPoll();
+    var cmd = relay.TakeCommand();
+    if (cmd != null)
     {
-        var cmd = pendingCommand;
-        pendingCommand = null;
-        // Encrypt command for client
+        logger.LogDebug("Poll: dispatching command to client");
         return Results.Ok(new { command = Crypto.EncryptString(cmd) });
     }
     return Results.Ok(new { command = (string?)null });
-});
+}).RequireRateLimiting("general");
 
 app.MapPost("/api/result", async (HttpRequest req) =>
 {
-    // Client sends AES-encrypted result bytes
     using var ms = new MemoryStream();
     await req.Body.CopyToAsync(ms);
     var decryptedBytes = Crypto.Decrypt(ms.ToArray());
     var result = JsonSerializer.Deserialize<CommandResult>(decryptedBytes, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-    if (result != null && resultTcs != null)
-        resultTcs.TrySetResult(result);
+    if (result != null)
+    {
+        relay.SetResult(result);
+        logger.LogInformation("Command result received: ExitCode={ExitCode}", result.ExitCode);
+    }
     return Results.Ok();
-});
+}).RequireRateLimiting("general");
 
-// === Command execution (controller-facing: plaintext, localhost) ===
+// === Command execution (controller-facing: plaintext, auth-protected) ===
 
 app.MapPost("/api/exec", async (HttpRequest req) =>
 {
@@ -117,38 +156,40 @@ app.MapPost("/api/exec", async (HttpRequest req) =>
     if (body?.Command == null)
         return Results.BadRequest(new { error = "Missing command" });
 
-    var isConnected = (DateTime.UtcNow - lastClientPoll).TotalSeconds < 10;
-    if (!isConnected)
+    if (!relay.IsClientConnected)
         return Results.Ok(new CommandResult { Output = "[ERROR] No client connected", ExitCode = -1 });
 
     if (!await commandLock.WaitAsync(TimeSpan.FromSeconds(2)))
         return Results.Ok(new CommandResult { Output = "[ERROR] Another command is pending", ExitCode = -1 });
 
+    logger.LogInformation("Exec: {Command}", body.Command);
+
     try
     {
-        resultTcs = new TaskCompletionSource<CommandResult>();
-        pendingCommand = body.Command;
+        var tcs = relay.TrySetCommand(body.Command);
+        if (tcs == null)
+            return Results.Ok(new CommandResult { Output = "[ERROR] State conflict", ExitCode = -1 });
 
         var timeout = body.TimeoutSeconds > 0 ? body.TimeoutSeconds : 30;
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeout));
 
         try
         {
-            var result = await resultTcs.Task.WaitAsync(cts.Token);
+            var result = await tcs.Task.WaitAsync(cts.Token);
             return Results.Ok(result);
         }
         catch (OperationCanceledException)
         {
-            pendingCommand = null;
+            relay.CancelCommand();
+            logger.LogWarning("Exec timeout after {Timeout}s for: {Command}", timeout, body.Command);
             return Results.Ok(new CommandResult { Output = $"[TIMEOUT] No response after {timeout}s", ExitCode = -1 });
         }
     }
     finally
     {
-        resultTcs = null;
         commandLock.Release();
     }
-});
+}).RequireRateLimiting("general");
 
 // === File transfer: Upload (local → remote, encrypted) ===
 
@@ -158,69 +199,73 @@ app.MapPost("/api/upload", async (HttpRequest req) =>
     if (string.IsNullOrEmpty(remotePath))
         return Results.BadRequest(new { error = "Missing ?path= parameter" });
 
-    var isConnected = (DateTime.UtcNow - lastClientPoll).TotalSeconds < 10;
-    if (!isConnected)
+    if (!relay.IsClientConnected)
         return Results.BadRequest(new { error = "No client connected" });
 
     using var ms = new MemoryStream();
     await req.Body.CopyToAsync(ms);
     var data = ms.ToArray();
 
-    Console.WriteLine($"[UPLOAD] {data.Length / 1024 / 1024}MB → {remotePath}");
+    logger.LogInformation("Upload: {SizeMB}MB → {RemotePath}", data.Length / 1024 / 1024, remotePath);
 
-    pendingUpload = new FileTransfer { Path = remotePath, Data = data };
-    uploadTcs = new TaskCompletionSource<bool>();
+    var tcs = relay.TrySetUpload(new FileTransfer { Path = remotePath, Data = data });
+    if (tcs == null)
+        return Results.StatusCode(409); // Conflict - upload already pending
 
     using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
     try
     {
-        var ok = await uploadTcs.Task.WaitAsync(cts.Token);
+        var ok = await tcs.Task.WaitAsync(cts.Token);
         return ok ? Results.Ok(new { status = "ok", size = data.Length }) : Results.StatusCode(500);
     }
     catch (OperationCanceledException)
     {
-        pendingUpload = null;
-        return Results.Ok(new { error = "Upload timeout" });
+        relay.CancelUpload();
+        logger.LogWarning("Upload timeout for {RemotePath}", remotePath);
+        return Results.Json(new { error = "Upload timeout" }, statusCode: 504);
     }
-});
+}).RequireRateLimiting("general");
 
 // Client polls for pending file transfers (encrypted metadata)
 app.MapGet("/api/file-poll", () =>
 {
-    lastClientPoll = DateTime.UtcNow;
+    relay.UpdateLastPoll();
 
-    if (pendingUpload != null)
+    var upload = relay.PeekUpload();
+    if (upload != null)
     {
-        var meta = JsonSerializer.Serialize(new { action = "upload", path = pendingUpload.Path, size = pendingUpload.Data!.Length });
+        var meta = JsonSerializer.Serialize(new { action = "upload", path = upload.Path, size = upload.Data!.Length });
         return Results.Ok(new { e = Crypto.EncryptString(meta) });
     }
 
-    if (downloadTcs != null)
+    if (relay.HasPendingDownload)
     {
-        var meta = JsonSerializer.Serialize(new { action = "download", path = pendingDownload?.Path ?? "", size = 0 });
+        var dl = relay.PeekDownload();
+        var meta = JsonSerializer.Serialize(new { action = "download", path = dl?.Path ?? "", size = 0 });
         return Results.Ok(new { e = Crypto.EncryptString(meta) });
     }
 
     return Results.Ok(new { e = (string?)null });
-});
+}).RequireRateLimiting("general");
 
 // Client downloads file data for upload-to-remote (encrypted bytes)
 app.MapGet("/api/file-data", () =>
 {
-    if (pendingUpload?.Data == null)
+    var upload = relay.PeekUpload();
+    if (upload?.Data == null)
         return Results.NotFound();
 
-    var encrypted = Crypto.Encrypt(pendingUpload.Data);
+    var encrypted = Crypto.Encrypt(upload.Data);
     return Results.File(encrypted, "application/octet-stream");
-});
+}).RequireRateLimiting("general");
 
 // Client confirms upload complete
 app.MapPost("/api/file-done", () =>
 {
-    pendingUpload = null;
-    uploadTcs?.TrySetResult(true);
+    relay.CompleteUpload();
+    logger.LogInformation("Upload completed by client");
     return Results.Ok();
-});
+}).RequireRateLimiting("general");
 
 // === File transfer: Download (remote → local, encrypted) ===
 
@@ -230,30 +275,30 @@ app.MapGet("/api/download", async (HttpRequest req) =>
     if (string.IsNullOrEmpty(remotePath))
         return Results.BadRequest(new { error = "Missing ?path= parameter" });
 
-    var isConnected = (DateTime.UtcNow - lastClientPoll).TotalSeconds < 10;
-    if (!isConnected)
+    if (!relay.IsClientConnected)
         return Results.BadRequest(new { error = "No client connected" });
 
-    Console.WriteLine($"[DOWNLOAD] ← {remotePath}");
+    logger.LogInformation("Download: ← {RemotePath}", remotePath);
 
-    pendingDownload = new FileTransfer { Path = remotePath };
-    downloadTcs = new TaskCompletionSource<FileTransfer>();
+    var tcs = relay.TrySetDownload(new FileTransfer { Path = remotePath });
+    if (tcs == null)
+        return Results.StatusCode(409); // Conflict - download already pending
 
     using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
     try
     {
-        var result = await downloadTcs.Task.WaitAsync(cts.Token);
+        var result = await tcs.Task.WaitAsync(cts.Token);
         if (result.Data == null)
             return Results.NotFound(new { error = result.Error ?? "File not found" });
         return Results.File(result.Data, "application/octet-stream", Path.GetFileName(remotePath));
     }
     catch (OperationCanceledException)
     {
-        pendingDownload = null;
-        downloadTcs = null;
+        relay.CancelDownload();
+        logger.LogWarning("Download timeout for {RemotePath}", remotePath);
         return Results.StatusCode(504);
     }
-});
+}).RequireRateLimiting("general");
 
 // Client uploads file data for download-from-remote (encrypted bytes)
 app.MapPost("/api/file-upload", async (HttpRequest req) =>
@@ -261,49 +306,44 @@ app.MapPost("/api/file-upload", async (HttpRequest req) =>
     var error = req.Query["error"].FirstOrDefault();
     if (!string.IsNullOrEmpty(error))
     {
-        downloadTcs?.TrySetResult(new FileTransfer { Error = error });
-        pendingDownload = null;
-        downloadTcs = null;
+        relay.CompleteDownloadWithError(error);
         return Results.Ok();
     }
 
     using var ms = new MemoryStream();
     await req.Body.CopyToAsync(ms);
-    // Decrypt file data from client
     var decrypted = Crypto.Decrypt(ms.ToArray());
-    downloadTcs?.TrySetResult(new FileTransfer { Data = decrypted });
-    pendingDownload = null;
-    downloadTcs = null;
+    relay.CompleteDownload(decrypted);
+    logger.LogInformation("Download data received from client: {Size} bytes", decrypted.Length);
     return Results.Ok();
-});
+}).RequireRateLimiting("general");
 
 // === Status (plaintext) ===
 
 app.MapGet("/api/status", () =>
 {
-    var connected = (DateTime.UtcNow - lastClientPoll).TotalSeconds < 10;
     return Results.Ok(new
     {
-        clientConnected = connected,
-        lastPoll = lastClientPoll,
-        secondsAgo = connected ? (int)(DateTime.UtcNow - lastClientPoll).TotalSeconds : -1,
+        clientConnected = relay.IsClientConnected,
+        lastPoll = relay.LastClientPoll,
+        secondsAgo = relay.IsClientConnected ? (int)(DateTime.UtcNow - relay.LastClientPoll).TotalSeconds : -1,
         encryption = "AES-256-GCM",
         tls = !noTls
     });
 });
 
 app.MapGet("/", () => Results.Text(
-    "Remote CMD Relay Server v1.0.0\n" +
+    "Remote CMD Relay Server v1.1.0\n" +
     $"Encryption: AES-256-GCM | TLS: {(noTls ? "off" : "self-signed")}\n\n" +
     "GET  /api/status                    - Check client\n" +
     "POST /api/exec                      - Run command {\"command\":\"...\", \"timeoutSeconds\":30}\n" +
     "POST /api/upload?path=C:\\dest\\f.zip  - Upload file to remote (--data-binary @local.zip)\n" +
     "GET  /api/download?path=C:\\src\\f.zip - Download file from remote\n" +
-    "All endpoints need ?token=<TOKEN>", "text/plain"));
+    "All endpoints require: Authorization: Bearer <TOKEN>", "text/plain"));
 
 app.Run();
 
-// === Self-signed certificate generation ===
+// === Self-signed certificate generation (in-memory, no disk write) ===
 
 static X509Certificate2 GenerateSelfSignedCert()
 {
@@ -319,7 +359,6 @@ static X509Certificate2 GenerateSelfSignedCert()
     request.CertificateExtensions.Add(
         new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature, false));
 
-    // SAN: localhost + wildcard IPs
     var sanBuilder = new SubjectAlternativeNameBuilder();
     sanBuilder.AddDnsName("localhost");
     sanBuilder.AddDnsName("*");
@@ -331,7 +370,159 @@ static X509Certificate2 GenerateSelfSignedCert()
         DateTimeOffset.UtcNow.AddDays(-1),
         DateTimeOffset.UtcNow.AddYears(5));
 
-    return cert;
+    // Export and reimport to detach from the RSA key (required by Kestrel on some platforms)
+    return X509CertificateLoader.LoadPkcs12(cert.Export(X509ContentType.Pfx), null);
+}
+
+// === Thread-safe relay state ===
+
+sealed class RelayState
+{
+    private readonly object _lock = new();
+
+    private string? _pendingCommand;
+    private TaskCompletionSource<CommandResult>? _resultTcs;
+    private DateTime _lastClientPoll = DateTime.MinValue;
+
+    private FileTransfer? _pendingUpload;
+    private TaskCompletionSource<bool>? _uploadTcs;
+    private FileTransfer? _pendingDownload;
+    private TaskCompletionSource<FileTransfer>? _downloadTcs;
+
+    public DateTime LastClientPoll
+    {
+        get { lock (_lock) return _lastClientPoll; }
+    }
+
+    public bool IsClientConnected
+    {
+        get { lock (_lock) return (DateTime.UtcNow - _lastClientPoll).TotalSeconds < 10; }
+    }
+
+    public bool HasPendingDownload
+    {
+        get { lock (_lock) return _downloadTcs != null; }
+    }
+
+    public void UpdateLastPoll()
+    {
+        lock (_lock) _lastClientPoll = DateTime.UtcNow;
+    }
+
+    /// <summary>Sets pending command and returns its TCS. Returns null if a command is already pending.</summary>
+    public TaskCompletionSource<CommandResult>? TrySetCommand(string command)
+    {
+        lock (_lock)
+        {
+            if (_pendingCommand != null) return null;
+            _resultTcs = new TaskCompletionSource<CommandResult>();
+            _pendingCommand = command;
+            return _resultTcs;
+        }
+    }
+
+    /// <summary>Takes the pending command (clears it). Returns null if none.</summary>
+    public string? TakeCommand()
+    {
+        lock (_lock)
+        {
+            var cmd = _pendingCommand;
+            _pendingCommand = null;
+            return cmd;
+        }
+    }
+
+    public void SetResult(CommandResult result)
+    {
+        lock (_lock) _resultTcs?.TrySetResult(result);
+    }
+
+    public void CancelCommand()
+    {
+        lock (_lock) _pendingCommand = null;
+    }
+
+    /// <summary>Sets pending upload and returns its TCS. Returns null if an upload is already pending.</summary>
+    public TaskCompletionSource<bool>? TrySetUpload(FileTransfer transfer)
+    {
+        lock (_lock)
+        {
+            if (_pendingUpload != null) return null;
+            _pendingUpload = transfer;
+            _uploadTcs = new TaskCompletionSource<bool>();
+            return _uploadTcs;
+        }
+    }
+
+    public FileTransfer? PeekUpload()
+    {
+        lock (_lock) return _pendingUpload;
+    }
+
+    public void CompleteUpload()
+    {
+        lock (_lock)
+        {
+            _pendingUpload = null;
+            _uploadTcs?.TrySetResult(true);
+            _uploadTcs = null;
+        }
+    }
+
+    public void CancelUpload()
+    {
+        lock (_lock)
+        {
+            _pendingUpload = null;
+            _uploadTcs = null;
+        }
+    }
+
+    /// <summary>Sets pending download request and returns its TCS. Returns null if a download is already pending.</summary>
+    public TaskCompletionSource<FileTransfer>? TrySetDownload(FileTransfer transfer)
+    {
+        lock (_lock)
+        {
+            if (_downloadTcs != null) return null;
+            _pendingDownload = transfer;
+            _downloadTcs = new TaskCompletionSource<FileTransfer>();
+            return _downloadTcs;
+        }
+    }
+
+    public FileTransfer? PeekDownload()
+    {
+        lock (_lock) return _pendingDownload;
+    }
+
+    public void CompleteDownload(byte[] data)
+    {
+        lock (_lock)
+        {
+            _downloadTcs?.TrySetResult(new FileTransfer { Data = data });
+            _pendingDownload = null;
+            _downloadTcs = null;
+        }
+    }
+
+    public void CompleteDownloadWithError(string error)
+    {
+        lock (_lock)
+        {
+            _downloadTcs?.TrySetResult(new FileTransfer { Error = error });
+            _pendingDownload = null;
+            _downloadTcs = null;
+        }
+    }
+
+    public void CancelDownload()
+    {
+        lock (_lock)
+        {
+            _pendingDownload = null;
+            _downloadTcs = null;
+        }
+    }
 }
 
 // === Models ===
