@@ -8,38 +8,14 @@ import http from "http";
 import https from "https";
 import fs from "fs";
 import path from "path";
+import { validateRemotePath, validateCommand, clampTimeout, buildAgent } from "./validation.mjs";
 
 const SERVER_URL = process.env.REMOTECMD_URL || "https://localhost:7890";
 const TOKEN = process.env.REMOTECMD_TOKEN || "";
 const isHttps = SERVER_URL.startsWith("https");
 const transport_module = isHttps ? https : http;
 
-/** Build per-request TLS agent - avoids global NODE_TLS_REJECT_UNAUTHORIZED override */
-function buildAgent() {
-  if (!isHttps) return undefined;
-
-  const caCertPath = process.env.REMOTECMD_CA_CERT;
-  if (caCertPath) {
-    const ca = fs.readFileSync(caCertPath);
-    return new https.Agent({ ca });
-  }
-
-  // Self-signed relay server: disable rejection only for this agent
-  return new https.Agent({ rejectUnauthorized: false });
-}
-
-const tlsAgent = buildAgent();
-
-/** Validate remote path - reject relative and UNC paths */
-function validateRemotePath(p) {
-  if (!p || typeof p !== "string") throw new Error("Path must be a non-empty string");
-  const trimmed = p.trim();
-  if (trimmed.startsWith("..") || trimmed.includes("/../") || trimmed.includes("\\..\\"))
-    throw new Error("Relative paths are not allowed");
-  if (trimmed.startsWith("\\\\") || trimmed.startsWith("//"))
-    throw new Error("UNC paths are not allowed");
-  return trimmed;
-}
+const tlsAgent = buildAgent(isHttps);
 
 function apiCall(method, endpoint, body = null, isBinary = false) {
   return new Promise((resolve, reject) => {
@@ -267,21 +243,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case "remote_exec": {
-        const command = (args.command ?? "").trim();
-        if (!command) {
-          return {
-            content: [{ type: "text", text: "Error: command must not be empty" }],
-            isError: true,
-          };
-        }
-        if (command.length > 8192) {
-          return {
-            content: [{ type: "text", text: "Error: command exceeds maximum length of 8192 characters" }],
-            isError: true,
-          };
-        }
-
-        const timeout = Math.min(300, Math.max(1, args.timeoutSeconds || 30));
+        const { command } = validateCommand(args.command);
+        const timeout = clampTimeout(args.timeoutSeconds);
 
         const result = await apiCall("POST", "/api/exec", {
           command,

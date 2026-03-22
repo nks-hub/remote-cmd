@@ -64,4 +64,9 @@ public static class Crypto
 
     public static string DecryptString(string base64)
         => Encoding.UTF8.GetString(Decrypt(Convert.FromBase64String(base64)));
+
+    /// <summary>
+    /// Resets the derived key. Intended for use in unit tests only.
+    /// </summary>
+    internal static void Reset() => _key = null;
 }
