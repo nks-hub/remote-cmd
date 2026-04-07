@@ -14,10 +14,14 @@ if (args.Length < 2)
 var serverArg = args[0];
 var token = args[1];
 
-// Default to HTTPS, support explicit http://
-var baseUrl = serverArg.StartsWith("http")
-    ? serverArg.TrimEnd('/')
-    : $"https://{serverArg}:7890";
+// Default to HTTPS on port 443, support explicit http:// or custom port
+string baseUrl;
+if (serverArg.StartsWith("http"))
+    baseUrl = serverArg.TrimEnd('/');
+else if (serverArg.Contains(':'))
+    baseUrl = $"https://{serverArg}";
+else
+    baseUrl = $"https://{serverArg}";
 
 var pollUrl = $"{baseUrl}/api/poll?token={token}";
 var resultUrl = $"{baseUrl}/api/result?token={token}";
@@ -29,12 +33,15 @@ var fileUploadUrl = $"{baseUrl}/api/file-upload?token={token}";
 // Initialize AES-256-GCM encryption from token
 Crypto.Init(token);
 
-// Accept self-signed certificates
-var handler = new HttpClientHandler
+// Accept self-signed certificates, auto-reconnect on server restart
+var handler = new SocketsHttpHandler
 {
-    ServerCertificateCustomValidationCallback = (_, _, _, _) => true
+    SslOptions = { RemoteCertificateValidationCallback = (_, _, _, _) => true },
+    PooledConnectionLifetime = TimeSpan.FromSeconds(30),
+    PooledConnectionIdleTimeout = TimeSpan.FromSeconds(15),
+    ConnectTimeout = TimeSpan.FromSeconds(10),
 };
-using var http = new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(10) };
+using var http = new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(5) };
 
 Console.WriteLine($"=== Remote CMD Client ===");
 Console.WriteLine($"Server: {baseUrl}");
