@@ -11,10 +11,21 @@ builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 200_000_000)
 var token = args.Length > 0 && !args[0].StartsWith("-")
     ? args[0]
     : Environment.GetEnvironmentVariable("REMOTECMD_TOKEN")
-      ?? Guid.NewGuid().ToString("N")[..12];
+      ?? Guid.NewGuid().ToString("N")[..16];
 var noTls = args.Contains("--no-tls")
     || string.Equals(Environment.GetEnvironmentVariable("REMOTECMD_NO_TLS"), "1", StringComparison.Ordinal)
     || string.Equals(Environment.GetEnvironmentVariable("REMOTECMD_NO_TLS"), "true", StringComparison.OrdinalIgnoreCase);
+
+const int MinTokenLength = 12;
+var allowShortToken = string.Equals(Environment.GetEnvironmentVariable("REMOTECMD_ALLOW_SHORT_TOKEN"), "1", StringComparison.Ordinal);
+if (token.Length < MinTokenLength && !allowShortToken)
+{
+    Console.Error.WriteLine($"[FATAL] Token too short ({token.Length} chars). Minimum is {MinTokenLength}. Set REMOTECMD_ALLOW_SHORT_TOKEN=1 to bypass (NOT RECOMMENDED).");
+    return 2;
+}
+
+// Session GC: remove clients that have not polled for longer than this threshold.
+var staleAfter = TimeSpan.FromHours(1);
 
 if (noTls)
 {
@@ -51,10 +62,29 @@ Console.WriteLine($"Token: {token}");
 Console.WriteLine($"TLS: {(noTls ? "disabled" : "enabled (self-signed)")}");
 Console.WriteLine($"Encryption: AES-256-GCM (always on)");
 Console.WriteLine($"Multi-client: enabled");
+Console.WriteLine($"Session GC threshold: {staleAfter.TotalMinutes:N0} minutes");
 Console.WriteLine();
 Console.WriteLine("Client setup (run on target machine):");
 Console.WriteLine($"  RemoteCmd.Client.exe <THIS_SERVER_IP> {token}");
 Console.WriteLine();
+
+// Session GC loop (every 5 minutes)
+var gcCts = app.Lifetime.ApplicationStopping;
+_ = Task.Run(async () =>
+{
+    using var timer = new PeriodicTimer(TimeSpan.FromMinutes(5));
+    while (!gcCts.IsCancellationRequested)
+    {
+        try
+        {
+            await timer.WaitForNextTickAsync(gcCts);
+            var pruned = ClientRegistry.PruneStale(clients, staleAfter, DateTime.UtcNow);
+            if (pruned > 0) Console.WriteLine($"[GC] pruned {pruned} stale client session(s)");
+        }
+        catch (OperationCanceledException) { break; }
+        catch (Exception ex) { Console.Error.WriteLine($"[GC ERROR] {ex.Message}"); }
+    }
+});
 
 // Auth middleware
 app.Use(async (context, next) =>
@@ -341,6 +371,7 @@ app.MapGet("/", () => Results.Text(
     "All endpoints need token (query/header/Bearer).", "text/plain"));
 
 app.Run();
+return 0;
 
 // === Helpers ===
 
