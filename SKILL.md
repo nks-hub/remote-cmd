@@ -1,67 +1,58 @@
 ---
 name: remote-cmd
-description: Remote command execution relay for AI agents. Execute PowerShell commands on remote Windows machines behind firewalls and NAT. Upload and download files to/from remote machines (max 200MB). Check remote machine connection status. Manage remote servers and workstations that are not directly accessible. Use this skill whenever the user mentions executing commands on remote machines, remote PowerShell execution, file upload or download to a remote machine, checking remote machine status, managing machines behind firewalls, NAT traversal for command execution, or accessing any machine through the RemoteCmd relay.
+description: Remote command execution relay for AI agents. Execute PowerShell commands on remote Windows machines behind firewalls and NAT. Upload and download files to/from remote machines (max 200MB). Check remote machine connection status. Manage multiple remote servers and workstations through a single relay — list connected clients, target a specific machine by name, and switch between them. Use this skill whenever the user mentions executing commands on remote machines, remote PowerShell execution, file upload or download to a remote machine, checking remote machine status, managing machines behind firewalls, NAT traversal for command execution, selecting between multiple connected clients, or accessing any machine through the RemoteCmd relay.
 ---
 
 # Remote Command Execution Relay (remote-cmd)
 
 ## 1. Purpose & Context
 
-**remote-cmd** is a three-component system that enables AI agents (such as Claude Code) to execute PowerShell commands and transfer files on remote Windows machines that sit behind firewalls or NAT. The remote machine does not need any inbound ports open -- it initiates all connections outbound to a relay server via HTTP polling.
+**remote-cmd** is a three-component system that enables AI agents (such as Claude Code) to execute PowerShell commands and transfer files on remote Windows machines that sit behind firewalls or NAT. The remote machines do not need any inbound ports open -- they initiate all connections outbound to a relay server via HTTP polling.
 
-**Why it exists:** Many target machines (servers, workstations, industrial PCs) sit behind corporate firewalls or consumer NAT routers with no inbound access. Traditional SSH or RDP requires port forwarding or VPN configuration on the target network. remote-cmd sidesteps this entirely: the client on the target machine polls outbound to a relay server, and controllers (Claude Code via MCP, or curl) send commands to that same relay. The relay bridges the two sides.
+**Why it exists:** Many target machines (servers, workstations, industrial PCs) sit behind corporate firewalls or consumer NAT routers with no inbound access. Traditional SSH or RDP requires port forwarding or VPN configuration on the target network. remote-cmd sidesteps this entirely: the client on each target machine polls outbound to a relay server, and controllers (Claude Code via MCP, or curl) send commands to that same relay. The relay bridges the two sides.
+
+**Multi-client (v1.1.0+):** A single relay can serve many target machines simultaneously. Each client registers with a stable `clientId` (persisted to disk) and a human-readable `name`. Controllers target a specific machine via the `client` parameter (name or id). When only one client is connected, the `client` parameter is optional.
 
 **Three components:**
 
 | Component | Runtime | Role |
 |-----------|---------|------|
-| **RemoteCmd.Server** | .NET 9.0 (Kestrel) | HTTP relay on port 7890. Queues commands from controllers, serves them to polling clients, returns results. |
-| **RemoteCmd.Client** | .NET 9.0 (self-contained exe) | Runs on the target machine. Polls the relay every 800ms for commands and file transfer requests. Executes via `powershell.exe`. |
-| **mcp-server** | Node.js (MCP SDK) | STDIO-based MCP bridge. Translates Claude Code tool calls into HTTP requests against the relay server. |
+| **RemoteCmd.Server** | .NET 9.0 (Kestrel) | HTTP relay on port 7890. Manages a dictionary of client sessions. |
+| **RemoteCmd.Client** | .NET 9.0 (self-contained exe) | Runs on each target machine. Polls the relay every 800 ms. Executes via `powershell.exe`. |
+| **mcp-server** | Node.js (MCP SDK) | STDIO-based MCP bridge. Translates tool calls into HTTP requests against the relay. |
 
 ## 2. Architecture
 
 ```
 +---------------------+        +----------------------+        +---------------------+
-|   Claude Code       |        |   Relay Server       |        |   Target Machine    |
+|   Claude Code       |        |   Relay Server       |        |   Target Machines   |
 |   (MCP Client)      |        |   (.NET 9, :7890)    |        |   (behind NAT)      |
 |                     |        |                      |        |                     |
 |  +---------------+  |  HTTP  |  /api/exec           |  HTTP  |  +---------------+  |
-|  | MCP Server    |--+------->|  /api/upload         |<-------+--| Client        |  |
-|  | (Node.js)     |  |        |  /api/download       | polling|  | (polling 800ms)|  |
-|  | stdio         |  |        |  /api/status         |        |  |               |  |
-|  +---------------+  |        |                      |        |  | PowerShell    |  |
+|  | MCP Server    |--+------->|  /api/upload         |<-------+--| Client A      |  |
+|  | (Node.js)     |  |        |  /api/download       | polling|  +---------------+  |
+|  | stdio         |  |        |  /api/clients        |<-------+--| Client B ...  |  |
+|  +---------------+  |        |  /api/status         |        |  +---------------+  |
 +---------------------+        +----------------------+        +---------------------+
 ```
 
 ### Command Flow
 
-1. Claude Code invokes an MCP tool (e.g., `remote_exec`).
-2. MCP Server (Node.js) sends an HTTP POST to `/api/exec` on the Relay Server.
-3. Relay Server queues the command. A `SemaphoreSlim(1)` enforces single-command-at-a-time.
-4. Client on the target machine polls `/api/poll` every 800ms, picks up the encrypted command.
-5. Client decrypts the command, executes it via `powershell.exe -NoProfile -NonInteractive`.
-6. Client encrypts the result (stdout + stderr + exit code), POSTs it to `/api/result`.
-7. Relay Server returns the result to the MCP Server, which returns it to Claude Code.
+1. Claude Code invokes an MCP tool (e.g., `remote_exec` with `{command: "hostname", client: "machine-a"}`).
+2. MCP Server sends an HTTP POST to `/api/exec?client=machine-a` on the Relay Server.
+3. Relay resolves the target session:
+   - If `client` specified → find session by name or id (404 if unknown, 400 if not connected).
+   - If omitted and exactly one client connected → auto-select.
+   - If omitted and multiple connected → error listing connected client names.
+4. Relay queues the command on that session. Per-session `SemaphoreSlim(1)` enforces single-command-at-a-time per client (different clients run in parallel).
+5. Client A polls `/api/poll?clientId=<guid>&name=machine-a`, picks up the encrypted command.
+6. Client executes via `powershell.exe -NoProfile -NonInteractive`.
+7. Client POSTs encrypted result to `/api/result?clientId=<guid>`.
+8. Relay returns the result to the MCP Server, which returns it to Claude Code.
 
 ### File Transfer Flow
 
-**Upload (local -> remote):**
-1. Controller POSTs binary file data to `/api/upload?path=<remote_path>`.
-2. Server stores file in memory, waits for client.
-3. Client polls `/api/file-poll`, gets encrypted metadata (action, path, size).
-4. Client GETs `/api/file-data`, receives encrypted file bytes.
-5. Client decrypts, creates directories, writes file to disk.
-6. Client POSTs `/api/file-done` to confirm.
-7. Server returns success to controller.
-
-**Download (remote -> local):**
-1. Controller GETs `/api/download?path=<remote_path>`.
-2. Server stores download request, waits for client.
-3. Client polls `/api/file-poll`, gets encrypted metadata (action, path).
-4. Client reads file from disk, encrypts, POSTs to `/api/file-upload`.
-5. Server decrypts, returns binary to controller.
-6. Controller (MCP Server) saves file locally.
+Upload and download follow the same session-scoped pattern. Each client has its own `PendingUpload` / `PendingDownload` state — transfers to different clients run concurrently without interfering.
 
 ### Encryption Model
 
@@ -71,7 +62,7 @@ All command payloads, results, file metadata, and file data are encrypted with *
 - Auth tag: 16 bytes (GCM integrity)
 - Wire format: `nonce(12) + tag(16) + ciphertext(N)`
 
-Transport layer optionally uses **TLS 1.2+** with an auto-generated self-signed certificate (RSA 2048, SHA256, 5-year validity). Disable with `--no-tls` flag.
+Transport layer optionally uses **TLS 1.2+** with an auto-generated self-signed certificate. Disable with `--no-tls` flag or `REMOTECMD_NO_TLS=1`.
 
 ## 3. Configuration
 
@@ -81,33 +72,30 @@ Transport layer optionally uses **TLS 1.2+** with an auto-generated self-signed 
 # With TLS (default)
 dotnet run --project RemoteCmd.Server -- <TOKEN>
 
-# Without TLS (HTTP only, AES encryption still active)
+# HTTP only
 dotnet run --project RemoteCmd.Server -- <TOKEN> --no-tls
+
+# Via env vars (systemd, containers, tests)
+REMOTECMD_TOKEN=<TOKEN> REMOTECMD_NO_TLS=1 dotnet run --project RemoteCmd.Server
 ```
 
-- Listens on `0.0.0.0:7890`
-- If no token provided, a random 12-char token is generated
-
-### Deploy the Client on Target Machine
+### Deploy Clients
 
 ```bash
-# Build self-contained exe (no .NET runtime needed on target)
+# Build self-contained exe
 dotnet publish RemoteCmd.Client -c Release -r win-x64 --self-contained \
   -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true \
   -o publish/client
 
-# Run on target machine
-RemoteCmd.Client.exe <SERVER_IP_OR_URL> <TOKEN>
-
-# Examples
-RemoteCmd.Client.exe relay.example.com mySecretToken        # HTTPS (default)
-RemoteCmd.Client.exe https://relay.example.com:7890 token   # Explicit HTTPS
-RemoteCmd.Client.exe http://10.0.0.100:7890 token           # HTTP mode
+# Run on each target machine with a distinctive name
+RemoteCmd.Client.exe <SERVER_IP> <TOKEN> --name comos-1
+RemoteCmd.Client.exe <SERVER_IP> <TOKEN> --name build-server
+RemoteCmd.Client.exe <SERVER_IP> <TOKEN>                 # default: %COMPUTERNAME%
 ```
 
-### Configure MCP Server for Claude Code
+Each client persists its GUID to `%LOCALAPPDATA%\RemoteCmd\client.id` so the id is stable across restarts.
 
-Add to `.mcp.json` or Claude Code MCP settings:
+### MCP Server Configuration
 
 ```json
 {
@@ -118,7 +106,8 @@ Add to `.mcp.json` or Claude Code MCP settings:
       "args": ["C:/work/sources/remote-cmd/mcp-server/index.mjs"],
       "env": {
         "REMOTECMD_URL": "https://localhost:7890",
-        "REMOTECMD_TOKEN": "<TOKEN>"
+        "REMOTECMD_TOKEN": "<TOKEN>",
+        "REMOTECMD_DEFAULT_CLIENT": "comos-1"
       }
     }
   }
@@ -130,243 +119,203 @@ Add to `.mcp.json` or Claude Code MCP settings:
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `REMOTECMD_URL` | No | `https://localhost:7890` | Full URL of the relay server |
-| `REMOTECMD_TOKEN` | Yes | `""` (empty) | Shared authentication token |
-
-### Firewall / NAT
-
-```powershell
-# Windows Firewall on the relay server
-netsh advfirewall firewall add rule name="RemoteCmd" dir=in action=allow protocol=tcp localport=7890
-```
-
-```
-# MikroTik DST-NAT (if relay is behind NAT)
-/ip firewall nat add chain=dstnat dst-port=7890 protocol=tcp \
-  action=dst-nat to-addresses=<SERVER_LAN_IP> to-ports=7890
-```
+| `REMOTECMD_TOKEN` | Yes | — | Shared authentication token |
+| `REMOTECMD_DEFAULT_CLIENT` | No | — | Default client name/id when `client` tool argument is omitted |
 
 ## 4. Complete MCP Tool Reference
 
-### remote_exec
+### remote_list_clients
 
-Execute a PowerShell command on the remote machine. Returns stdout, stderr, and exit code.
-
-| Parameter | Type | Required | Default | Constraints | Description |
-|-----------|------|----------|---------|-------------|-------------|
-| `command` | string | Yes | -- | -- | PowerShell command to execute |
-| `timeoutSeconds` | number | No | 30 | Max 300 | How long to wait for the command to complete |
+List every client the relay knows about. No parameters.
 
 **Returns** (JSON):
 ```json
 {
-  "output": "REMOTE-PC",
-  "exitCode": 0
+  "count": 2,
+  "connected": 2,
+  "clients": [
+    {"id": "a3f1...", "name": "comos-1", "lastPoll": "2026-04-16T10:00:00Z", "secondsAgo": 1, "connected": true},
+    {"id": "b7c2...", "name": "build-server", "lastPoll": "2026-04-16T10:00:02Z", "secondsAgo": 0, "connected": true}
+  ]
 }
 ```
 
-**Error responses (exitCode = -1):**
-
-| output prefix | Meaning |
-|--------------|---------|
-| `[ERROR] No client connected` | Client has not polled in the last 10 seconds |
-| `[ERROR] Another command is pending` | A command is already in progress (SemaphoreSlim timeout after 2s) |
-| `[TIMEOUT] No response after Xs` | Command did not complete within timeoutSeconds |
-| `[KILLED] Command exceeded 60s timeout` | Client-side process kill after 60 seconds |
-| `[EXEC ERROR] ...` | PowerShell process failed to start or crashed |
-
-**Execution details:**
-- Shell: `powershell.exe -NoProfile -NonInteractive -Command "<command>"`
-- Double quotes in the command are escaped automatically
-- Output is combined stdout + stderr (stderr prefixed with `[STDERR]`)
-- Only one command executes at a time (server-side semaphore)
-- Client-side hard kill at 60 seconds regardless of timeoutSeconds
+**Always call this first when there could be more than one target machine.**
 
 ### remote_status
 
-Check if the remote client is connected to the relay server. Takes no parameters.
+Check connection status. Without `client` returns aggregate; with `client` returns per-client details.
 
-| Parameter | Type | Required |
-|-----------|------|----------|
-| _(none)_ | -- | -- |
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `client` | string | No | Target client name or id. If omitted, returns aggregate. |
 
-**Returns** (JSON):
+**Aggregate response:**
 ```json
-{
-  "clientConnected": true,
-  "lastPoll": "2026-02-11T14:20:18Z",
-  "secondsAgo": 2,
-  "encryption": "AES-256-GCM",
-  "tls": true
-}
+{"clientConnected": true, "totalClients": 2, "connectedClients": 2, "encryption": "AES-256-GCM", "tls": true}
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `clientConnected` | boolean | True if client polled within the last 10 seconds |
-| `lastPoll` | string (ISO 8601) | UTC timestamp of the last client poll |
-| `secondsAgo` | integer | Seconds since last poll (-1 if disconnected) |
-| `encryption` | string | Always `"AES-256-GCM"` |
-| `tls` | boolean | Whether TLS is enabled on the relay |
+**Per-client response:**
+```json
+{"clientConnected": true, "name": "comos-1", "id": "a3f1...", "lastPoll": "2026-04-16T10:00:00Z", "secondsAgo": 1, "encryption": "AES-256-GCM", "tls": true}
+```
+
+### remote_exec
+
+Execute a PowerShell command on a target client.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `command` | string | Yes | — | PowerShell command to execute |
+| `timeoutSeconds` | number | No | 30 | Server-side wait timeout (max 300) |
+| `client` | string | No | auto | Target client name or id |
+
+**Target selection** (when `client` is omitted):
+1. If `REMOTECMD_DEFAULT_CLIENT` env is set → that client.
+2. Else if exactly one client is connected → that one.
+3. Else → error: `[ERROR] Multiple clients connected (name-a, name-b); specify ?client=<name|id>`.
+
+**Error prefixes on exitCode = -1:**
+
+| Prefix | Meaning |
+|-------|---------|
+| `[ERROR] No client connected` | No sessions polled in the last 10 s |
+| `[ERROR] Unknown client '<x>'` | No session with that name or id |
+| `[ERROR] Client '<x>' not connected` | Session exists but lastPoll > 10 s ago |
+| `[ERROR] Multiple clients connected (...)` | Omitted `client` but 2+ connected |
+| `[ERROR] Another command is pending on '<x>'` | That client is busy |
+| `[TIMEOUT] No response from '<x>' after Xs` | Command did not complete |
 
 ### remote_upload
 
-Upload a file from the local machine to the remote machine. Maximum file size is 200MB.
+Upload a local file to a target client (max 200MB).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `localPath` | string | Yes | Absolute path to the file on the local machine |
-| `remotePath` | string | Yes | Absolute path where the file should be saved on the remote machine |
-
-**Returns** (JSON on success):
-```json
-{
-  "status": "ok",
-  "size": 254976
-}
-```
-
-**Error conditions:**
-- Local file not found: returns `isError: true` with message
-- No client connected: `{"error": "No client connected"}`
-- Transfer timeout (5 minutes): `{"error": "Upload timeout"}`
-
-**Notes:**
-- Directories are created automatically on the remote machine
-- File data is encrypted with AES-256-GCM in transit
-- The MCP server reads the entire file into memory before sending
+| `remotePath` | string | Yes | Absolute path on the remote machine |
+| `client` | string | No | Target client name or id |
 
 ### remote_download
 
-Download a file from the remote machine to the local machine. Maximum file size is 200MB.
+Download a file from a target client to the local machine (max 200MB).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `remotePath` | string | Yes | Absolute path to the file on the remote machine |
-| `localPath` | string | Yes | Absolute path where the file should be saved locally |
-
-**Returns** (JSON on success):
-```json
-{
-  "status": "ok",
-  "size": 102400,
-  "localPath": "C:\\Users\\user\\Desktop\\remote-file.log"
-}
-```
-
-**Error conditions:**
-- File not found on remote: `{"error": "File not found: C:\\path\\to\\file"}`
-- No client connected: `{"error": "No client connected"}`
-- Transfer timeout (5 minutes): HTTP 504
-
-**Notes:**
-- Local directories are created automatically
-- Existing local files are overwritten
-- File data is encrypted with AES-256-GCM in transit
+| `remotePath` | string | Yes | Absolute path on the remote machine |
+| `localPath` | string | Yes | Absolute path on the local machine |
+| `client` | string | No | Target client name or id |
 
 ## 5. Workflow Recipes
 
-### Check if the remote machine is connected
+### See what machines are available
 
 ```
-Use remote_status tool (no parameters).
-If clientConnected is true, the machine is reachable.
-If false, the client is not running or has lost connectivity.
+remote_list_clients            (no args)
 ```
 
-### Run a diagnostic command
+### Run a command on the default target
 
 ```
-remote_exec with command: "hostname"
-remote_exec with command: "Get-Process | Select-Object -First 10"
-remote_exec with command: "Get-Service | Where-Object Status -eq Running"
-remote_exec with command: "Get-CimInstance Win32_LogicalDisk | Select DeviceID, FreeSpace, Size"
-remote_exec with command: "systeminfo | Select-String 'Total Physical Memory'"
+remote_exec command:"hostname"
 ```
 
-### Deploy a file to the remote machine
+If multiple clients are connected and no default is set, this returns an error listing the connected names.
+
+### Run a command on a specific machine
 
 ```
-1. remote_status  (verify client is connected)
-2. remote_upload with localPath: "C:\local\app.zip", remotePath: "C:\Users\user\Desktop\app.zip"
-3. remote_exec with command: "Expand-Archive -Path C:\Users\user\Desktop\app.zip -DestinationPath C:\Apps\myapp -Force"
+remote_exec command:"Get-Service -Name MyService" client:"comos-1"
 ```
 
-### Retrieve a file from the remote machine
+### Switch between clients across a session
 
 ```
-1. remote_status  (verify client is connected)
-2. remote_download with remotePath: "C:\Logs\app.log", localPath: "C:\Users\user\Desktop\app.log"
+remote_list_clients                                          (discover)
+remote_exec client:"comos-1"  command:"hostname"             (A reports hostname)
+remote_exec client:"build-srv" command:"Get-Service"         (B reports services)
+remote_upload  client:"build-srv" localPath:"..."  remotePath:"C:\drop\app.zip"
+remote_exec    client:"build-srv" command:"Expand-Archive C:\drop\app.zip -DestinationPath C:\Apps\myapp -Force"
 ```
 
-### Complex multi-step operation
+### Deploy the same artifact to multiple machines
 
 ```
-1. remote_status
-2. remote_exec: "Stop-Service MyService"
-3. remote_upload: deploy new binary
-4. remote_exec: "Start-Service MyService"
-5. remote_exec: "Get-Service MyService | Select Status"
+remote_list_clients                                         (list all)
+# loop over clients, skipping any with connected=false:
+remote_upload client:"comos-1"    localPath:"..." remotePath:"C:\dest\app.zip"
+remote_upload client:"comos-2"    localPath:"..." remotePath:"C:\dest\app.zip"
+remote_upload client:"build-srv"  localPath:"..." remotePath:"C:\dest\app.zip"
+```
+
+Because each client has its own `SemaphoreSlim`, uploads to different clients run in parallel on the server — but note that the MCP tool calls themselves are issued serially by Claude Code.
+
+### Verify connectivity before a long operation
+
+```
+remote_status client:"comos-1"
+# if clientConnected == false → client is down, do not proceed.
+remote_exec client:"comos-1" command:"chkdsk C: /scan" timeoutSeconds:300
 ```
 
 ### Long-running command
 
 ```
-remote_exec with command: "chkdsk C: /scan", timeoutSeconds: 300
+remote_exec command:"chkdsk C: /scan" timeoutSeconds:300 client:"comos-1"
 ```
+
+The client still has a hard-coded 60 s process kill. For anything over 60 s, launch as a background job: `Start-Job { chkdsk C: /scan }` and poll for completion.
 
 ## 6. Security Considerations
 
-- **Token-based authentication**: All API endpoints require a shared token via `?token=<TOKEN>` query parameter or `X-Token` header. Minimum 24 characters recommended for production use.
-- **AES-256-GCM payload encryption**: All sensitive data (commands, results, file contents, file metadata) is encrypted even over HTTP. Key is derived from the shared token.
-- **TLS transport**: Self-signed certificate auto-generated on server startup (RSA 2048, SHA256, 5-year validity). Client accepts self-signed certificates by default (certificate validation disabled). Use `--no-tls` for HTTP-only mode (payload encryption remains active).
-- **No command sandboxing**: PowerShell execution is completely unrestricted. Any command the client process can run will be executed. There is no allowlist, denylist, or role-based access.
-- **No path traversal protection**: File upload and download accept any absolute path. The only restriction is the OS file system permissions of the user running the client process.
-- **No rate limiting**: The relay server does not limit request frequency. A compromised token allows unlimited command execution.
-- **Single static token**: No token rotation, expiry, or multi-user support. Protect the token as you would a root password.
-- **Token in query parameters**: When using `?token=` (vs. `X-Token` header), the token may appear in proxy logs, server access logs, and HTTP Referer headers.
+- **Token-based authentication** on every `/api/*` endpoint, accepted via `?token=<T>`, `X-Token: <T>` header, or `Authorization: Bearer <T>`. Constant-time comparison used server-side. Prefer header/Bearer over query string in production — query strings leak into proxy logs.
+- **AES-256-GCM payload encryption** on commands, results, file contents, and file metadata. Key derived from the shared token (`SHA256("RemoteCmd:v1:" + token)`).
+- **TLS transport** — self-signed certificate auto-generated on server startup. Client accepts self-signed certs.
+- **No command sandboxing** — PowerShell execution is unrestricted. Any command the client process can run will be executed.
+- **No path traversal protection** — upload/download accept any absolute path.
+- **No rate limiting** — a compromised token allows unlimited command execution.
+- **Single shared token** — no rotation, expiry, or per-client auth. Every client knows the same token.
+- **Stable client id persisted to disk** — if the disk is compromised, the id can be replayed but the attacker still needs the token.
 
 ## 7. Operational Details
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
-| Client poll interval | 800ms | Continuous loop while connected |
-| Command timeout (default) | 30 seconds | Configurable per request via `timeoutSeconds` |
-| Command timeout (max) | 300 seconds | Server-side limit |
-| Process kill timeout | 60 seconds | Client kills the PowerShell process after 60s regardless |
-| File transfer timeout | 5 minutes | Both upload and download |
-| Max file size | 200MB | Server request body limit and transfer cap |
-| Max request body | 200MB | Kestrel `MaxRequestBodySize` setting |
-| Client connection detection | 10 seconds | Client considered connected if last poll < 10s ago |
-| Auto-reconnect backoff | 1s, 2s, 4s, 8s, 16s, 30s | Exponential, capped at 30 seconds |
-| Command concurrency | 1 | SemaphoreSlim(1) on the server, 2s wait before rejecting |
-| Shell | `powershell.exe -NoProfile -NonInteractive` | No user profile loaded, no interactive prompts |
-| MCP transport | STDIO | MCP Server communicates with Claude Code via stdin/stdout |
-| HTTP client timeout | 5 minutes (300s) | MCP Server HTTP request timeout |
-| Server port | 7890 | Hardcoded in both server and client |
-| Self-contained client exe | ~68MB | Includes .NET runtime, no dependencies on target |
+| Client poll interval | 800 ms | Continuous loop while connected |
+| Command timeout (default) | 30 s | Configurable via `timeoutSeconds` |
+| Command timeout (max) | 300 s | Server-side cap |
+| Process kill timeout | 60 s | Client kills PowerShell regardless |
+| File transfer timeout | 5 min | Upload and download |
+| Max file / body size | 200 MB | Kestrel `MaxRequestBodySize` |
+| Client connection detection | 10 s | Connected if lastPoll < 10 s ago |
+| Auto-reconnect backoff | 1, 2, 4, 8, 16, 30 s | Exponential, capped at 30 |
+| Command concurrency | 1 per client | Different clients run in parallel |
+| Shell | `powershell.exe -NoProfile -NonInteractive` | |
+| Client ID location | `%LOCALAPPDATA%\RemoteCmd\client.id` | Persisted GUID |
+| MCP transport | STDIO | |
+| Server port | 7890 (TCP) | Hardcoded |
+| Self-contained client exe | ~68 MB | Includes .NET runtime |
 
 ## 8. Tips & Gotchas
 
-- **Always check status first.** Before sending commands or file transfers, call `remote_status` to verify the client is connected. If `clientConnected` is false, all operations will fail with "No client connected".
+- **List before you execute.** On any session where there might be more than one target, call `remote_list_clients` first and confirm which machine you mean.
 
-- **One command at a time.** The relay enforces single-command concurrency. If you send a second command while the first is still executing, you get "Another command is pending". Wait for the first to complete or timeout.
+- **Name your clients explicitly.** Use `--name comos-1` when starting the client so the server has a memorable identifier. Without it, the default is `Environment.MachineName` — fine for unique hostnames, confusing when you have two `DESKTOP-XXXXX` machines.
 
-- **Long-running commands need increased timeout.** The default is 30 seconds. For operations like `chkdsk`, `sfc /scannow`, large file copies, or software installations, set `timeoutSeconds` up to 300.
+- **One command at a time per client.** Different clients run in parallel but each client still serializes its commands. If you send a second command to the same client while the first is running you get `[ERROR] Another command is pending on '<name>'`.
 
-- **The 60-second hard kill is on the client side.** Even if you set `timeoutSeconds: 300`, the client will kill the PowerShell process after 60 seconds. The server timeout controls how long the server waits for a response; the client kill timeout is hardcoded at 60 seconds. For commands genuinely needing more than 60 seconds, consider launching them as background jobs.
+- **Long-running commands need increased timeout.** Default is 30 s; set `timeoutSeconds` up to 300. But the client still kills at 60 s — for > 60 s work, use `Start-Job`.
 
-- **File paths on the remote machine use Windows backslashes.** When specifying `remotePath`, use `C:\Users\user\file.txt`, not forward slashes.
+- **File paths use Windows backslashes.** `remotePath` on a Windows target: `C:\Users\user\file.txt`.
 
-- **Directories are created automatically.** Both upload (on remote) and download (locally) will create parent directories if they do not exist.
+- **Large files are held in memory** on both the relay and the MCP server. Plan for 200 MB per in-flight transfer.
 
-- **Large files are held in memory.** Both the relay server and MCP server buffer entire files in memory. A 200MB upload requires ~200MB RAM on the server side and ~200MB on the MCP server side.
+- **Client reconnects automatically** with exponential backoff. After a server restart, wait a few seconds and it's back.
 
-- **Errors are returned as JSON, not HTTP error codes.** Most error conditions (client disconnected, timeout, killed) still return HTTP 200 with an error message in the JSON body and `exitCode: -1`.
+- **PowerShell profile is not loaded.** `-NoProfile` means custom aliases and profile scripts are not available.
 
-- **Client reconnects automatically.** If the relay server restarts or the network drops, the client will retry with exponential backoff (1s to 30s). No manual intervention needed.
+- **stderr is included in output** prefixed with `[STDERR]`.
 
-- **PowerShell profile is not loaded.** Commands run with `-NoProfile`, so custom aliases, functions, and profile scripts from the remote user's PowerShell profile are not available.
+- **The token is the only security boundary.** Anyone with the token has full PowerShell access on every connected target. Treat it with the same care as a root password.
 
-- **stderr is included in output.** If a command produces stderr output, it appears after `[STDERR]` in the combined output string.
-
-- **The token is the only security boundary.** Anyone with the token has full PowerShell access and arbitrary file read/write on the target machine. Treat the token with the same care as a root password or SSH private key.
+- **Backward compatibility:** A client without a `clientId` parameter is accepted as a "legacy-<ip>" session. Always upgrade both client and server together.
