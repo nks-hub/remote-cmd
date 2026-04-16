@@ -11,17 +11,24 @@ import path from "path";
 
 const SERVER_URL = process.env.REMOTECMD_URL || "https://localhost:7890";
 const TOKEN = process.env.REMOTECMD_TOKEN || "";
+const DEFAULT_CLIENT = process.env.REMOTECMD_DEFAULT_CLIENT || "";
 const isHttps = SERVER_URL.startsWith("https");
 const transport_module = isHttps ? https : http;
 
-// Accept self-signed certificates
 if (isHttps) process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
-function apiCall(method, endpoint, body = null, isBinary = false) {
-  return new Promise((resolve, reject) => {
-    const url = new URL(endpoint, SERVER_URL);
-    url.searchParams.set("token", TOKEN);
+function buildUrl(endpoint, params = {}) {
+  const url = new URL(endpoint, SERVER_URL);
+  url.searchParams.set("token", TOKEN);
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, v);
+  }
+  return url;
+}
 
+function apiCall(method, endpoint, body = null, params = {}, isBinary = false) {
+  return new Promise((resolve, reject) => {
+    const url = buildUrl(endpoint, params);
     const options = {
       hostname: url.hostname,
       port: url.port,
@@ -29,7 +36,6 @@ function apiCall(method, endpoint, body = null, isBinary = false) {
       method,
       timeout: 300000,
     };
-
     if (body && !isBinary) {
       options.headers = { "Content-Type": "application/json" };
     }
@@ -64,12 +70,10 @@ function apiCall(method, endpoint, body = null, isBinary = false) {
   });
 }
 
-function uploadFile(localPath, remotePath) {
+function uploadFile(localPath, remotePath, client) {
   return new Promise((resolve, reject) => {
     const fileData = fs.readFileSync(localPath);
-    const url = new URL("/api/upload", SERVER_URL);
-    url.searchParams.set("token", TOKEN);
-    url.searchParams.set("path", remotePath);
+    const url = buildUrl("/api/upload", { path: remotePath, client });
 
     const options = {
       hostname: url.hostname,
@@ -106,11 +110,9 @@ function uploadFile(localPath, remotePath) {
   });
 }
 
-function downloadFile(remotePath, localPath) {
+function downloadFile(remotePath, localPath, client) {
   return new Promise((resolve, reject) => {
-    const url = new URL("/api/download", SERVER_URL);
-    url.searchParams.set("token", TOKEN);
-    url.searchParams.set("path", remotePath);
+    const url = buildUrl("/api/download", { path: remotePath, client });
 
     const options = {
       hostname: url.hostname,
@@ -150,8 +152,18 @@ function downloadFile(remotePath, localPath) {
   });
 }
 
+const clientProp = {
+  type: "string",
+  description:
+    "Target client name or ID. If omitted, uses REMOTECMD_DEFAULT_CLIENT env or auto-selects when exactly one client is connected.",
+};
+
+function resolveClient(args) {
+  return args.client || DEFAULT_CLIENT || undefined;
+}
+
 const server = new Server(
-  { name: "remote-cmd", version: "1.0.0" },
+  { name: "remote-cmd", version: "1.1.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -160,7 +172,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "remote_exec",
       description:
-        "Execute a PowerShell command on the remote machine (COMOS_1). Returns stdout, stderr and exit code.",
+        "Execute a PowerShell command on a remote client machine. Returns stdout, stderr and exit code. Use 'client' to target a specific machine when multiple are connected.",
       inputSchema: {
         type: "object",
         properties: {
@@ -173,6 +185,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             description: "Timeout in seconds (default 30, max 300)",
             default: 30,
           },
+          client: clientProp,
         },
         required: ["command"],
       },
@@ -180,7 +193,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "remote_status",
       description:
-        "Check if the remote client (COMOS_1) is connected to the relay server.",
+        "Check connection status. Without 'client' returns aggregate (total/connected clients). With 'client' returns details for that specific client.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          client: clientProp,
+        },
+      },
+    },
+    {
+      name: "remote_list_clients",
+      description:
+        "List all clients known to the relay server with their connection status, name, id, and last-poll time.",
       inputSchema: {
         type: "object",
         properties: {},
@@ -189,7 +213,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "remote_upload",
       description:
-        "Upload a file from local machine to the remote machine (COMOS_1). Max 200MB.",
+        "Upload a file from local machine to a remote client (max 200MB). Use 'client' when multiple clients are connected.",
       inputSchema: {
         type: "object",
         properties: {
@@ -202,6 +226,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             description:
               "Absolute path where file should be saved on remote machine",
           },
+          client: clientProp,
         },
         required: ["localPath", "remotePath"],
       },
@@ -209,7 +234,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "remote_download",
       description:
-        "Download a file from the remote machine (COMOS_1) to local machine. Max 200MB.",
+        "Download a file from a remote client to the local machine (max 200MB). Use 'client' when multiple clients are connected.",
       inputSchema: {
         type: "object",
         properties: {
@@ -221,6 +246,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             description: "Absolute path where file should be saved locally",
           },
+          client: clientProp,
         },
         required: ["remotePath", "localPath"],
       },
@@ -229,34 +255,38 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  const { name, arguments: args = {} } = request.params;
 
   try {
     switch (name) {
       case "remote_exec": {
-        const result = await apiCall("POST", "/api/exec", {
-          command: args.command,
-          timeoutSeconds: args.timeoutSeconds || 30,
-        });
+        const result = await apiCall(
+          "POST",
+          "/api/exec",
+          {
+            command: args.command,
+            timeoutSeconds: args.timeoutSeconds || 30,
+          },
+          { client: resolveClient(args) }
+        );
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
       }
 
       case "remote_status": {
-        const result = await apiCall("GET", "/api/status");
+        const result = await apiCall("GET", "/api/status", null, {
+          client: resolveClient(args),
+        });
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result, null, 2),
-            },
-          ],
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "remote_list_clients": {
+        const result = await apiCall("GET", "/api/clients");
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
       }
 
@@ -273,19 +303,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
         const stat = fs.statSync(args.localPath);
-        const result = await uploadFile(args.localPath, args.remotePath);
+        const result = await uploadFile(
+          args.localPath,
+          args.remotePath,
+          resolveClient(args)
+        );
         return {
           content: [
             {
               type: "text",
-              text: `Uploaded ${(stat.size / 1024 / 1024).toFixed(1)}MB: ${args.localPath} → ${args.remotePath}\n${JSON.stringify(result, null, 2)}`,
+              text: `Uploaded ${(stat.size / 1024 / 1024).toFixed(1)}MB: ${args.localPath} -> ${args.remotePath}\n${JSON.stringify(result, null, 2)}`,
             },
           ],
         };
       }
 
       case "remote_download": {
-        const result = await downloadFile(args.remotePath, args.localPath);
+        const result = await downloadFile(
+          args.remotePath,
+          args.localPath,
+          resolveClient(args)
+        );
         if (result.error) {
           return {
             content: [{ type: "text", text: `Error: ${result.error}` }],
@@ -296,7 +334,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: "text",
-              text: `Downloaded ${(result.size / 1024 / 1024).toFixed(1)}MB: ${args.remotePath} → ${args.localPath}`,
+              text: `Downloaded ${(result.size / 1024 / 1024).toFixed(1)}MB: ${args.remotePath} -> ${args.localPath}`,
             },
           ],
         };

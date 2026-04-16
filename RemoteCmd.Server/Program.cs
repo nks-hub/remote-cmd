@@ -1,15 +1,20 @@
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
-using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using RemoteCmd.Shared;
 
 var builder = WebApplication.CreateBuilder(args);
-builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 200_000_000); // 200MB
+builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 200_000_000);
 
-// Parse arguments: <token> [--no-tls]
-var token = args.Length > 0 && !args[0].StartsWith("-") ? args[0] : Guid.NewGuid().ToString("N")[..12];
-var noTls = args.Contains("--no-tls");
+var token = args.Length > 0 && !args[0].StartsWith("-")
+    ? args[0]
+    : Environment.GetEnvironmentVariable("REMOTECMD_TOKEN")
+      ?? Guid.NewGuid().ToString("N")[..12];
+var noTls = args.Contains("--no-tls")
+    || string.Equals(Environment.GetEnvironmentVariable("REMOTECMD_NO_TLS"), "1", StringComparison.Ordinal)
+    || string.Equals(Environment.GetEnvironmentVariable("REMOTECMD_NO_TLS"), "true", StringComparison.OrdinalIgnoreCase);
 
 if (noTls)
 {
@@ -17,7 +22,6 @@ if (noTls)
 }
 else
 {
-    // Generate self-signed certificate for HTTPS
     var cert = GenerateSelfSignedCert();
     var certPath = Path.Combine(AppContext.BaseDirectory, "remotecmd.pfx");
     var certPassword = Guid.NewGuid().ToString("N")[..16];
@@ -29,26 +33,16 @@ else
         o.Limits.MaxRequestBodySize = 200_000_000;
         o.ConfigureHttpsDefaults(https =>
         {
-            https.ServerCertificate = new X509Certificate2(certPath, certPassword);
+            https.ServerCertificate = X509CertificateLoader.LoadPkcs12FromFile(certPath, certPassword);
         });
     });
 }
 
 var app = builder.Build();
 
-// Initialize AES-256-GCM encryption from token
 Crypto.Init(token);
 
-string? pendingCommand = null;
-TaskCompletionSource<CommandResult>? resultTcs = null;
-DateTime lastClientPoll = DateTime.MinValue;
-var commandLock = new SemaphoreSlim(1, 1);
-
-// File transfer state
-FileTransfer? pendingUpload = null;
-TaskCompletionSource<bool>? uploadTcs = null;
-FileTransfer? pendingDownload = null;
-TaskCompletionSource<FileTransfer>? downloadTcs = null;
+var clients = new ConcurrentDictionary<string, ClientSession>();
 
 var protocol = noTls ? "http" : "https";
 Console.WriteLine("=== Remote CMD Relay Server ===");
@@ -56,23 +50,22 @@ Console.WriteLine($"Listening on: {protocol}://0.0.0.0:7890");
 Console.WriteLine($"Token: {token}");
 Console.WriteLine($"TLS: {(noTls ? "disabled" : "enabled (self-signed)")}");
 Console.WriteLine($"Encryption: AES-256-GCM (always on)");
+Console.WriteLine($"Multi-client: enabled");
 Console.WriteLine();
 Console.WriteLine("Client setup (run on target machine):");
 Console.WriteLine($"  RemoteCmd.Client.exe <THIS_SERVER_IP> {token}");
 Console.WriteLine();
-Console.WriteLine("API (local controller):");
-Console.WriteLine($"  curl -X POST {protocol}://localhost:7890/api/exec?token={token} -H \"Content-Type: application/json\" -d \"{{\\\"command\\\":\\\"hostname\\\"}}\"");
-Console.WriteLine();
 
-// Auth middleware - token required for /api/ endpoints
+// Auth middleware
 app.Use(async (context, next) =>
 {
     var path = context.Request.Path.Value ?? "";
     if (path.StartsWith("/api/"))
     {
         var reqToken = context.Request.Query["token"].FirstOrDefault()
-                       ?? context.Request.Headers["X-Token"].FirstOrDefault();
-        if (reqToken != token)
+                       ?? context.Request.Headers["X-Token"].FirstOrDefault()
+                       ?? ExtractBearer(context.Request.Headers["Authorization"].FirstOrDefault());
+        if (!TokensEqual(reqToken, token))
         {
             context.Response.StatusCode = 401;
             await context.Response.WriteAsync("Invalid token");
@@ -82,16 +75,15 @@ app.Use(async (context, next) =>
     await next();
 });
 
-// === Command execution (client-facing: encrypted) ===
+// === Client-facing: polling (encrypted) ===
 
-app.MapGet("/api/poll", () =>
+app.MapGet("/api/poll", (HttpRequest req) =>
 {
-    lastClientPoll = DateTime.UtcNow;
-    if (pendingCommand != null)
+    var session = TouchSession(req, clients);
+    if (session.PendingCommand != null)
     {
-        var cmd = pendingCommand;
-        pendingCommand = null;
-        // Encrypt command for client
+        var cmd = session.PendingCommand;
+        session.PendingCommand = null;
         return Results.Ok(new { command = Crypto.EncryptString(cmd) });
     }
     return Results.Ok(new { command = (string?)null });
@@ -99,58 +91,127 @@ app.MapGet("/api/poll", () =>
 
 app.MapPost("/api/result", async (HttpRequest req) =>
 {
-    // Client sends AES-encrypted result bytes
+    var session = TouchSession(req, clients);
     using var ms = new MemoryStream();
     await req.Body.CopyToAsync(ms);
-    var decryptedBytes = Crypto.Decrypt(ms.ToArray());
-    var result = JsonSerializer.Deserialize<CommandResult>(decryptedBytes, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-    if (result != null && resultTcs != null)
-        resultTcs.TrySetResult(result);
+    try
+    {
+        var decryptedBytes = Crypto.Decrypt(ms.ToArray());
+        var result = JsonSerializer.Deserialize<CommandResult>(decryptedBytes, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+        if (result != null) session.ResultTcs?.TrySetResult(result);
+    }
+    catch (Exception ex)
+    {
+        session.ResultTcs?.TrySetResult(new CommandResult { Output = $"[DECRYPT ERROR] {ex.Message}", ExitCode = -1 });
+    }
     return Results.Ok();
 });
 
-// === Command execution (controller-facing: plaintext, localhost) ===
+app.MapGet("/api/file-poll", (HttpRequest req) =>
+{
+    var session = TouchSession(req, clients);
+
+    if (session.PendingUpload != null)
+    {
+        var meta = JsonSerializer.Serialize(new { action = "upload", path = session.PendingUpload.Path, size = session.PendingUpload.Data!.Length });
+        return Results.Ok(new { e = Crypto.EncryptString(meta) });
+    }
+    if (session.PendingDownload != null)
+    {
+        var meta = JsonSerializer.Serialize(new { action = "download", path = session.PendingDownload.Path ?? "", size = 0 });
+        return Results.Ok(new { e = Crypto.EncryptString(meta) });
+    }
+    return Results.Ok(new { e = (string?)null });
+});
+
+app.MapGet("/api/file-data", (HttpRequest req) =>
+{
+    var session = TouchSession(req, clients);
+    if (session.PendingUpload?.Data == null) return Results.NotFound();
+    var encrypted = Crypto.Encrypt(session.PendingUpload.Data);
+    return Results.File(encrypted, "application/octet-stream");
+});
+
+app.MapPost("/api/file-done", (HttpRequest req) =>
+{
+    var session = TouchSession(req, clients);
+    session.PendingUpload = null;
+    session.UploadTcs?.TrySetResult(true);
+    return Results.Ok();
+});
+
+app.MapPost("/api/file-upload", async (HttpRequest req) =>
+{
+    var session = TouchSession(req, clients);
+    var error = req.Query["error"].FirstOrDefault();
+    if (!string.IsNullOrEmpty(error))
+    {
+        session.DownloadTcs?.TrySetResult(new FileTransfer { Error = error });
+        session.PendingDownload = null;
+        session.DownloadTcs = null;
+        return Results.Ok();
+    }
+
+    using var ms = new MemoryStream();
+    await req.Body.CopyToAsync(ms);
+    try
+    {
+        var decrypted = Crypto.Decrypt(ms.ToArray());
+        session.DownloadTcs?.TrySetResult(new FileTransfer { Data = decrypted });
+    }
+    catch (Exception ex)
+    {
+        session.DownloadTcs?.TrySetResult(new FileTransfer { Error = $"[DECRYPT ERROR] {ex.Message}" });
+    }
+    session.PendingDownload = null;
+    session.DownloadTcs = null;
+    return Results.Ok();
+});
+
+// === Controller-facing: commands, file transfer ===
 
 app.MapPost("/api/exec", async (HttpRequest req) =>
 {
-    var body = await req.ReadFromJsonAsync<CommandRequest>();
+    CommandRequest? body;
+    try { body = await req.ReadFromJsonAsync<CommandRequest>(); }
+    catch { return Results.BadRequest(new { error = "Invalid JSON body" }); }
+
     if (body?.Command == null)
         return Results.BadRequest(new { error = "Missing command" });
 
-    var isConnected = (DateTime.UtcNow - lastClientPoll).TotalSeconds < 10;
-    if (!isConnected)
-        return Results.Ok(new CommandResult { Output = "[ERROR] No client connected", ExitCode = -1 });
+    var target = ResolveTarget(req, clients);
+    if (target.Error != null)
+        return Results.Ok(new CommandResult { Output = $"[ERROR] {target.Error}", ExitCode = -1 });
 
-    if (!await commandLock.WaitAsync(TimeSpan.FromSeconds(2)))
-        return Results.Ok(new CommandResult { Output = "[ERROR] Another command is pending", ExitCode = -1 });
+    var session = target.Session!;
+    if (!await session.CommandLock.WaitAsync(TimeSpan.FromSeconds(2)))
+        return Results.Ok(new CommandResult { Output = $"[ERROR] Another command is pending on '{session.Name}'", ExitCode = -1 });
 
     try
     {
-        resultTcs = new TaskCompletionSource<CommandResult>();
-        pendingCommand = body.Command;
+        session.ResultTcs = new TaskCompletionSource<CommandResult>();
+        session.PendingCommand = body.Command;
 
-        var timeout = body.TimeoutSeconds > 0 ? body.TimeoutSeconds : 30;
+        var timeout = body.TimeoutSeconds > 0 ? Math.Min(body.TimeoutSeconds, 300) : 30;
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeout));
 
         try
         {
-            var result = await resultTcs.Task.WaitAsync(cts.Token);
+            var result = await session.ResultTcs.Task.WaitAsync(cts.Token);
             return Results.Ok(result);
         }
         catch (OperationCanceledException)
         {
-            pendingCommand = null;
-            return Results.Ok(new CommandResult { Output = $"[TIMEOUT] No response after {timeout}s", ExitCode = -1 });
+            session.PendingCommand = null;
+            return Results.Ok(new CommandResult { Output = $"[TIMEOUT] No response from '{session.Name}' after {timeout}s", ExitCode = -1 });
         }
     }
     finally
     {
-        resultTcs = null;
-        commandLock.Release();
+        session.ResultTcs = null;
+        session.CommandLock.Release();
     }
 });
-
-// === File transfer: Upload (local → remote, encrypted) ===
 
 app.MapPost("/api/upload", async (HttpRequest req) =>
 {
@@ -158,71 +219,35 @@ app.MapPost("/api/upload", async (HttpRequest req) =>
     if (string.IsNullOrEmpty(remotePath))
         return Results.BadRequest(new { error = "Missing ?path= parameter" });
 
-    var isConnected = (DateTime.UtcNow - lastClientPoll).TotalSeconds < 10;
-    if (!isConnected)
-        return Results.BadRequest(new { error = "No client connected" });
+    var target = ResolveTarget(req, clients);
+    if (target.Error != null)
+        return Results.BadRequest(new { error = target.Error });
+
+    var session = target.Session!;
 
     using var ms = new MemoryStream();
     await req.Body.CopyToAsync(ms);
     var data = ms.ToArray();
 
-    Console.WriteLine($"[UPLOAD] {data.Length / 1024 / 1024}MB → {remotePath}");
+    Console.WriteLine($"[UPLOAD] {session.Name}: {data.Length / 1024 / 1024}MB -> {remotePath}");
 
-    pendingUpload = new FileTransfer { Path = remotePath, Data = data };
-    uploadTcs = new TaskCompletionSource<bool>();
+    session.PendingUpload = new FileTransfer { Path = remotePath, Data = data };
+    session.UploadTcs = new TaskCompletionSource<bool>();
 
     using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
     try
     {
-        var ok = await uploadTcs.Task.WaitAsync(cts.Token);
-        return ok ? Results.Ok(new { status = "ok", size = data.Length }) : Results.StatusCode(500);
+        var ok = await session.UploadTcs.Task.WaitAsync(cts.Token);
+        return ok
+            ? Results.Ok(new { status = "ok", size = data.Length, client = session.Name })
+            : Results.StatusCode(500);
     }
     catch (OperationCanceledException)
     {
-        pendingUpload = null;
+        session.PendingUpload = null;
         return Results.Ok(new { error = "Upload timeout" });
     }
 });
-
-// Client polls for pending file transfers (encrypted metadata)
-app.MapGet("/api/file-poll", () =>
-{
-    lastClientPoll = DateTime.UtcNow;
-
-    if (pendingUpload != null)
-    {
-        var meta = JsonSerializer.Serialize(new { action = "upload", path = pendingUpload.Path, size = pendingUpload.Data!.Length });
-        return Results.Ok(new { e = Crypto.EncryptString(meta) });
-    }
-
-    if (downloadTcs != null)
-    {
-        var meta = JsonSerializer.Serialize(new { action = "download", path = pendingDownload?.Path ?? "", size = 0 });
-        return Results.Ok(new { e = Crypto.EncryptString(meta) });
-    }
-
-    return Results.Ok(new { e = (string?)null });
-});
-
-// Client downloads file data for upload-to-remote (encrypted bytes)
-app.MapGet("/api/file-data", () =>
-{
-    if (pendingUpload?.Data == null)
-        return Results.NotFound();
-
-    var encrypted = Crypto.Encrypt(pendingUpload.Data);
-    return Results.File(encrypted, "application/octet-stream");
-});
-
-// Client confirms upload complete
-app.MapPost("/api/file-done", () =>
-{
-    pendingUpload = null;
-    uploadTcs?.TrySetResult(true);
-    return Results.Ok();
-});
-
-// === File transfer: Download (remote → local, encrypted) ===
 
 app.MapGet("/api/download", async (HttpRequest req) =>
 {
@@ -230,80 +255,158 @@ app.MapGet("/api/download", async (HttpRequest req) =>
     if (string.IsNullOrEmpty(remotePath))
         return Results.BadRequest(new { error = "Missing ?path= parameter" });
 
-    var isConnected = (DateTime.UtcNow - lastClientPoll).TotalSeconds < 10;
-    if (!isConnected)
-        return Results.BadRequest(new { error = "No client connected" });
+    var target = ResolveTarget(req, clients);
+    if (target.Error != null)
+        return Results.BadRequest(new { error = target.Error });
 
-    Console.WriteLine($"[DOWNLOAD] ← {remotePath}");
+    var session = target.Session!;
 
-    pendingDownload = new FileTransfer { Path = remotePath };
-    downloadTcs = new TaskCompletionSource<FileTransfer>();
+    Console.WriteLine($"[DOWNLOAD] {session.Name}: <- {remotePath}");
+
+    session.PendingDownload = new FileTransfer { Path = remotePath };
+    session.DownloadTcs = new TaskCompletionSource<FileTransfer>();
 
     using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
     try
     {
-        var result = await downloadTcs.Task.WaitAsync(cts.Token);
+        var result = await session.DownloadTcs.Task.WaitAsync(cts.Token);
         if (result.Data == null)
             return Results.NotFound(new { error = result.Error ?? "File not found" });
         return Results.File(result.Data, "application/octet-stream", Path.GetFileName(remotePath));
     }
     catch (OperationCanceledException)
     {
-        pendingDownload = null;
-        downloadTcs = null;
+        session.PendingDownload = null;
+        session.DownloadTcs = null;
         return Results.StatusCode(504);
     }
 });
 
-// Client uploads file data for download-from-remote (encrypted bytes)
-app.MapPost("/api/file-upload", async (HttpRequest req) =>
-{
-    var error = req.Query["error"].FirstOrDefault();
-    if (!string.IsNullOrEmpty(error))
-    {
-        downloadTcs?.TrySetResult(new FileTransfer { Error = error });
-        pendingDownload = null;
-        downloadTcs = null;
-        return Results.Ok();
-    }
+// === Info endpoints ===
 
-    using var ms = new MemoryStream();
-    await req.Body.CopyToAsync(ms);
-    // Decrypt file data from client
-    var decrypted = Crypto.Decrypt(ms.ToArray());
-    downloadTcs?.TrySetResult(new FileTransfer { Data = decrypted });
-    pendingDownload = null;
-    downloadTcs = null;
-    return Results.Ok();
+app.MapGet("/api/clients", () =>
+{
+    var list = clients.Values
+        .OrderBy(c => c.Name)
+        .Select(c => new
+        {
+            id = c.Id,
+            name = c.Name,
+            lastPoll = c.LastPoll,
+            secondsAgo = c.LastPoll == DateTime.MinValue ? -1 : (int)(DateTime.UtcNow - c.LastPoll).TotalSeconds,
+            connected = c.IsConnected()
+        }).ToList();
+    return Results.Ok(new { count = list.Count, connected = list.Count(x => x.connected), clients = list });
 });
 
-// === Status (plaintext) ===
-
-app.MapGet("/api/status", () =>
+app.MapGet("/api/status", (HttpRequest req) =>
 {
-    var connected = (DateTime.UtcNow - lastClientPoll).TotalSeconds < 10;
+    var clientParam = req.Query["client"].FirstOrDefault();
+    if (!string.IsNullOrEmpty(clientParam))
+    {
+        var s = FindByNameOrId(clients, clientParam);
+        if (s == null) return Results.NotFound(new { error = $"Unknown client '{clientParam}'" });
+        return Results.Ok(new
+        {
+            clientConnected = s.IsConnected(),
+            name = s.Name,
+            id = s.Id,
+            lastPoll = s.LastPoll,
+            secondsAgo = s.LastPoll == DateTime.MinValue ? -1 : (int)(DateTime.UtcNow - s.LastPoll).TotalSeconds,
+            encryption = "AES-256-GCM",
+            tls = !noTls
+        });
+    }
+
+    var connectedCount = clients.Values.Count(c => c.IsConnected());
     return Results.Ok(new
     {
-        clientConnected = connected,
-        lastPoll = lastClientPoll,
-        secondsAgo = connected ? (int)(DateTime.UtcNow - lastClientPoll).TotalSeconds : -1,
+        clientConnected = connectedCount > 0,
+        totalClients = clients.Count,
+        connectedClients = connectedCount,
         encryption = "AES-256-GCM",
         tls = !noTls
     });
 });
 
 app.MapGet("/", () => Results.Text(
-    "Remote CMD Relay Server v1.0.0\n" +
-    $"Encryption: AES-256-GCM | TLS: {(noTls ? "off" : "self-signed")}\n\n" +
-    "GET  /api/status                    - Check client\n" +
-    "POST /api/exec                      - Run command {\"command\":\"...\", \"timeoutSeconds\":30}\n" +
-    "POST /api/upload?path=C:\\dest\\f.zip  - Upload file to remote (--data-binary @local.zip)\n" +
-    "GET  /api/download?path=C:\\src\\f.zip - Download file from remote\n" +
-    "All endpoints need ?token=<TOKEN>", "text/plain"));
+    "Remote CMD Relay Server v1.1.0 (multi-client)\n" +
+    $"Encryption: AES-256-GCM | TLS: {(noTls ? "off" : "self-signed")}\n" +
+    $"Connected clients: {clients.Values.Count(c => c.IsConnected())}/{clients.Count}\n\n" +
+    "GET  /api/status[?client=X]                - Check client(s)\n" +
+    "GET  /api/clients                          - List all clients\n" +
+    "POST /api/exec[?client=X]                  - Run command {\"command\":\"...\"}\n" +
+    "POST /api/upload?path=...[&client=X]       - Upload file (binary body)\n" +
+    "GET  /api/download?path=...[&client=X]     - Download file\n" +
+    "All endpoints need token (query/header/Bearer).", "text/plain"));
 
 app.Run();
 
-// === Self-signed certificate generation ===
+// === Helpers ===
+
+static string? ExtractBearer(string? authHeader)
+{
+    if (string.IsNullOrEmpty(authHeader)) return null;
+    const string prefix = "Bearer ";
+    return authHeader.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+        ? authHeader[prefix.Length..].Trim()
+        : null;
+}
+
+static bool TokensEqual(string? a, string b)
+{
+    if (a == null || a.Length != b.Length) return false;
+    var aBytes = System.Text.Encoding.UTF8.GetBytes(a);
+    var bBytes = System.Text.Encoding.UTF8.GetBytes(b);
+    return CryptographicOperations.FixedTimeEquals(aBytes, bBytes);
+}
+
+static ClientSession TouchSession(HttpRequest req, ConcurrentDictionary<string, ClientSession> clients)
+{
+    var clientId = req.Query["clientId"].FirstOrDefault();
+    var name = req.Query["name"].FirstOrDefault();
+
+    if (string.IsNullOrEmpty(clientId))
+    {
+        // Legacy client without clientId: synthesize stable id from remote IP
+        var ip = req.HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        clientId = "legacy-" + ip;
+        name ??= ip;
+    }
+    name ??= clientId;
+
+    var session = clients.GetOrAdd(clientId, id => new ClientSession { Id = id, Name = name });
+    session.Name = name;
+    session.LastPoll = DateTime.UtcNow;
+    return session;
+}
+
+static ClientSession? FindByNameOrId(ConcurrentDictionary<string, ClientSession> clients, string nameOrId)
+{
+    if (clients.TryGetValue(nameOrId, out var byId)) return byId;
+    return clients.Values.FirstOrDefault(c =>
+        string.Equals(c.Name, nameOrId, StringComparison.OrdinalIgnoreCase));
+}
+
+static TargetResolution ResolveTarget(HttpRequest req, ConcurrentDictionary<string, ClientSession> clients)
+{
+    var clientParam = req.Query["client"].FirstOrDefault();
+
+    if (!string.IsNullOrEmpty(clientParam))
+    {
+        var s = FindByNameOrId(clients, clientParam);
+        if (s == null) return new TargetResolution { Error = $"Unknown client '{clientParam}'" };
+        if (!s.IsConnected()) return new TargetResolution { Error = $"Client '{s.Name}' not connected" };
+        return new TargetResolution { Session = s };
+    }
+
+    var connected = clients.Values.Where(c => c.IsConnected()).ToList();
+    if (connected.Count == 0) return new TargetResolution { Error = "No client connected" };
+    if (connected.Count == 1) return new TargetResolution { Session = connected[0] };
+
+    var names = string.Join(", ", connected.Select(c => c.Name));
+    return new TargetResolution { Error = $"Multiple clients connected ({names}); specify ?client=<name|id>" };
+}
 
 static X509Certificate2 GenerateSelfSignedCert()
 {
@@ -319,34 +422,54 @@ static X509Certificate2 GenerateSelfSignedCert()
     request.CertificateExtensions.Add(
         new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature, false));
 
-    // SAN: localhost + wildcard IPs
     var sanBuilder = new SubjectAlternativeNameBuilder();
     sanBuilder.AddDnsName("localhost");
-    sanBuilder.AddDnsName("*");
     sanBuilder.AddIpAddress(System.Net.IPAddress.Loopback);
     sanBuilder.AddIpAddress(System.Net.IPAddress.IPv6Loopback);
     request.CertificateExtensions.Add(sanBuilder.Build());
 
-    var cert = request.CreateSelfSigned(
+    return request.CreateSelfSigned(
         DateTimeOffset.UtcNow.AddDays(-1),
         DateTimeOffset.UtcNow.AddYears(5));
-
-    return cert;
 }
 
 // === Models ===
 
-record CommandRequest(string Command, int TimeoutSeconds = 30);
+public record CommandRequest(string Command, int TimeoutSeconds = 30);
 
-record CommandResult
+public record CommandResult
 {
     public string Output { get; set; } = "";
     public int ExitCode { get; set; }
 }
 
-class FileTransfer
+public class FileTransfer
 {
     public string? Path { get; set; }
     public byte[]? Data { get; set; }
     public string? Error { get; set; }
 }
+
+public class ClientSession
+{
+    public string Id { get; set; } = "";
+    public string Name { get; set; } = "";
+    public DateTime LastPoll { get; set; } = DateTime.MinValue;
+    public string? PendingCommand { get; set; }
+    public TaskCompletionSource<CommandResult>? ResultTcs { get; set; }
+    public FileTransfer? PendingUpload { get; set; }
+    public TaskCompletionSource<bool>? UploadTcs { get; set; }
+    public FileTransfer? PendingDownload { get; set; }
+    public TaskCompletionSource<FileTransfer>? DownloadTcs { get; set; }
+    public SemaphoreSlim CommandLock { get; } = new(1, 1);
+
+    public bool IsConnected() => (DateTime.UtcNow - LastPoll).TotalSeconds < 10;
+}
+
+public class TargetResolution
+{
+    public ClientSession? Session { get; set; }
+    public string? Error { get; set; }
+}
+
+public partial class Program { }

@@ -1,17 +1,26 @@
 using System.Security.Cryptography;
 using System.Text;
 
-static class Crypto
+namespace RemoteCmd.Shared;
+
+/// <summary>
+/// AES-256-GCM encryption with key derived from a shared token via SHA256.
+/// Wire format: nonce(12) + tag(16) + ciphertext(N).
+/// </summary>
+public static class Crypto
 {
     private static byte[] _key = null!;
 
     /// <summary>
-    /// Derive AES-256 key from shared token using SHA256
+    /// Derive AES-256 key from shared token using SHA256.
     /// </summary>
     public static void Init(string token)
     {
         _key = SHA256.HashData(Encoding.UTF8.GetBytes("RemoteCmd:v1:" + token));
     }
+
+    /// <summary>Reset key state. Test-only.</summary>
+    internal static void Reset() => _key = null!;
 
     public static byte[] Encrypt(byte[] data)
     {
@@ -23,7 +32,6 @@ static class Crypto
         using var aes = new AesGcm(_key, 16);
         aes.Encrypt(nonce, data, ciphertext, tag);
 
-        // Format: nonce(12) + tag(16) + ciphertext(N)
         var result = new byte[28 + ciphertext.Length];
         Buffer.BlockCopy(nonce, 0, result, 0, 12);
         Buffer.BlockCopy(tag, 0, result, 12, 16);
