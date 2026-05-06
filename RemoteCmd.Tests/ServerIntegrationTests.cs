@@ -74,6 +74,43 @@ public class ServerIntegrationTests : IClassFixture<RemoteCmdFactory>
     }
 
     [Fact]
+    public async Task Exec_UnknownClient_ErrorIncludesAvailableNames()
+    {
+        Environment.SetEnvironmentVariable("REMOTECMD_TOKEN", RemoteCmdFactory.Token);
+        Environment.SetEnvironmentVariable("REMOTECMD_NO_TLS", "1");
+        using var iso = new IsolatedFactory();
+        var http = iso.CreateClient();
+
+        var id = Guid.NewGuid().ToString("N");
+        await http.GetAsync($"/api/poll?token={RemoteCmdFactory.Token}&clientId={id}&name=available-target");
+
+        var res = await http.PostAsJsonAsync(
+            $"/api/exec?token={RemoteCmdFactory.Token}&client=does-not-exist",
+            new { command = "x", timeoutSeconds = 2 });
+        var body = await res.Content.ReadFromJsonAsync<ExecResponse>();
+        Assert.Equal(-1, body!.ExitCode);
+        Assert.Contains("Unknown client 'does-not-exist'", body.Output);
+        Assert.Contains("available-target", body.Output);
+    }
+
+    [Fact]
+    public async Task Poll_NameChange_ForSameClientId_PreservesSession_AndUpdatesName()
+    {
+        var id = Guid.NewGuid().ToString("N");
+        await _http.GetAsync(Url("/api/poll", ("clientId", id), ("name", "original")));
+        await _http.GetAsync(Url("/api/poll", ("clientId", id), ("name", "renamed")));
+
+        // Both names refer to the same session; the latest poll wins
+        var byOriginal = await _http.GetAsync(Url("/api/status", ("client", "original")));
+        Assert.Equal(HttpStatusCode.NotFound, byOriginal.StatusCode);
+
+        var byRenamed = await _http.GetFromJsonAsync<StatusNamed>(Url("/api/status", ("client", "renamed")));
+        Assert.NotNull(byRenamed);
+        Assert.Equal(id, byRenamed!.Id);
+        Assert.Equal("renamed", byRenamed.Name);
+    }
+
+    [Fact]
     public async Task Exec_TargetedByName_RoundTripsThroughPoll()
     {
         var id = Guid.NewGuid().ToString("N");

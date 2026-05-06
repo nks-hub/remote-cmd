@@ -407,7 +407,17 @@ static ClientSession TouchSession(HttpRequest req, ConcurrentDictionary<string, 
     name ??= clientId;
 
     var session = clients.GetOrAdd(clientId, id => new ClientSession { Id = id, Name = name });
-    session.Name = name;
+    if (!string.Equals(session.Name, name, StringComparison.Ordinal))
+    {
+        // Two processes polling with the same clientId but different --name → name flapping.
+        // Throttle the warning so we don't spam logs (every 10s per session is plenty).
+        if (DateTime.UtcNow - session.LastNameFlapWarning > TimeSpan.FromSeconds(10))
+        {
+            Console.Error.WriteLine($"[WARN] clientId {clientId} switched name '{session.Name}' -> '{name}' — likely two processes sharing the same client.id file");
+            session.LastNameFlapWarning = DateTime.UtcNow;
+        }
+        session.Name = name;
+    }
     session.LastPoll = DateTime.UtcNow;
     return session;
 }
@@ -426,7 +436,14 @@ static TargetResolution ResolveTarget(HttpRequest req, ConcurrentDictionary<stri
     if (!string.IsNullOrEmpty(clientParam))
     {
         var s = FindByNameOrId(clients, clientParam);
-        if (s == null) return new TargetResolution { Error = $"Unknown client '{clientParam}'" };
+        if (s == null)
+        {
+            var available = string.Join(", ", clients.Values
+                .Where(c => c.IsConnected())
+                .Select(c => $"{c.Name} ({c.Id[..Math.Min(8, c.Id.Length)]})"));
+            var hint = string.IsNullOrEmpty(available) ? "no clients connected" : $"connected: {available}";
+            return new TargetResolution { Error = $"Unknown client '{clientParam}' — {hint}" };
+        }
         if (!s.IsConnected()) return new TargetResolution { Error = $"Client '{s.Name}' not connected" };
         return new TargetResolution { Session = s };
     }
@@ -486,6 +503,7 @@ public class ClientSession
     public string Id { get; set; } = "";
     public string Name { get; set; } = "";
     public DateTime LastPoll { get; set; } = DateTime.MinValue;
+    public DateTime LastNameFlapWarning { get; set; } = DateTime.MinValue;
     public string? PendingCommand { get; set; }
     public TaskCompletionSource<CommandResult>? ResultTcs { get; set; }
     public FileTransfer? PendingUpload { get; set; }
