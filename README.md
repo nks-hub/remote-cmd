@@ -64,7 +64,7 @@ dotnet run --project RemoteCmd.Client -- <SERVER_IP> <TOKEN> [--name <alias>]
 RemoteCmd.Client.exe <SERVER_IP> <TOKEN> --name comos-1
 ```
 
-Each client persists its GUID to `%LOCALAPPDATA%\RemoteCmd\client.id` (Linux/macOS: `$XDG_DATA_HOME/RemoteCmd/` or `~/.local/share/RemoteCmd/`). The ID survives restarts.
+Each client persists its GUID to `%LOCALAPPDATA%\RemoteCmd\client.<name>.id` (Linux/macOS: `$XDG_DATA_HOME/RemoteCmd/` or `~/.local/share/RemoteCmd/`). The ID survives restarts. The id file is **scoped per `--name`**, so multiple aliased instances on the same machine (e.g. elevated + non-elevated) get distinct ids and don't compete for the same session. A legacy `client.id` is auto-migrated for the default machine-name instance.
 
 ### 3. Configure MCP for Claude Code
 

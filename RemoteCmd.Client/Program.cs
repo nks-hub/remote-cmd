@@ -16,9 +16,9 @@ var serverArg = args[0];
 var token = args[1];
 
 string? clientName = null;
-for (int i = 2; i < args.Length - 1; i++)
+for (int i = 2; i < args.Length; i++)
 {
-    if (args[i] == "--name") { clientName = args[i + 1]; i++; }
+    if (args[i] == "--name" && i + 1 < args.Length) { clientName = args[i + 1]; i++; }
 }
 clientName ??= Environment.MachineName;
 
@@ -28,13 +28,23 @@ if (serverArg.StartsWith("http"))
 else
     baseUrl = $"https://{serverArg}";
 
-// Stable client ID persisted on disk
+// Stable client ID persisted on disk. Scoped per --name so multiple aliased
+// instances on the same machine (e.g. elevated + non-elevated) don't share an
+// id and stomp each other's `Name` on every poll.
 var idDir = Path.Combine(
     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData,
         Environment.SpecialFolderOption.Create),
     "RemoteCmd");
 Directory.CreateDirectory(idDir);
-var idFile = Path.Combine(idDir, "client.id");
+var idFile = Path.Combine(idDir, $"client.{SanitizeForFileName(clientName)}.id");
+// One-time migration: if a per-name id file does not exist but the legacy
+// shared `client.id` does, reuse it for the default (machine-name) instance
+// to preserve identity across upgrades. Aliased instances always get fresh ids.
+var legacyIdFile = Path.Combine(idDir, "client.id");
+if (!File.Exists(idFile) && clientName == Environment.MachineName && File.Exists(legacyIdFile))
+{
+    try { File.Copy(legacyIdFile, idFile); } catch { /* best-effort */ }
+}
 string clientId;
 if (File.Exists(idFile))
 {
@@ -176,6 +186,16 @@ while (!ct.IsCancellationRequested)
 
 Console.WriteLine("[STOPPED]");
 return 0;
+
+static string SanitizeForFileName(string name)
+{
+    var invalid = Path.GetInvalidFileNameChars();
+    var sb = new StringBuilder(name.Length);
+    foreach (var ch in name)
+        sb.Append(Array.IndexOf(invalid, ch) >= 0 ? '_' : ch);
+    var sanitized = sb.ToString().Trim('.', ' ');
+    return string.IsNullOrEmpty(sanitized) ? "default" : sanitized;
+}
 
 static async Task<(string output, int exitCode)> ExecuteCommand(string command, CancellationToken ct)
 {
