@@ -66,6 +66,42 @@ RemoteCmd.Client.exe <SERVER_IP> <TOKEN> --name comos-1
 
 Each client persists its GUID to `%LOCALAPPDATA%\RemoteCmd\client.<name>.id` (Linux/macOS: `$XDG_DATA_HOME/RemoteCmd/` or `~/.local/share/RemoteCmd/`). The ID survives restarts. The id file is **scoped per `--name`**, so multiple aliased instances on the same machine (e.g. elevated + non-elevated) get distinct ids and don't compete for the same session. A legacy `client.id` is auto-migrated for the default machine-name instance.
 
+#### Run as a system service
+
+The .NET 9 client can register itself as a **Windows Service** or **systemd unit** so it
+starts at boot and restarts on failure (needs admin / root):
+
+```bash
+# Install (Windows Service on Windows, systemd unit on Linux)
+RemoteCmd.Client install-service <SERVER_IP> <TOKEN> --name comos-1 [--service-name <name>]
+
+# Remove
+RemoteCmd.Client uninstall-service [--service-name <name>]
+```
+
+Default service name is `RemoteCmdClient`. The service runs the same poll loop as the
+console mode (`--service` is the host marker used internally by the SCM / systemd).
+
+#### Legacy Windows 7 / .NET Framework 4.8 client
+
+`RemoteCmd.Client48` is a wire-compatible port for hosts without .NET 9 (e.g. Windows 7).
+It ships as `RemoteCmd.Client48.exe` plus `BouncyCastle.Cryptography.dll` (AES-256-GCM via
+BouncyCastle). Same command surface, Windows-only service registration:
+
+```bat
+RemoteCmd.Client48.exe <SERVER_IP> <TOKEN> --name bmw-vm
+RemoteCmd.Client48.exe install-service <SERVER_IP> <TOKEN> --name bmw-vm
+```
+
+#### Android client (rooted devices)
+
+`android/` is a Kotlin app (`cz.nks.remotecmd`) with full parity: AES-256-GCM, command
+exec, and 200MB file transfer. It runs a **foreground service**, auto-starts on boot, and
+executes commands as **root via `su`** (Magisk `su -c` and AOSP `su 0` are both detected).
+Configure server/token/name in the UI and tap **Start**. Build a debug APK with
+`cd android && ./gradlew assembleDebug` (output: `app/build/outputs/apk/debug/app-debug.apk`).
+From the host the relay is reachable at `http://10.0.2.2:7890` on an emulator.
+
 ### 3. Configure MCP for Claude Code
 
 ```json
@@ -175,6 +211,7 @@ dotnet publish RemoteCmd.Client -c Release -r win-x64 --self-contained \
 |----------|-------|---------|-------------|
 | `REMOTECMD_TOKEN` | Server, MCP | — | Shared authentication token |
 | `REMOTECMD_NO_TLS` | Server | unset | `1`/`true` disables TLS (fallback when `--no-tls` is not passed) |
+| `REMOTECMD_PORT` | Server | `7890` | Listen port (CI / running multiple instances) |
 | `REMOTECMD_URL` | MCP | `https://localhost:7890` | Relay URL |
 | `REMOTECMD_DEFAULT_CLIENT` | MCP | unset | Name or id of client to target when `client` arg is omitted |
 
@@ -210,8 +247,10 @@ Use `--no-tls` (or `REMOTECMD_NO_TLS=1`) on the server for HTTP-only mode (AES p
 RemoteCmd.sln
 ├── RemoteCmd.Shared/       # Shared Crypto (AES-256-GCM)
 ├── RemoteCmd.Server/       # HTTPS relay server
-├── RemoteCmd.Client/       # Target machine client
+├── RemoteCmd.Client/       # Target machine client (.NET 9, console / service)
+├── RemoteCmd.Client48/     # .NET Framework 4.8 client (Windows 7+, BouncyCastle)
 ├── RemoteCmd.Tests/        # xUnit unit + integration tests
+├── android/                # Rooted Android client (Kotlin, foreground service)
 ├── mcp-server/             # MCP bridge (Node.js)
 │   └── tests/              # node --test validation tests
 ├── .github/workflows/      # CI + Release
