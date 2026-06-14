@@ -3,7 +3,7 @@
 [![GitHub Stars](https://img.shields.io/github/stars/nks-hub/remote-cmd?style=flat)](https://github.com/nks-hub/remote-cmd)
 [![.NET](https://img.shields.io/badge/.NET-9.0-512BD4)](https://dotnet.microsoft.com/)
 
-# RemoteCmd v1.1.0
+# RemoteCmd v1.2.0
 
 Remote command execution relay for AI agents. Execute PowerShell commands and transfer files on remote machines through NAT/firewalls via HTTP polling. **Multi-client support** — a single relay can serve many target machines and route commands to a specific one by name.
 
