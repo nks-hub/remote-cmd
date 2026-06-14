@@ -27,9 +27,14 @@ if (token.Length < MinTokenLength && !allowShortToken)
 // Session GC: remove clients that have not polled for longer than this threshold.
 var staleAfter = TimeSpan.FromHours(1);
 
+// Listen port: default 7890, overridable via REMOTECMD_PORT (CI / multi-instance).
+var port = int.TryParse(Environment.GetEnvironmentVariable("REMOTECMD_PORT"), out var p) && p is > 0 and < 65536
+    ? p
+    : 7890;
+
 if (noTls)
 {
-    builder.WebHost.UseUrls("http://0.0.0.0:7890");
+    builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 }
 else
 {
@@ -38,7 +43,7 @@ else
     var certPassword = Guid.NewGuid().ToString("N")[..16];
     File.WriteAllBytes(certPath, cert.Export(X509ContentType.Pfx, certPassword));
 
-    builder.WebHost.UseUrls("https://0.0.0.0:7890");
+    builder.WebHost.UseUrls($"https://0.0.0.0:{port}");
     builder.WebHost.ConfigureKestrel(o =>
     {
         o.Limits.MaxRequestBodySize = 200_000_000;
@@ -57,7 +62,7 @@ var clients = new ConcurrentDictionary<string, ClientSession>();
 
 var protocol = noTls ? "http" : "https";
 Console.WriteLine("=== Remote CMD Relay Server ===");
-Console.WriteLine($"Listening on: {protocol}://0.0.0.0:7890");
+Console.WriteLine($"Listening on: {protocol}://0.0.0.0:{port}");
 Console.WriteLine($"Token: {token}");
 Console.WriteLine($"TLS: {(noTls ? "disabled" : "enabled (self-signed)")}");
 Console.WriteLine($"Encryption: AES-256-GCM (always on)");
