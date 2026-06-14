@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">RemoteCmd</string>
+    <string name="server_hint">Server (e.g. 192.168.3.41:7890 or http://…)</string>
+    <string name="token_hint">Token</string>
+    <string name="name_hint">Client name (alias)</string>
+    <string name="autostart">Start on boot</string>
+    <string name="start">Start</string>
+    <string name="stop">Stop</string>
+    <string name="status_stopped">Stopped</string>
+    <string name="status_running">Running</string>
+    <string name="notif_channel">RemoteCmd service</string>
+</resources>

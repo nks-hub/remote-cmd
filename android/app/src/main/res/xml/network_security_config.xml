@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Relay may run plain HTTP on a LAN; allow cleartext. TLS uses a self-signed
+     cert which the client trusts explicitly in code (Crypto layer adds AES-GCM). -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
