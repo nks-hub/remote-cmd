@@ -21,6 +21,12 @@ Thumbs.db
 appsettings.Development.json
 cmd.json
 
+# Android build output (wrapper jar is intentionally tracked)
+android/build/
+android/app/build/
+android/local.properties
+*.apk
+
 # Editor/IDE local configs
 .[a-z]*/
 !.git/
