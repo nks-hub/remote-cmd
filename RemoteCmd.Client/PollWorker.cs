@@ -16,8 +16,16 @@ namespace RemoteCmd.Client;
 /// </summary>
 public sealed class PollWorker : BackgroundService
 {
+    private const int CommandTimeoutMs = 60_000;
+    // After the process exits we wait at most this long for the pipes to drain: a detached child
+    // (e.g. `nohup ... &`) can keep the write end open forever, so we return what we have and move on.
+    private const int OutputGraceMs = 1_500;
+
     private readonly ClientConfig _config;
     private readonly ILogger<PollWorker> _log;
+
+    // Single-flight guard so a large file transfer runs off the poll loop without being re-dispatched.
+    private volatile bool _fileBusy;
 
     public PollWorker(ClientConfig config, ILogger<PollWorker> log)
     {
@@ -46,6 +54,7 @@ public sealed class PollWorker : BackgroundService
             PooledConnectionLifetime = TimeSpan.FromSeconds(30),
             PooledConnectionIdleTimeout = TimeSpan.FromSeconds(15),
             ConnectTimeout = TimeSpan.FromSeconds(10),
+            MaxConnectionsPerServer = 32,
         };
         using var http = new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(5) };
 
@@ -57,32 +66,48 @@ public sealed class PollWorker : BackgroundService
         {
             try
             {
+                var gotWork = false;
+
+                // 1. Poll for a command. Never block the loop on execution: run it on its own task
+                //    and post the result (with its requestId) when it finishes, so the heartbeat
+                //    keeps ticking and further commands are picked up concurrently.
                 var response = await http.GetFromJsonAsync<PollResponse>(pollUrl, stoppingToken);
                 if (response?.Command != null)
                 {
+                    gotWork = true;
                     var command = Crypto.DecryptString(response.Command);
-                    _log.LogInformation("[CMD] {Command}", command);
-                    var (output, exitCode) = await ExecuteCommand(command, stoppingToken);
-                    if (exitCode != 0) _log.LogWarning("[EXIT {Code}]", exitCode);
-
-                    var resultJson = JsonSerializer.Serialize(new CommandResult { Output = output, ExitCode = exitCode });
-                    var encrypted = Crypto.Encrypt(Encoding.UTF8.GetBytes(resultJson));
-                    using var content = new ByteArrayContent(encrypted);
-                    await http.PostAsync(resultUrl, content, stoppingToken);
+                    var requestId = response.RequestId;
+                    _log.LogInformation("[CMD{Id}] {Command}",
+                        requestId is null ? "" : " " + requestId[..Math.Min(8, requestId.Length)], command);
+                    _ = HandleCommandAsync(http, resultUrl, command, requestId, stoppingToken);
                 }
 
-                var filePoll = await http.GetFromJsonAsync<EncryptedFilePoll>(filePollUrl, stoppingToken);
-                if (filePoll?.E != null)
+                // 2. Poll for a file transfer, also dispatched off-loop (single-flight) so a large
+                //    transfer never stalls command polling or the heartbeat.
+                if (!_fileBusy)
                 {
-                    var meta = JsonSerializer.Deserialize<FilePollMeta>(Crypto.DecryptString(filePoll.E));
-                    if (meta?.Action == "upload" && meta.Path != null)
-                        await ReceiveFile(http, meta, fileDataUrl, fileDoneUrl, stoppingToken);
-                    else if (meta?.Action == "download" && meta.Path != null)
-                        await SendFile(http, meta, fileUploadUrl, stoppingToken);
+                    var filePoll = await http.GetFromJsonAsync<EncryptedFilePoll>(filePollUrl, stoppingToken);
+                    if (filePoll?.E != null)
+                    {
+                        var meta = JsonSerializer.Deserialize<FilePollMeta>(Crypto.DecryptString(filePoll.E));
+                        if (meta?.Action == "upload" && meta.Path != null)
+                        {
+                            _fileBusy = true;
+                            gotWork = true;
+                            _ = RunFileTransferAsync(ReceiveFile(http, meta, fileDataUrl, fileDoneUrl, stoppingToken));
+                        }
+                        else if (meta?.Action == "download" && meta.Path != null)
+                        {
+                            _fileBusy = true;
+                            gotWork = true;
+                            _ = RunFileTransferAsync(SendFile(http, meta, fileUploadUrl, stoppingToken));
+                        }
+                    }
                 }
 
                 retryDelay = 1;
-                await Task.Delay(800, stoppingToken);
+                // Drain a burst of queued commands quickly; otherwise settle to the idle cadence.
+                await Task.Delay(gotWork ? 50 : 800, stoppingToken);
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
@@ -95,6 +120,32 @@ public sealed class PollWorker : BackgroundService
         }
 
         _log.LogInformation("Remote CMD Client stopped.");
+    }
+
+    private async Task RunFileTransferAsync(Task transfer)
+    {
+        try { await transfer; }
+        finally { _fileBusy = false; }
+    }
+
+    private async Task HandleCommandAsync(HttpClient http, string resultUrl, string command, string? requestId, CancellationToken ct)
+    {
+        try
+        {
+            var (output, exitCode) = await ExecuteCommand(command, ct);
+            if (exitCode != 0) _log.LogWarning("[EXIT {Code}]", exitCode);
+
+            var resultJson = JsonSerializer.Serialize(new CommandResult { Output = output, ExitCode = exitCode });
+            var encrypted = Crypto.Encrypt(Encoding.UTF8.GetBytes(resultJson));
+            var url = requestId is null ? resultUrl : $"{resultUrl}&requestId={requestId}";
+            using var content = new ByteArrayContent(encrypted);
+            await http.PostAsync(url, content, ct);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            _log.LogWarning("[CMD ERROR] {Message}", ex.Message);
+        }
     }
 
     private async Task ReceiveFile(HttpClient http, FilePollMeta meta, string fileDataUrl, string fileDoneUrl, CancellationToken ct)
@@ -152,6 +203,7 @@ public sealed class PollWorker : BackgroundService
                 {
                     FileName = "powershell.exe",
                     Arguments = $"-NoProfile -NonInteractive -Command \"{command.Replace("\"", "\\\"")}\"",
+                    RedirectStandardInput = true,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
                     UseShellExecute = false,
@@ -161,6 +213,7 @@ public sealed class PollWorker : BackgroundService
                 {
                     FileName = "/bin/bash",
                     ArgumentList = { "-c", command },
+                    RedirectStandardInput = true,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
                     UseShellExecute = false,
@@ -168,26 +221,83 @@ public sealed class PollWorker : BackgroundService
                 };
 
             process.Start();
-            var outputTask = process.StandardOutput.ReadToEndAsync(ct);
-            var errorTask = process.StandardError.ReadToEndAsync(ct);
 
-            if (!process.WaitForExit(60_000))
+            // Give the child a closed stdin (immediate EOF) so it can never block waiting for input.
+            try { process.StandardInput.Close(); } catch { /* ignore */ }
+
+            // Pump the pipes incrementally. ReadToEnd would hang forever when a detached grandchild
+            // inherits the write end and keeps it open (the classic `nohup long_running &` case).
+            var stdout = new StringBuilder();
+            var stderr = new StringBuilder();
+            var outPump = PumpAsync(process.StandardOutput, stdout, ct);
+            var errPump = PumpAsync(process.StandardError, stderr, ct);
+
+            var exited = await WaitForExitAsync(process, CommandTimeoutMs, ct);
+            var killed = false;
+            if (!exited)
             {
-                try { process.Kill(entireProcessTree: true); } catch { }
-                return ("[KILLED] Command exceeded 60s timeout", -1);
+                try { process.Kill(entireProcessTree: true); } catch { /* already gone */ }
+                killed = true;
             }
 
-            var stdout = await outputTask;
-            var stderr = await errorTask;
-            var combined = stdout;
-            if (!string.IsNullOrWhiteSpace(stderr))
-                combined += "\n[STDERR]\n" + stderr;
+            // Wait for the pipes to drain, but only briefly — a detached child may hold them open.
+            await Task.WhenAny(Task.WhenAll(outPump, errPump), Task.Delay(OutputGraceMs, ct));
 
-            return (combined.TrimEnd(), process.ExitCode);
+            string outStr, errStr;
+            lock (stdout) outStr = stdout.ToString();
+            lock (stderr) errStr = stderr.ToString();
+
+            var combined = outStr;
+            if (!string.IsNullOrWhiteSpace(errStr))
+                combined += "\n[STDERR]\n" + errStr;
+            combined = combined.TrimEnd();
+
+            if (killed)
+            {
+                const string note = "[KILLED] Command exceeded 60s timeout";
+                return (combined.Length == 0 ? note : combined + "\n" + note, -1);
+            }
+
+            return (combined, process.ExitCode);
+        }
+        catch (OperationCanceledException)
+        {
+            return ("[CANCELLED]", -1);
         }
         catch (Exception ex)
         {
             return ($"[EXEC ERROR] {ex.Message}", -1);
+        }
+    }
+
+    /// <summary>Copy a redirected stream into <paramref name="sink"/> until EOF, tolerating pipe teardown.</summary>
+    private static async Task PumpAsync(StreamReader reader, StringBuilder sink, CancellationToken ct)
+    {
+        var buffer = new char[4096];
+        try
+        {
+            int n;
+            while ((n = await reader.ReadAsync(buffer.AsMemory(), ct)) > 0)
+                lock (sink) sink.Append(buffer, 0, n);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception) { /* pipe closed / process disposed */ }
+    }
+
+    /// <summary>Wait for exit up to <paramref name="timeoutMs"/>. Returns false on timeout; rethrows real cancellation.</summary>
+    private static async Task<bool> WaitForExitAsync(Process process, int timeoutMs, CancellationToken ct)
+    {
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(timeoutMs);
+        try
+        {
+            await process.WaitForExitAsync(timeoutCts.Token);
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            if (ct.IsCancellationRequested) throw;
+            return false;
         }
     }
 

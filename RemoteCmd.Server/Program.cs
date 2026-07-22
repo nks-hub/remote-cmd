@@ -15,6 +15,8 @@ var token = args.Length > 0 && !args[0].StartsWith("-")
 var noTls = args.Contains("--no-tls")
     || string.Equals(Environment.GetEnvironmentVariable("REMOTECMD_NO_TLS"), "1", StringComparison.Ordinal)
     || string.Equals(Environment.GetEnvironmentVariable("REMOTECMD_NO_TLS"), "true", StringComparison.OrdinalIgnoreCase);
+var dashboard = args.Contains("--dashboard")
+    || string.Equals(Environment.GetEnvironmentVariable("REMOTECMD_DASHBOARD"), "1", StringComparison.Ordinal);
 
 const int MinTokenLength = 12;
 var allowShortToken = string.Equals(Environment.GetEnvironmentVariable("REMOTECMD_ALLOW_SHORT_TOKEN"), "1", StringComparison.Ordinal);
@@ -54,10 +56,16 @@ else
     });
 }
 
+// The live dashboard owns the console, so silence framework request/lifetime chatter that would
+// otherwise scroll through it. Explicit relay events (UPLOAD/DOWNLOAD/GC) still print.
+if (dashboard)
+    builder.Logging.AddFilter("Microsoft", LogLevel.Warning);
+
 var app = builder.Build();
 
 Crypto.Init(token);
 
+var startedUtc = DateTime.UtcNow;
 var clients = new ConcurrentDictionary<string, ClientSession>();
 
 var protocol = noTls ? "http" : "https";
@@ -68,6 +76,7 @@ Console.WriteLine($"TLS: {(noTls ? "disabled" : "enabled (self-signed)")}");
 Console.WriteLine($"Encryption: AES-256-GCM (always on)");
 Console.WriteLine($"Multi-client: enabled");
 Console.WriteLine($"Session GC threshold: {staleAfter.TotalMinutes:N0} minutes");
+Console.WriteLine($"Live dashboard: {(dashboard ? "on (--dashboard)" : "off (add --dashboard)")}");
 Console.WriteLine();
 Console.WriteLine("Client setup (run on target machine):");
 Console.WriteLine($"  RemoteCmd.Client.exe <THIS_SERVER_IP> {token}");
@@ -90,6 +99,28 @@ _ = Task.Run(async () =>
         catch (Exception ex) { Console.Error.WriteLine($"[GC ERROR] {ex.Message}"); }
     }
 });
+
+// Optional live status dashboard: a top-style fixed view repainted every second showing who's
+// connected, for how long, how many commands are running/queued, and file-transfer state.
+if (dashboard)
+{
+    Dashboard.EnableAnsi();
+    _ = Task.Run(async () =>
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
+        while (!gcCts.IsCancellationRequested)
+        {
+            try
+            {
+                await timer.WaitForNextTickAsync(gcCts);
+                Console.Out.Write(Dashboard.Render(clients, port, noTls, startedUtc, DateTime.UtcNow));
+                Console.Out.Flush();
+            }
+            catch (OperationCanceledException) { break; }
+            catch { /* never let the status view take the server down */ }
+        }
+    });
+}
 
 // Auth middleware
 app.Use(async (context, next) =>
@@ -115,11 +146,11 @@ app.Use(async (context, next) =>
 app.MapGet("/api/poll", (HttpRequest req) =>
 {
     var session = TouchSession(req, clients);
-    if (session.PendingCommand != null)
+    // Hand out one queued command per poll. Skip any that timed out before being delivered.
+    while (session.CommandQueue.TryDequeue(out var pending))
     {
-        var cmd = session.PendingCommand;
-        session.PendingCommand = null;
-        return Results.Ok(new { command = Crypto.EncryptString(cmd) });
+        if (pending.Cancelled) continue;
+        return Results.Ok(new { command = Crypto.EncryptString(pending.Command), requestId = pending.RequestId });
     }
     return Results.Ok(new { command = (string?)null });
 });
@@ -127,18 +158,21 @@ app.MapGet("/api/poll", (HttpRequest req) =>
 app.MapPost("/api/result", async (HttpRequest req) =>
 {
     var session = TouchSession(req, clients);
+    var requestId = req.Query["requestId"].FirstOrDefault();
     using var ms = new MemoryStream();
     await req.Body.CopyToAsync(ms);
+    CommandResult result;
     try
     {
         var decryptedBytes = Crypto.Decrypt(ms.ToArray());
-        var result = JsonSerializer.Deserialize<CommandResult>(decryptedBytes, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-        if (result != null) session.ResultTcs?.TrySetResult(result);
+        result = JsonSerializer.Deserialize<CommandResult>(decryptedBytes, new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+                 ?? new CommandResult { Output = "[EMPTY RESULT]", ExitCode = -1 };
     }
     catch (Exception ex)
     {
-        session.ResultTcs?.TrySetResult(new CommandResult { Output = $"[DECRYPT ERROR] {ex.Message}", ExitCode = -1 });
+        result = new CommandResult { Output = $"[DECRYPT ERROR] {ex.Message}", ExitCode = -1 };
     }
+    CompleteCommand(session, requestId, result);
     return Results.Ok();
 });
 
@@ -219,32 +253,25 @@ app.MapPost("/api/exec", async (HttpRequest req) =>
         return Results.Ok(new CommandResult { Output = $"[ERROR] {target.Error}", ExitCode = -1 });
 
     var session = target.Session!;
-    if (!await session.CommandLock.WaitAsync(TimeSpan.FromSeconds(2)))
-        return Results.Ok(new CommandResult { Output = $"[ERROR] Another command is pending on '{session.Name}'", ExitCode = -1 });
 
+    // Each exec gets its own correlated slot. Multiple execs (same or different sessions) run
+    // concurrently — the client picks them up one per poll and returns each result by requestId.
+    var pending = new PendingCommand { Command = body.Command };
+    session.InFlight[pending.RequestId] = pending;
+    session.CommandQueue.Enqueue(pending);
+
+    var timeout = body.TimeoutSeconds > 0 ? Math.Min(body.TimeoutSeconds, 300) : 30;
+    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeout));
     try
     {
-        session.ResultTcs = new TaskCompletionSource<CommandResult>();
-        session.PendingCommand = body.Command;
-
-        var timeout = body.TimeoutSeconds > 0 ? Math.Min(body.TimeoutSeconds, 300) : 30;
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeout));
-
-        try
-        {
-            var result = await session.ResultTcs.Task.WaitAsync(cts.Token);
-            return Results.Ok(result);
-        }
-        catch (OperationCanceledException)
-        {
-            session.PendingCommand = null;
-            return Results.Ok(new CommandResult { Output = $"[TIMEOUT] No response from '{session.Name}' after {timeout}s", ExitCode = -1 });
-        }
+        var result = await pending.Tcs.Task.WaitAsync(cts.Token);
+        return Results.Ok(result);
     }
-    finally
+    catch (OperationCanceledException)
     {
-        session.ResultTcs = null;
-        session.CommandLock.Release();
+        pending.Cancelled = true;
+        session.InFlight.TryRemove(pending.RequestId, out _);
+        return Results.Ok(new CommandResult { Output = $"[TIMEOUT] No response from '{session.Name}' after {timeout}s", ExitCode = -1 });
     }
 });
 
@@ -329,7 +356,11 @@ app.MapGet("/api/clients", () =>
             name = c.Name,
             lastPoll = c.LastPoll,
             secondsAgo = c.LastPoll == DateTime.MinValue ? -1 : (int)(DateTime.UtcNow - c.LastPoll).TotalSeconds,
-            connected = c.IsConnected()
+            connected = c.IsConnected(),
+            running = c.InFlight.Count,
+            queued = c.CommandQueue.Count,
+            served = Interlocked.Read(ref c.CommandsServed),
+            connectedForSeconds = (int)(DateTime.UtcNow - c.ConnectedSince).TotalSeconds
         }).ToList();
     return Results.Ok(new { count = list.Count, connected = list.Count(x => x.connected), clients = list });
 });
@@ -434,6 +465,29 @@ static ClientSession? FindByNameOrId(ConcurrentDictionary<string, ClientSession>
         string.Equals(c.Name, nameOrId, StringComparison.OrdinalIgnoreCase));
 }
 
+// Match an incoming result to the waiting exec. New clients echo the requestId for exact routing;
+// legacy clients omit it, so we complete the oldest in-flight command (they only run one at a time).
+static void CompleteCommand(ClientSession session, string? requestId, CommandResult result)
+{
+    PendingCommand? pending = null;
+    if (!string.IsNullOrEmpty(requestId))
+        session.InFlight.TryRemove(requestId, out pending);
+
+    if (pending == null)
+    {
+        var oldest = session.InFlight.Values
+            .Where(p => !p.Cancelled)
+            .OrderBy(p => p.Seq)
+            .FirstOrDefault();
+        if (oldest != null)
+            session.InFlight.TryRemove(oldest.RequestId, out pending);
+    }
+
+    if (pending == null) return;
+    Interlocked.Increment(ref session.CommandsServed);
+    pending.Tcs.TrySetResult(result);
+}
+
 static TargetResolution ResolveTarget(HttpRequest req, ConcurrentDictionary<string, ClientSession> clients)
 {
     var clientParam = req.Query["client"].FirstOrDefault();
@@ -509,15 +563,35 @@ public class ClientSession
     public string Name { get; set; } = "";
     public DateTime LastPoll { get; set; } = DateTime.MinValue;
     public DateTime LastNameFlapWarning { get; set; } = DateTime.MinValue;
-    public string? PendingCommand { get; set; }
-    public TaskCompletionSource<CommandResult>? ResultTcs { get; set; }
+    public DateTime ConnectedSince { get; set; } = DateTime.UtcNow;
+    public long CommandsServed;   // total results delivered; mutable field for Interlocked
+
+    // Commands queued for the next poll(s), and those handed out awaiting a result (keyed by id).
+    public ConcurrentQueue<PendingCommand> CommandQueue { get; } = new();
+    public ConcurrentDictionary<string, PendingCommand> InFlight { get; } = new();
+
     public FileTransfer? PendingUpload { get; set; }
     public TaskCompletionSource<bool>? UploadTcs { get; set; }
     public FileTransfer? PendingDownload { get; set; }
     public TaskCompletionSource<FileTransfer>? DownloadTcs { get; set; }
-    public SemaphoreSlim CommandLock { get; } = new(1, 1);
 
     public bool IsConnected() => (DateTime.UtcNow - LastPoll).TotalSeconds < 10;
+}
+
+/// <summary>
+/// One in-flight command with its own result correlation. Many can be pending on a single session
+/// at once; each carries a unique <see cref="RequestId"/> so the matching /api/exec caller unblocks
+/// when its result returns. <see cref="Seq"/> gives a total order for the legacy (no-requestId) path.
+/// </summary>
+public sealed class PendingCommand
+{
+    private static long _seqCounter;
+
+    public string RequestId { get; } = Guid.NewGuid().ToString("N");
+    public required string Command { get; init; }
+    public TaskCompletionSource<CommandResult> Tcs { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public long Seq { get; } = Interlocked.Increment(ref _seqCounter);
+    public volatile bool Cancelled;
 }
 
 public class TargetResolution

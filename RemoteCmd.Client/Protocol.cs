@@ -14,6 +14,9 @@ public sealed class PollResponse
 {
     [JsonPropertyName("command")]
     public string? Command { get; set; }
+
+    [JsonPropertyName("requestId")]
+    public string? RequestId { get; set; }
 }
 
 public sealed class EncryptedFilePoll

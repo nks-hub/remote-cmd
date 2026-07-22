@@ -233,6 +233,48 @@ public class ServerIntegrationTests : IClassFixture<RemoteCmdFactory>
     }
 
     [Fact]
+    public async Task Exec_TwoConcurrentCommands_SameClient_CorrelateByRequestId()
+    {
+        var id = Guid.NewGuid().ToString("N");
+        var name = "concurrent-" + Guid.NewGuid().ToString("N")[..8];
+        await _http.GetAsync(Url("/api/poll", ("clientId", id), ("name", name)));
+
+        // Two execs in flight on the SAME client at once — must not serialize or cross results.
+        var execA = _http.PostAsJsonAsync(Url("/api/exec", ("client", name)),
+            new { command = "cmd-A", timeoutSeconds = 10 });
+        var execB = _http.PostAsJsonAsync(Url("/api/exec", ("client", name)),
+            new { command = "cmd-B", timeoutSeconds = 10 });
+
+        // Drain both queued commands (one per poll), capturing each command's requestId.
+        var byCommand = new Dictionary<string, string>();
+        while (byCommand.Count < 2)
+        {
+            var p = await _http.GetFromJsonAsync<PollWithId>(Url("/api/poll", ("clientId", id), ("name", name)));
+            if (p?.Command == null) { await Task.Delay(20); continue; }
+            byCommand[Crypto.DecryptString(p.Command)] = p.RequestId!;
+        }
+        Assert.True(byCommand.ContainsKey("cmd-A"));
+        Assert.True(byCommand.ContainsKey("cmd-B"));
+
+        // Return results in REVERSE order to prove routing is by requestId, not arrival/FIFO.
+        await PostResult(id, byCommand["cmd-B"], "out-B");
+        await PostResult(id, byCommand["cmd-A"], "out-A");
+
+        var bodyA = await (await execA).Content.ReadFromJsonAsync<ExecResponse>();
+        var bodyB = await (await execB).Content.ReadFromJsonAsync<ExecResponse>();
+        Assert.Equal("out-A", bodyA!.Output);
+        Assert.Equal("out-B", bodyB!.Output);
+    }
+
+    private async Task PostResult(string clientId, string requestId, string output)
+    {
+        var resultJson = System.Text.Json.JsonSerializer.Serialize(new { output, exitCode = 0 });
+        var encrypted = Crypto.Encrypt(Encoding.UTF8.GetBytes(resultJson));
+        using var content = new ByteArrayContent(encrypted);
+        await _http.PostAsync(Url("/api/result", ("clientId", clientId), ("requestId", requestId)), content);
+    }
+
+    [Fact]
     public async Task Exec_TimesOut_WhenClientDoesNotRespond()
     {
         var id = Guid.NewGuid().ToString("N");
@@ -280,6 +322,7 @@ public class ServerIntegrationTests : IClassFixture<RemoteCmdFactory>
     // === DTOs for test deserialization ===
 
     record PollDto(string? Command);
+    record PollWithId(string? Command, string? RequestId);
     record ExecResponse(string Output, int ExitCode);
     record ClientsResponse(int Count, int Connected, List<ClientEntry> Clients);
     record ClientEntry(string Id, string Name, bool Connected);

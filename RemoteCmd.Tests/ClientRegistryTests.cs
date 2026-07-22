@@ -51,21 +51,22 @@ public class ClientRegistryTests
     {
         var now = DateTime.UtcNow;
         var dict = new ConcurrentDictionary<string, ClientSession>();
+        var pending = new PendingCommand { Command = "stuck-cmd" };
         var session = new ClientSession
         {
             Id = "stuck",
             Name = "stuck",
             LastPoll = now.AddHours(-5),
-            ResultTcs = new TaskCompletionSource<CommandResult>(),
             UploadTcs = new TaskCompletionSource<bool>(),
             DownloadTcs = new TaskCompletionSource<FileTransfer>(),
         };
+        session.InFlight[pending.RequestId] = pending;
         dict["stuck"] = session;
 
         ClientRegistry.PruneStale(dict, TimeSpan.FromHours(1), now);
 
-        Assert.True(session.ResultTcs.Task.IsCompleted);
-        Assert.Equal(-1, (await session.ResultTcs.Task).ExitCode);
+        Assert.True(pending.Tcs.Task.IsCompleted);
+        Assert.Equal(-1, (await pending.Tcs.Task).ExitCode);
         Assert.True(session.UploadTcs.Task.IsCompleted);
         Assert.False(await session.UploadTcs.Task);
         Assert.True(session.DownloadTcs.Task.IsCompleted);
