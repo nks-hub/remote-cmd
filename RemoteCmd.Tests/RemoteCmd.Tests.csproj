@@ -18,6 +18,7 @@
   <ItemGroup>
     <ProjectReference Include="..\RemoteCmd.Shared\RemoteCmd.Shared.csproj" />
     <ProjectReference Include="..\RemoteCmd.Server\RemoteCmd.Server.csproj" />
+    <ProjectReference Include="..\RemoteCmd.Client\RemoteCmd.Client.csproj" />
   </ItemGroup>
 
 </Project>

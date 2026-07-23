@@ -5,6 +5,12 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using RemoteCmd.Shared;
 
+if (args.Length > 0 && args[0] is "--version" or "-v" or "version")
+{
+    Console.WriteLine($"RemoteCmd.Server {RemoteCmd.Shared.VersionInfo.Version}");
+    return 0;
+}
+
 var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 200_000_000);
 
@@ -69,7 +75,7 @@ var startedUtc = DateTime.UtcNow;
 var clients = new ConcurrentDictionary<string, ClientSession>();
 
 var protocol = noTls ? "http" : "https";
-Console.WriteLine("=== Remote CMD Relay Server ===");
+Console.WriteLine($"=== Remote CMD Relay Server {RemoteCmd.Shared.VersionInfo.Version} ===");
 Console.WriteLine($"Listening on: {protocol}://0.0.0.0:{port}");
 Console.WriteLine($"Token: {token}");
 Console.WriteLine($"TLS: {(noTls ? "disabled" : "enabled (self-signed)")}");
@@ -396,7 +402,7 @@ app.MapGet("/api/status", (HttpRequest req) =>
 });
 
 app.MapGet("/", () => Results.Text(
-    "Remote CMD Relay Server v1.1.0 (multi-client)\n" +
+    $"Remote CMD Relay Server {RemoteCmd.Shared.VersionInfo.Version} (multi-client)\n" +
     $"Encryption: AES-256-GCM | TLS: {(noTls ? "off" : "self-signed")}\n" +
     $"Connected clients: {clients.Values.Count(c => c.IsConnected())}/{clients.Count}\n\n" +
     "GET  /api/status[?client=X]                - Check client(s)\n" +

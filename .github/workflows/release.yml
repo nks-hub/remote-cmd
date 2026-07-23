@@ -57,12 +57,16 @@ jobs:
       - name: Publish
         shell: bash
         run: |
+          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          echo "Stamping version: $VERSION"
           dotnet publish ${{ matrix.project }} \
             -c Release \
             -r ${{ matrix.rid }} \
             --self-contained \
             -p:PublishSingleFile=true \
             -p:IncludeNativeLibrariesForSelfExtract=true \
+            -p:Version="$VERSION" \
             -o publish/${{ matrix.project }}-${{ matrix.rid }}
 
       - name: Package (zip)
@@ -97,7 +101,11 @@ jobs:
           dotnet-version: "9.0.x"
 
       - name: Build
-        run: dotnet build RemoteCmd.Client48/RemoteCmd.Client48.csproj -c Release
+        shell: bash
+        run: |
+          VERSION="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          dotnet build RemoteCmd.Client48/RemoteCmd.Client48.csproj -c Release -p:Version="$VERSION"
 
       - name: Package (zip)
         shell: pwsh

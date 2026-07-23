@@ -23,14 +23,16 @@ public sealed class PollWorker : BackgroundService
 
     private readonly ClientConfig _config;
     private readonly ILogger<PollWorker> _log;
+    private readonly ClientStats? _stats;
 
     // Single-flight guard so a large file transfer runs off the poll loop without being re-dispatched.
     private volatile bool _fileBusy;
 
-    public PollWorker(ClientConfig config, ILogger<PollWorker> log)
+    public PollWorker(ClientConfig config, ILogger<PollWorker> log, ClientStats? stats = null)
     {
         _config = config;
         _log = log;
+        _stats = stats;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -72,6 +74,7 @@ public sealed class PollWorker : BackgroundService
                 //    and post the result (with its requestId) when it finishes, so the heartbeat
                 //    keeps ticking and further commands are picked up concurrently.
                 var response = await http.GetFromJsonAsync<PollResponse>(pollUrl, stoppingToken);
+                _stats?.MarkPoll();
                 if (response?.Command != null)
                 {
                     gotWork = true;
@@ -130,6 +133,7 @@ public sealed class PollWorker : BackgroundService
 
     private async Task HandleCommandAsync(HttpClient http, string resultUrl, string command, string? requestId, CancellationToken ct)
     {
+        _stats?.ExecStarted();
         try
         {
             var (output, exitCode) = await ExecuteCommand(command, ct);
@@ -145,6 +149,10 @@ public sealed class PollWorker : BackgroundService
         catch (Exception ex)
         {
             _log.LogWarning("[CMD ERROR] {Message}", ex.Message);
+        }
+        finally
+        {
+            _stats?.ExecFinished();
         }
     }
 
@@ -189,7 +197,7 @@ public sealed class PollWorker : BackgroundService
         }
     }
 
-    private static string DefaultShell()
+    internal static string DefaultShell()
         => RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "powershell.exe" : "/bin/bash";
 
     private static async Task<(string output, int exitCode)> ExecuteCommand(string command, CancellationToken ct)
@@ -305,7 +313,7 @@ public sealed class PollWorker : BackgroundService
     /// Stable client ID persisted on disk, scoped per --name so aliased instances
     /// on the same machine don't share an id. Mirrors the legacy single-file layout.
     /// </summary>
-    private static string ResolveClientId(string clientName)
+    internal static string ResolveClientId(string clientName)
     {
         var idDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData,
