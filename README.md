@@ -64,6 +64,31 @@ dotnet run --project RemoteCmd.Client -- <SERVER_IP> <TOKEN> [--name <alias>]
 RemoteCmd.Client.exe <SERVER_IP> <TOKEN> --name comos-1
 ```
 
+#### One-line PowerShell bootstrap (Windows)
+
+Downloads the latest self-contained client from GitHub Releases, generates a random
+key, and connects. Edit `$Server` to point at your relay; the printed key is the
+shared secret the relay operator must start the server with (or add for this client).
+
+```powershell
+$Server = 'http://YOUR_RELAY_HOST:7890'   # <-- change to your relay URL
+$Token  = -join ((48..57 + 65..90 + 97..122) | Get-Random -Count 24 | % { [char]$_ })
+$Dir = "$env:TEMP\remotecmd"; New-Item $Dir -ItemType Directory -Force | Out-Null
+Invoke-WebRequest 'https://github.com/nks-hub/remote-cmd/releases/latest/download/RemoteCmd.Client-win-x64.zip' -OutFile "$Dir\client.zip"
+Expand-Archive "$Dir\client.zip" $Dir -Force
+Write-Host "Client key (give this to the relay operator): $Token"
+& "$Dir\RemoteCmd.Client.exe" $Server $Token --name $env:COMPUTERNAME
+```
+
+Condensed to a single line for copy-paste:
+
+```powershell
+$S='http://YOUR_RELAY_HOST:7890';$T=-join((48..57+65..90+97..122)|Get-Random -Count 24|%{[char]$_});$D="$env:TEMP\remotecmd";ni $D -ItemType Directory -Force|Out-Null;iwr 'https://github.com/nks-hub/remote-cmd/releases/latest/download/RemoteCmd.Client-win-x64.zip' -OutFile "$D\c.zip";Expand-Archive "$D\c.zip" $D -Force;Write-Host "KEY: $T";& "$D\RemoteCmd.Client.exe" $S $T --name $env:COMPUTERNAME
+```
+
+Note: for an HTTP (`--no-tls`) relay the URL **must** start with `http://` and include
+the port, otherwise the client assumes `https://<host>` on port 443.
+
 Each client persists its GUID to `%LOCALAPPDATA%\RemoteCmd\client.<name>.id` (Linux/macOS: `$XDG_DATA_HOME/RemoteCmd/` or `~/.local/share/RemoteCmd/`). The ID survives restarts. The id file is **scoped per `--name`**, so multiple aliased instances on the same machine (e.g. elevated + non-elevated) get distinct ids and don't compete for the same session. A legacy `client.id` is auto-migrated for the default machine-name instance.
 
 #### Run as a system service
