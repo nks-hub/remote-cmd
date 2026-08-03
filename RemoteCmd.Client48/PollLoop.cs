@@ -27,11 +27,11 @@ namespace RemoteCmd.Client48
         public static void Run(ClientConfig config, Action<string> log, CancellationToken ct)
         {
             ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
-            ServicePointManager.ServerCertificateValidationCallback = (s, c, ch, e) => true;
 
             var baseUrl = config.BaseUrl;
             var clientId = ResolveClientId(config.Name);
-            var qs = "?token=" + config.Token + "&clientId=" + clientId + "&name=" + Uri.EscapeDataString(config.Name);
+            // Token travels in a header — query strings land in access and proxy logs.
+            var qs = "?clientId=" + clientId + "&name=" + Uri.EscapeDataString(config.Name);
 
             var pollUrl = baseUrl + "/api/poll" + qs;
             var resultUrl = baseUrl + "/api/result" + qs;
@@ -42,9 +42,15 @@ namespace RemoteCmd.Client48
 
             Crypto.Init(config.Token);
 
-            var handler = new HttpClientHandler();
+            // Accept the relay's self-signed certificate on this client only. The old
+            // ServicePointManager callback turned certificate checking off process-wide.
+            var handler = new HttpClientHandler
+            {
+                ServerCertificateCustomValidationCallback = (msg, cert, chain, errors) => true
+            };
             using (var http = new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(5) })
             {
+                http.DefaultRequestHeaders.Add("X-Token", config.Token);
                 log("Remote CMD Client48 started. Server=" + baseUrl + " Name=" + config.Name + " Id=" + clientId);
 
                 int retryDelay = 1;

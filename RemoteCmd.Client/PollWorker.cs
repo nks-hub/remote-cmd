@@ -39,7 +39,9 @@ public sealed class PollWorker : BackgroundService
     {
         var baseUrl = _config.BaseUrl;
         var clientId = ResolveClientId(_config.Name);
-        var qs = $"?token={_config.Token}&clientId={clientId}&name={Uri.EscapeDataString(_config.Name)}";
+        // The token goes in a header, not the query string: URLs end up in server access logs,
+        // proxy logs and error pages, and a leaked one is remote code execution.
+        var qs = $"?clientId={clientId}&name={Uri.EscapeDataString(_config.Name)}";
 
         var pollUrl = $"{baseUrl}/api/poll{qs}";
         var resultUrl = $"{baseUrl}/api/result{qs}";
@@ -59,6 +61,7 @@ public sealed class PollWorker : BackgroundService
             MaxConnectionsPerServer = 32,
         };
         using var http = new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(5) };
+        http.DefaultRequestHeaders.Add("X-Token", _config.Token);
 
         _log.LogInformation("Remote CMD Client started. Server={Server} Name={Name} Id={Id} Shell={Shell}",
             baseUrl, _config.Name, clientId, DefaultShell());

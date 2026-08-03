@@ -89,6 +89,7 @@ var startedUtc = DateTime.UtcNow;
 var clients = new ConcurrentDictionary<string, ClientSession>();
 var events = new EventLog();
 var stats = new RelayStats();
+var authThrottle = new AuthThrottle();
 
 var protocol = noTls ? "http" : "https";
 Console.WriteLine($"=== Remote CMD Relay Server {RemoteCmd.Shared.VersionInfo.Version} ===");
@@ -115,6 +116,7 @@ _ = Task.Run(async () =>
         try
         {
             await timer.WaitForNextTickAsync(gcCts);
+            authThrottle.Prune(DateTime.UtcNow);
             var pruned = ClientRegistry.PruneStale(clients, staleAfter, DateTime.UtcNow);
             if (pruned > 0)
             {
@@ -164,13 +166,21 @@ app.Use(async (context, next) =>
         var reqToken = context.Request.Query["token"].FirstOrDefault()
                        ?? context.Request.Headers["X-Token"].FirstOrDefault()
                        ?? ExtractBearer(context.Request.Headers["Authorization"].FirstOrDefault());
+        // A valid token is always served — the throttle only slows down the guessing, so an
+        // attacker sharing a NAT address with a real client can never lock that client out.
         var matched = tokens.FirstOrDefault(t => TokensEqual(reqToken, t));
         if (matched is null)
         {
+            var peer = context.Connection.RemoteIpAddress?.ToString() ?? "?";
+            var now = DateTime.UtcNow;
             Interlocked.Increment(ref stats.AuthFailures);
-            events.Add("auth", context.Connection.RemoteIpAddress?.ToString() ?? "?", $"401 on {path}");
-            context.Response.StatusCode = 401;
-            await context.Response.WriteAsync("Invalid token");
+            var justLocked = authThrottle.RecordFailure(peer, now);
+            var throttled = justLocked || authThrottle.IsLockedOut(peer, now);
+            events.Add("auth", peer, throttled ? $"blocked on {path}" : $"401 on {path}");
+
+            context.Response.StatusCode = throttled ? 429 : 401;
+            if (throttled) context.Response.Headers.RetryAfter = (AuthThrottle.LockoutMinutes * 60).ToString();
+            await context.Response.WriteAsync(throttled ? "Too many failed attempts" : "Invalid token");
             return;
         }
         context.Items[TokenItemKey] = matched;
