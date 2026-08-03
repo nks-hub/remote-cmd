@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Hosting.Systemd;
@@ -70,6 +71,12 @@ static async Task RunHost(ClientConfig config, bool dashboard)
         var host = builder.Build();
         ClientDashboard.EnableAnsi();
         ClientDashboard.Enter();
+
+        // A `kill` or a service stop must not leave the terminal stuck in the alternate buffer with
+        // a hidden cursor: restore it from the signal handler as well as from the normal exit path.
+        using var sigTerm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, _ => ClientDashboard.Leave());
+        using var sigInt = PosixSignalRegistration.Create(PosixSignal.SIGINT, _ => ClientDashboard.Leave());
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => ClientDashboard.Leave();
 
         using var repaintCts = new CancellationTokenSource();
         var repaint = Task.Run(async () =>

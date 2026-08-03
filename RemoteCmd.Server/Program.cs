@@ -137,6 +137,9 @@ if (dashboard)
     Dashboard.Enter();
     app.Lifetime.ApplicationStopping.Register(Dashboard.Leave);
     AppDomain.CurrentDomain.ProcessExit += (_, _) => Dashboard.Leave();
+    // Restore the terminal on `kill` / service stop too, not just on graceful shutdown.
+    System.Runtime.InteropServices.PosixSignalRegistration.Create(System.Runtime.InteropServices.PosixSignal.SIGTERM, _ => Dashboard.Leave());
+    System.Runtime.InteropServices.PosixSignalRegistration.Create(System.Runtime.InteropServices.PosixSignal.SIGINT, _ => Dashboard.Leave());
     _ = Task.Run(async () =>
     {
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
