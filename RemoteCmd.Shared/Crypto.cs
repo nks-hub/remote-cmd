@@ -1,28 +1,23 @@
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 
 namespace RemoteCmd.Shared;
 
 /// <summary>
-/// AES-256-GCM encryption with key derived from a shared token via SHA256.
+/// AES-256-GCM payload encryption. The key is derived from the shared token via SHA256, so every
+/// token has its own key — a relay serving several tokens must encrypt each client's traffic with
+/// the token that client authenticated with (see <see cref="Crypto.For"/>).
 /// Wire format: nonce(12) + tag(16) + ciphertext(N).
 /// </summary>
-public static class Crypto
+public sealed class CryptoKey
 {
-    private static byte[] _key = null!;
+    private readonly byte[] _key;
 
-    /// <summary>
-    /// Derive AES-256 key from shared token using SHA256.
-    /// </summary>
-    public static void Init(string token)
-    {
-        _key = SHA256.HashData(Encoding.UTF8.GetBytes("RemoteCmd:v1:" + token));
-    }
+    public CryptoKey(string token)
+        => _key = SHA256.HashData(Encoding.UTF8.GetBytes("RemoteCmd:v1:" + token));
 
-    /// <summary>Reset key state. Test-only.</summary>
-    internal static void Reset() => _key = null!;
-
-    public static byte[] Encrypt(byte[] data)
+    public byte[] Encrypt(byte[] data)
     {
         var nonce = new byte[12];
         RandomNumberGenerator.Fill(nonce);
@@ -39,7 +34,7 @@ public static class Crypto
         return result;
     }
 
-    public static byte[] Decrypt(byte[] data)
+    public byte[] Decrypt(byte[] data)
     {
         if (data.Length < 28) throw new CryptographicException("Invalid encrypted data");
 
@@ -57,9 +52,38 @@ public static class Crypto
         return plaintext;
     }
 
-    public static string EncryptString(string text)
+    public string EncryptString(string text)
         => Convert.ToBase64String(Encrypt(Encoding.UTF8.GetBytes(text)));
 
-    public static string DecryptString(string base64)
+    public string DecryptString(string base64)
         => Encoding.UTF8.GetString(Decrypt(Convert.FromBase64String(base64)));
+}
+
+/// <summary>
+/// Key cache plus the single-token helpers used by the client, which only ever talks to one relay
+/// with one token.
+/// </summary>
+public static class Crypto
+{
+    private static readonly ConcurrentDictionary<string, CryptoKey> Keys = new(StringComparer.Ordinal);
+    private static CryptoKey? _default;
+
+    /// <summary>Key for a specific token; cached so lookups on the polling path stay cheap.</summary>
+    public static CryptoKey For(string token) => Keys.GetOrAdd(token, t => new CryptoKey(t));
+
+    /// <summary>Set the key used by the parameterless helpers below.</summary>
+    public static void Init(string token) => _default = For(token);
+
+    /// <summary>Reset key state. Test-only.</summary>
+    internal static void Reset() => _default = null;
+
+    private static CryptoKey Default => _default ?? throw new InvalidOperationException("Crypto.Init was not called");
+
+    public static byte[] Encrypt(byte[] data) => Default.Encrypt(data);
+
+    public static byte[] Decrypt(byte[] data) => Default.Decrypt(data);
+
+    public static string EncryptString(string text) => Default.EncryptString(text);
+
+    public static string DecryptString(string base64) => Default.DecryptString(base64);
 }
