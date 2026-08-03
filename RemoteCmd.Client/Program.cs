@@ -69,7 +69,7 @@ static async Task RunHost(ClientConfig config, bool dashboard)
 
         var host = builder.Build();
         ClientDashboard.EnableAnsi();
-        try { Console.CursorVisible = false; } catch { /* redirected */ }
+        ClientDashboard.Enter();
 
         using var repaintCts = new CancellationTokenSource();
         var repaint = Task.Run(async () =>
@@ -88,7 +88,7 @@ static async Task RunHost(ClientConfig config, bool dashboard)
         {
             repaintCts.Cancel();
             try { await repaint; } catch { /* ignore */ }
-            try { Console.CursorVisible = true; } catch { /* ignore */ }
+            ClientDashboard.Leave();
         }
         return;
     }

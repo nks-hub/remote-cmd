@@ -1,6 +1,6 @@
 using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
-using System.Text;
+using RemoteCmd.Shared;
 
 /// <summary>
 /// Live "top"-style status view for the relay console: which clients are connected, for how long,
@@ -9,32 +9,31 @@ using System.Text;
 /// </summary>
 public static class Dashboard
 {
-    private const string HomeAndClear = "\x1b[H\x1b[2J"; // cursor home + clear screen
-
     public static string Render(
         ConcurrentDictionary<string, ClientSession> clients,
         int port,
         bool noTls,
         DateTime startedUtc,
-        DateTime nowUtc)
+        DateTime nowUtc,
+        IReadOnlyList<string>? events = null,
+        int height = 0)
     {
         var sessions = clients.Values.OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase).ToList();
         var connected = sessions.Count(c => c.IsConnected());
         var running = sessions.Sum(c => c.InFlight.Count);
         var queued = sessions.Sum(c => c.CommandQueue.Count);
 
-        var sb = new StringBuilder();
-        sb.Append(HomeAndClear);
-        sb.Append("=== Remote CMD Relay :").Append(port).Append(' ').Append(noTls ? "http" : "https")
-          .Append(" — up ").Append(Fmt(nowUtc - startedUtc)).Append(" ===\n");
-        sb.Append("Clients: ").Append(connected).Append(" connected / ").Append(sessions.Count).Append(" total")
-          .Append("   Commands: ").Append(running).Append(" running, ").Append(queued).Append(" queued")
-          .Append("   ").Append(nowUtc.ToLocalTime().ToString("HH:mm:ss")).Append('\n');
-        sb.Append('\n');
-        sb.Append(Row("NAME", "ID", "POLL", "RUN", "QUEUE", "DONE", "STATE"));
+        var rows = new List<string>
+        {
+            $"=== Remote CMD Relay :{port} {(noTls ? "http" : "https")} — up {Fmt(nowUtc - startedUtc)} ===",
+            $"Clients: {connected} connected / {sessions.Count} total   " +
+            $"Commands: {running} running, {queued} queued   {nowUtc.ToLocalTime():HH:mm:ss}",
+            "",
+            Row("NAME", "ID", "TOKEN", "POLL", "RUN", "QUEUE", "DONE", "STATE"),
+        };
 
         if (sessions.Count == 0)
-            sb.Append("(no clients registered)\n");
+            rows.Add("(no clients registered)");
 
         foreach (var c in sessions)
         {
@@ -43,26 +42,46 @@ public static class Dashboard
             var state = c.PendingUpload != null ? "UPLOAD"
                       : c.PendingDownload != null ? "DOWNLOAD"
                       : c.IsConnected() ? "idle" : "STALE";
-            sb.Append(Row(
+            rows.Add(Row(
                 Trunc(c.Name, 17),
                 c.Id.Length <= 8 ? c.Id : c.Id[..8],
+                Trunc(c.TokenLabel, 9),
                 poll,
                 c.InFlight.Count.ToString(),
                 c.CommandQueue.Count.ToString(),
                 Interlocked.Read(ref c.CommandsServed).ToString(),
                 state));
         }
-        return sb.ToString();
+
+        if (events is { Count: > 0 })
+        {
+            rows.Add("");
+            rows.Add("--- recent events ---");
+            var room = height > 0 ? Math.Max(1, height - rows.Count - 1) : events.Count;
+            foreach (var e in events.TakeLast(room))
+                rows.Add(e);
+        }
+
+        if (height > 0 && rows.Count > height)
+            rows = rows.Take(height).ToList();
+
+        return TerminalScreen.Frame(rows);
     }
 
-    private static string Row(string name, string id, string poll, string run, string queue, string done, string state)
-        => string.Format("{0,-18}{1,-10}{2,-8}{3,-6}{4,-7}{5,-7}{6}\n", name, id, poll, run, queue, done, state);
+    private static string Row(string name, string id, string token, string poll, string run, string queue, string done, string state)
+        => string.Format("{0,-18}{1,-10}{2,-11}{3,-8}{4,-6}{5,-7}{6,-7}{7}", name, id, token, poll, run, queue, done, state);
 
     private static string Fmt(TimeSpan t)
         => $"{(int)t.TotalHours:00}:{t.Minutes:00}:{t.Seconds:00}";
 
     private static string Trunc(string s, int max)
         => s.Length <= max ? s : s[..(max - 1)] + "~";
+
+    /// <summary>Enter the alternate screen buffer so repaints stay in place instead of filling scrollback.</summary>
+    public static void Enter() => TerminalScreen.Enter();
+
+    /// <summary>Restore the terminal to the state it had before the dashboard took over.</summary>
+    public static void Leave() => TerminalScreen.Leave();
 
     /// <summary>Enable ANSI/VT processing on the Windows console. No-op elsewhere or when redirected.</summary>
     public static void EnableAnsi()
