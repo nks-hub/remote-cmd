@@ -58,9 +58,8 @@ if (noTls)
 }
 else
 {
-    // The certificate is kept between restarts: a fresh one every start means the browser warning
-    // can never be dismissed for good and no client can ever pin the relay.
-    var certificate = LoadOrCreateCert(Path.Combine(AppContext.BaseDirectory, "remotecmd.pfx"));
+    var certificate = RelayCertificate.LoadOrCreate(
+        Path.Combine(AppContext.BaseDirectory, "remotecmd.pfx"), Console.Out);
 
     builder.WebHost.UseUrls($"https://0.0.0.0:{port}");
     builder.WebHost.ConfigureKestrel(o =>
@@ -617,68 +616,6 @@ static TargetResolution ResolveTarget(HttpRequest req, ConcurrentDictionary<stri
 
     var names = string.Join(", ", connected.Select(c => c.Name));
     return new TargetResolution { Error = $"Multiple clients connected ({names}); specify ?client=<name|id>" };
-}
-
-/// <summary>
-/// Reuse the certificate stored next to the executable, or make one and keep it. The password sits
-/// beside it in a file the OS protects the same way as the key itself — the point is stability
-/// across restarts, not secrecy from someone who already reads the relay's own directory.
-/// </summary>
-static X509Certificate2 LoadOrCreateCert(string certPath)
-{
-    var passPath = certPath + ".pass";
-    try
-    {
-        if (File.Exists(certPath) && File.Exists(passPath))
-        {
-            var cert = X509CertificateLoader.LoadPkcs12FromFile(certPath, File.ReadAllText(passPath));
-            if (cert.NotAfter > DateTime.Now.AddDays(7)) return cert;
-            Console.WriteLine("[TLS] stored certificate expires soon — issuing a new one");
-        }
-    }
-    catch (Exception ex)
-    {
-        Console.Error.WriteLine($"[TLS] cannot reuse stored certificate ({ex.Message}) — issuing a new one");
-    }
-
-    var fresh = GenerateSelfSignedCert();
-    var password = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
-    try
-    {
-        File.WriteAllBytes(certPath, fresh.Export(X509ContentType.Pfx, password));
-        File.WriteAllText(passPath, password);
-        Console.WriteLine($"[TLS] certificate stored in {certPath} (thumbprint {fresh.Thumbprint})");
-    }
-    catch (Exception ex)
-    {
-        Console.Error.WriteLine($"[TLS] certificate not persisted ({ex.Message}) — the browser warning will return after a restart");
-    }
-    return fresh;
-}
-
-static X509Certificate2 GenerateSelfSignedCert()
-{
-    using var rsa = RSA.Create(2048);
-    var request = new CertificateRequest(
-        "CN=RemoteCmd, O=NKS Hub",
-        rsa,
-        HashAlgorithmName.SHA256,
-        RSASignaturePadding.Pkcs1);
-
-    request.CertificateExtensions.Add(
-        new X509BasicConstraintsExtension(false, false, 0, false));
-    request.CertificateExtensions.Add(
-        new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature, false));
-
-    var sanBuilder = new SubjectAlternativeNameBuilder();
-    sanBuilder.AddDnsName("localhost");
-    sanBuilder.AddIpAddress(System.Net.IPAddress.Loopback);
-    sanBuilder.AddIpAddress(System.Net.IPAddress.IPv6Loopback);
-    request.CertificateExtensions.Add(sanBuilder.Build());
-
-    return request.CreateSelfSigned(
-        DateTimeOffset.UtcNow.AddDays(-1),
-        DateTimeOffset.UtcNow.AddYears(5));
 }
 
 // === Models ===
