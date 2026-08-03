@@ -58,19 +58,15 @@ if (noTls)
 }
 else
 {
-    var cert = GenerateSelfSignedCert();
-    var certPath = Path.Combine(AppContext.BaseDirectory, "remotecmd.pfx");
-    var certPassword = Guid.NewGuid().ToString("N")[..16];
-    File.WriteAllBytes(certPath, cert.Export(X509ContentType.Pfx, certPassword));
+    // The certificate is kept between restarts: a fresh one every start means the browser warning
+    // can never be dismissed for good and no client can ever pin the relay.
+    var certificate = LoadOrCreateCert(Path.Combine(AppContext.BaseDirectory, "remotecmd.pfx"));
 
     builder.WebHost.UseUrls($"https://0.0.0.0:{port}");
     builder.WebHost.ConfigureKestrel(o =>
     {
         o.Limits.MaxRequestBodySize = 200_000_000;
-        o.ConfigureHttpsDefaults(https =>
-        {
-            https.ServerCertificate = X509CertificateLoader.LoadPkcs12FromFile(certPath, certPassword);
-        });
+        o.ConfigureHttpsDefaults(https => https.ServerCertificate = certificate);
     });
 }
 
@@ -100,7 +96,7 @@ Console.WriteLine($"Encryption: AES-256-GCM (always on)");
 Console.WriteLine($"Multi-client: enabled");
 Console.WriteLine($"Session GC threshold: {staleAfter.TotalMinutes:N0} minutes");
 Console.WriteLine($"Live dashboard: {(dashboard ? "on (--dashboard)" : "off (add --dashboard)")}");
-Console.WriteLine($"Status page: {protocol}://<this-host>:{port}/ui?token=<token>");
+Console.WriteLine($"Status page: {protocol}://<this-host>:{port}/ui");
 Console.WriteLine();
 Console.WriteLine("Client setup (run on target machine):");
 Console.WriteLine($"  RemoteCmd.Client.exe <THIS_SERVER_IP> {token}");
@@ -164,7 +160,9 @@ if (dashboard)
 app.Use(async (context, next) =>
 {
     var path = context.Request.Path.Value ?? "";
-    if (path.StartsWith("/api/") || path.StartsWith("/ui"))
+    // /ui itself is a static shell with no data in it; it asks for the token in the browser and
+    // sends it as a header on its own API calls, so it never has to travel in a URL.
+    if (path.StartsWith("/api/"))
     {
         var reqToken = context.Request.Query["token"].FirstOrDefault()
                        ?? context.Request.Headers["X-Token"].FirstOrDefault()
@@ -477,11 +475,11 @@ app.MapGet("/api/status", (HttpRequest req) =>
     });
 });
 
+// Unauthenticated: says what this is and nothing about who is connected.
 app.MapGet("/", () => Results.Text(
     $"Remote CMD Relay Server {RemoteCmd.Shared.VersionInfo.Version} (multi-client)\n" +
-    $"Encryption: AES-256-GCM | TLS: {(noTls ? "off" : "self-signed")} | Tokens: {tokens.Count}\n" +
-    $"Connected clients: {clients.Values.Count(c => c.IsConnected())}/{clients.Count}\n\n" +
-    "GET  /ui?token=...                         - Status page (sessions, history, stats)\n" +
+    $"Encryption: AES-256-GCM | TLS: {(noTls ? "off" : "self-signed")}\n\n" +
+    "GET  /ui                                   - Status page (sessions, history, stats)\n" +
     "GET  /api/status[?client=X]                - Check client(s)\n" +
     "GET  /api/clients                          - List all clients\n" +
     "GET  /api/events[?limit=N]                 - Recent relay events + counters\n" +
@@ -619,6 +617,43 @@ static TargetResolution ResolveTarget(HttpRequest req, ConcurrentDictionary<stri
 
     var names = string.Join(", ", connected.Select(c => c.Name));
     return new TargetResolution { Error = $"Multiple clients connected ({names}); specify ?client=<name|id>" };
+}
+
+/// <summary>
+/// Reuse the certificate stored next to the executable, or make one and keep it. The password sits
+/// beside it in a file the OS protects the same way as the key itself — the point is stability
+/// across restarts, not secrecy from someone who already reads the relay's own directory.
+/// </summary>
+static X509Certificate2 LoadOrCreateCert(string certPath)
+{
+    var passPath = certPath + ".pass";
+    try
+    {
+        if (File.Exists(certPath) && File.Exists(passPath))
+        {
+            var cert = X509CertificateLoader.LoadPkcs12FromFile(certPath, File.ReadAllText(passPath));
+            if (cert.NotAfter > DateTime.Now.AddDays(7)) return cert;
+            Console.WriteLine("[TLS] stored certificate expires soon — issuing a new one");
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"[TLS] cannot reuse stored certificate ({ex.Message}) — issuing a new one");
+    }
+
+    var fresh = GenerateSelfSignedCert();
+    var password = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
+    try
+    {
+        File.WriteAllBytes(certPath, fresh.Export(X509ContentType.Pfx, password));
+        File.WriteAllText(passPath, password);
+        Console.WriteLine($"[TLS] certificate stored in {certPath} (thumbprint {fresh.Thumbprint})");
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"[TLS] certificate not persisted ({ex.Message}) — the browser warning will return after a restart");
+    }
+    return fresh;
 }
 
 static X509Certificate2 GenerateSelfSignedCert()

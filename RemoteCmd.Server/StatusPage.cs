@@ -1,6 +1,7 @@
 /// <summary>
-/// Single-file status page served at /ui. It reuses the caller's query string for its own fetches,
-/// so the token stays out of the markup, and it renders everything from /api/clients and /api/events.
+/// Single-file status page served at /ui. The page itself carries no data and needs no token to
+/// load; it asks for one in the browser, keeps it in sessionStorage and sends it as an X-Token
+/// header, so the token never appears in a URL, in browser history or in the relay's access log.
 /// </summary>
 public static class StatusPage
 {
@@ -32,11 +33,24 @@ public static class StatusPage
   .ev { display:grid; grid-template-columns:78px 84px 150px 1fr; gap:8px; padding:3px 0; border-bottom:1px solid var(--line); }
   .ev .k { color:var(--muted); }
   .empty { color:var(--muted); padding:8px 0; }
+  #gate { display:flex; gap:8px; align-items:center; margin:16px 0 24px; flex-wrap:wrap; }
+  #gate input { font:inherit; padding:8px 10px; min-width:280px; background:var(--card); color:var(--fg);
+                border:1px solid var(--line); border-radius:6px; }
+  #gate button { font:inherit; padding:8px 16px; border-radius:6px; border:1px solid var(--line);
+                 background:var(--card); color:var(--fg); cursor:pointer; }
+  #gate .err { color:var(--bad); }
+  [hidden] { display:none !important; }
 </style>
 </head>
 <body>
 <h1>RemoteCmd relay</h1>
 <div class="sub" id="sub">loading…</div>
+
+<form id="gate" hidden>
+  <input id="token" type="password" placeholder="relay token" autocomplete="off" spellcheck="false">
+  <button type="submit">Connect</button>
+  <span class="err" id="gateErr"></span>
+</form>
 
 <div class="cards" id="cards"></div>
 
@@ -51,8 +65,54 @@ public static class StatusPage
 <div id="events"></div>
 
 <script>
-const qs = location.search;
 const txt = (v) => document.createTextNode(String(v));
+const gate = document.getElementById('gate');
+const gateErr = document.getElementById('gateErr');
+const body = ['cards', 'tbl', 'events'].map((id) => document.getElementById(id));
+let token = sessionStorage.getItem('rcmd-token');
+
+// A token in the query string still works (older bookmarks), but it is moved into the session and
+// wiped from the address bar so it stops leaking through history and the referrer.
+const fromUrl = new URLSearchParams(location.search).get('token');
+if (fromUrl) {
+  token = fromUrl;
+  sessionStorage.setItem('rcmd-token', token);
+  history.replaceState(null, '', location.pathname);
+}
+
+function askForToken(message) {
+  token = null;
+  sessionStorage.removeItem('rcmd-token');
+  gateErr.textContent = message || '';
+  gate.hidden = false;
+  body.forEach((el) => { el.hidden = true; });
+  document.getElementById('noclients').hidden = true;
+  document.getElementById('sub').textContent = 'not connected';
+  document.getElementById('token').focus();
+}
+
+gate.addEventListener('submit', (e) => {
+  e.preventDefault();
+  const value = document.getElementById('token').value.trim();
+  if (!value) return;
+  token = value;
+  sessionStorage.setItem('rcmd-token', token);
+  document.getElementById('token').value = '';
+  gate.hidden = true;
+  gateErr.textContent = '';
+  body.forEach((el) => { el.hidden = false; });
+  tick();
+});
+
+async function api(path) {
+  const res = await fetch(path, { headers: { 'X-Token': token } });
+  if (res.status === 401 || res.status === 429) {
+    const err = new Error('auth');
+    err.auth = res.status;
+    throw err;
+  }
+  return res.json();
+}
 
 function dur(s) {
   if (s < 0) return '-';
@@ -70,14 +130,14 @@ function card(value, label) {
 }
 
 async function tick() {
+  if (!token) return;
   let clients, info;
   try {
-    [clients, info] = await Promise.all([
-      fetch('/api/clients' + qs).then(r => r.json()),
-      fetch('/api/events' + qs + (qs ? '&' : '?') + 'limit=80').then(r => r.json()),
-    ]);
-  } catch {
-    document.getElementById('sub').textContent = 'relay unreachable';
+    [clients, info] = await Promise.all([api('/api/clients'), api('/api/events?limit=80')]);
+  } catch (e) {
+    if (e.auth === 401) askForToken('wrong token');
+    else if (e.auth === 429) askForToken('too many attempts — wait a few minutes');
+    else document.getElementById('sub').textContent = 'relay unreachable';
     return;
   }
 
@@ -136,7 +196,7 @@ async function tick() {
   }
 }
 
-tick();
+if (token) tick(); else askForToken();
 setInterval(tick, 3000);
 </script>
 </body>
