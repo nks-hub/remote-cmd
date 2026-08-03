@@ -35,6 +35,10 @@ var noTls = args.Contains("--no-tls")
     || string.Equals(Environment.GetEnvironmentVariable("REMOTECMD_NO_TLS"), "true", StringComparison.OrdinalIgnoreCase);
 var dashboard = args.Contains("--dashboard")
     || string.Equals(Environment.GetEnvironmentVariable("REMOTECMD_DASHBOARD"), "1", StringComparison.Ordinal);
+// Read-only status without a token: the web dashboard then just opens. Everything that touches a
+// machine — exec, file transfer, the client protocol — still needs one.
+var openStatus = args.Contains("--open-status")
+    || string.Equals(Environment.GetEnvironmentVariable("REMOTECMD_OPEN_STATUS"), "1", StringComparison.Ordinal);
 
 const int MinTokenLength = 12;
 var allowShortToken = string.Equals(Environment.GetEnvironmentVariable("REMOTECMD_ALLOW_SHORT_TOKEN"), "1", StringComparison.Ordinal);
@@ -95,7 +99,7 @@ Console.WriteLine($"Encryption: AES-256-GCM (always on)");
 Console.WriteLine($"Multi-client: enabled");
 Console.WriteLine($"Session GC threshold: {staleAfter.TotalMinutes:N0} minutes");
 Console.WriteLine($"Live dashboard: {(dashboard ? "on (--dashboard)" : "off (add --dashboard)")}");
-Console.WriteLine($"Status page: {protocol}://<this-host>:{port}/ui");
+Console.WriteLine($"Status page: {protocol}://<this-host>:{port}/ui{(openStatus ? "  (open, no token)" : "")}");
 Console.WriteLine();
 Console.WriteLine("Client setup (run on target machine):");
 Console.WriteLine($"  RemoteCmd.Client.exe <THIS_SERVER_IP> {token}");
@@ -161,7 +165,8 @@ app.Use(async (context, next) =>
     var path = context.Request.Path.Value ?? "";
     // /ui itself is a static shell with no data in it; it asks for the token in the browser and
     // sends it as a header on its own API calls, so it never has to travel in a URL.
-    if (path.StartsWith("/api/"))
+    var readOnly = path is "/api/status" or "/api/clients" or "/api/events";
+    if (path.StartsWith("/api/") && !(openStatus && readOnly))
     {
         var reqToken = context.Request.Query["token"].FirstOrDefault()
                        ?? context.Request.Headers["X-Token"].FirstOrDefault()

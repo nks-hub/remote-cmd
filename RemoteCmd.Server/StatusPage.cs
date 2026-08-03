@@ -87,7 +87,7 @@ function askForToken(message) {
   gate.hidden = false;
   body.forEach((el) => { el.hidden = true; });
   document.getElementById('noclients').hidden = true;
-  document.getElementById('sub').textContent = 'not connected';
+  document.getElementById('sub').textContent = 'this relay needs a token';
   document.getElementById('token').focus();
 }
 
@@ -105,7 +105,7 @@ gate.addEventListener('submit', (e) => {
 });
 
 async function api(path) {
-  const res = await fetch(path, { headers: { 'X-Token': token } });
+  const res = await fetch(path, { headers: token ? { 'X-Token': token } : {} });
   if (res.status === 401 || res.status === 429) {
     const err = new Error('auth');
     err.auth = res.status;
@@ -130,16 +130,20 @@ function card(value, label) {
 }
 
 async function tick() {
-  if (!token) return;
   let clients, info;
   try {
     [clients, info] = await Promise.all([api('/api/clients'), api('/api/events?limit=80')]);
   } catch (e) {
-    if (e.auth === 401) askForToken('wrong token');
+    // A relay started with --open-status serves these without a token, so the form only appears
+    // when the relay actually demands one.
+    if (e.auth === 401) askForToken(token ? 'wrong token' : '');
     else if (e.auth === 429) askForToken('too many attempts — wait a few minutes');
     else document.getElementById('sub').textContent = 'relay unreachable';
     return;
   }
+
+  gate.hidden = true;
+  body.forEach((el) => { el.hidden = false; });
 
   document.getElementById('sub').textContent =
     `up ${dur(info.uptimeSeconds)} · ${info.tls ? 'TLS' : 'plain http'} · ${info.tokens} token(s) accepted`;
@@ -196,7 +200,7 @@ async function tick() {
   }
 }
 
-if (token) tick(); else askForToken();
+tick();
 setInterval(tick, 3000);
 </script>
 </body>
