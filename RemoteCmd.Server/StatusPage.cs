@@ -56,7 +56,7 @@ public static class StatusPage
 
 <h2>Sessions</h2>
 <div class="scroll"><table id="tbl">
-  <thead><tr><th>name</th><th>id</th><th>token</th><th>state</th><th>last poll</th><th>run</th><th>queue</th><th>served</th><th>connected</th></tr></thead>
+  <thead><tr><th>name</th><th>id</th><th>address</th><th>token</th><th>state</th><th>last poll</th><th>run</th><th>queue</th><th>served</th><th>connected</th></tr></thead>
   <tbody></tbody>
 </table></div>
 <div class="empty" id="noclients" hidden>no clients registered</div>
@@ -164,12 +164,12 @@ async function tick() {
   tbody.replaceChildren();
   for (const c of clients.clients) {
     const tr = document.createElement('tr');
-    const cells = [c.name, c.id.slice(0, 8), c.token, c.state,
+    const cells = [c.name, c.id.slice(0, 8), c.ip || '-', c.token, c.state,
                    c.secondsAgo < 0 ? '-' : c.secondsAgo + 's',
                    c.running, c.queued, c.served, dur(c.connectedForSeconds)];
     cells.forEach((v, i) => {
       const td = document.createElement('td');
-      if (i === 3) td.className = v === 'idle' ? 'idle' : v === 'stale' ? 'stale' : 'busy';
+      if (i === 4) td.className = v === 'idle' ? 'idle' : v === 'stale' ? 'stale' : 'busy';
       td.append(txt(v));
       tr.append(td);
     });

@@ -29,7 +29,7 @@ public static class Dashboard
             $"Clients: {connected} connected / {sessions.Count} total   " +
             $"Commands: {running} running, {queued} queued   {nowUtc.ToLocalTime():HH:mm:ss}",
             "",
-            Row("NAME", "ID", "TOKEN", "POLL", "RUN", "QUEUE", "DONE", "STATE"),
+            Row("NAME", "ID", "ADDRESS", "TOKEN", "POLL", "RUN", "QUEUE", "DONE", "STATE"),
         };
 
         if (sessions.Count == 0)
@@ -45,6 +45,7 @@ public static class Dashboard
             rows.Add(Row(
                 Trunc(c.Name, 17),
                 c.Id.Length <= 8 ? c.Id : c.Id[..8],
+                Trunc(string.IsNullOrEmpty(c.RemoteIp) ? "-" : c.RemoteIp, 15),
                 Trunc(c.TokenLabel, 9),
                 poll,
                 c.InFlight.Count.ToString(),
@@ -68,8 +69,9 @@ public static class Dashboard
         return TerminalScreen.Frame(rows);
     }
 
-    private static string Row(string name, string id, string token, string poll, string run, string queue, string done, string state)
-        => string.Format("{0,-18}{1,-10}{2,-11}{3,-8}{4,-6}{5,-7}{6,-7}{7}", name, id, token, poll, run, queue, done, state);
+    private static string Row(string name, string id, string address, string token, string poll, string run, string queue, string done, string state)
+        => string.Format("{0,-18}{1,-10}{2,-17}{3,-11}{4,-8}{5,-6}{6,-7}{7,-7}{8}",
+                         name, id, address, token, poll, run, queue, done, state);
 
     private static string Fmt(TimeSpan t)
         => $"{(int)t.TotalHours:00}:{t.Minutes:00}:{t.Seconds:00}";

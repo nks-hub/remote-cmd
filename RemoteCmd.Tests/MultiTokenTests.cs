@@ -82,6 +82,7 @@ public class MultiTokenTests : IClassFixture<MultiTokenFactory>
         var entry = list!.Clients.Single(c => c.Id == id);
 
         Assert.Equal($"{MultiTokenFactory.Second[..2]}…{MultiTokenFactory.Second[^2..]}", entry.Token);
+        Assert.NotNull(entry.Ip); // the address the client polled from, "" for the in-memory transport
     }
 
     [Fact]
@@ -100,7 +101,7 @@ public class MultiTokenTests : IClassFixture<MultiTokenFactory>
     record PollWithId(string? Command, string? RequestId);
     record ExecDto(string Output, int ExitCode);
     record ClientsDto(int Count, List<ClientDto> Clients);
-    record ClientDto(string Id, string Name, string Token);
+    record ClientDto(string Id, string Name, string Token, string Ip);
     record EventsDto(int Tokens, List<EventDto> Events);
     record EventDto(string Kind, string Client, string Message);
 }

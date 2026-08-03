@@ -416,6 +416,7 @@ app.MapGet("/api/clients", () =>
         {
             id = c.Id,
             name = c.Name,
+            ip = c.RemoteIp,
             token = c.TokenLabel,
             lastPoll = c.LastPoll,
             secondsAgo = c.LastPoll == DateTime.MinValue ? -1 : (int)(DateTime.UtcNow - c.LastPoll).TotalSeconds,
@@ -461,6 +462,7 @@ app.MapGet("/api/status", (HttpRequest req) =>
             clientConnected = s.IsConnected(),
             name = s.Name,
             id = s.Id,
+            ip = s.RemoteIp,
             lastPoll = s.LastPoll,
             secondsAgo = s.LastPoll == DateTime.MinValue ? -1 : (int)(DateTime.UtcNow - s.LastPoll).TotalSeconds,
             encryption = "AES-256-GCM",
@@ -548,6 +550,7 @@ static ClientSession TouchSession(HttpRequest req, ConcurrentDictionary<string, 
     var wasOffline = !isNew && !session.IsConnected();
 
     session.TokenLabel = MaskToken((string)req.HttpContext.Items[TokenItemKey]!);
+    session.RemoteIp = req.HttpContext.Connection.RemoteIpAddress?.ToString() ?? "";
     if (isNew) events.Add("connect", name, $"new session {clientId[..Math.Min(8, clientId.Length)]} (token {session.TokenLabel})");
     else if (wasOffline) events.Add("connect", name, $"back after {(int)(DateTime.UtcNow - session.LastPoll).TotalSeconds}s");
 
@@ -648,6 +651,7 @@ public class ClientSession
     public DateTime LastNameFlapWarning { get; set; } = DateTime.MinValue;
     public DateTime ConnectedSince { get; set; } = DateTime.UtcNow;
     public string TokenLabel { get; set; } = "";  // masked token this client authenticates with
+    public string RemoteIp { get; set; } = "";    // address the client last polled from
     public long CommandsServed;   // total results delivered; mutable field for Interlocked
 
     // Commands queued for the next poll(s), and those handed out awaiting a result (keyed by id).
