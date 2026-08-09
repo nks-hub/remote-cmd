@@ -18,11 +18,20 @@ const EXEC_MAX_SECONDS = 3600;
 const isHttps = SERVER_URL.startsWith("https");
 const transport_module = isHttps ? https : http;
 
-if (isHttps) process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+// Without a token every call is a failed attempt, and the relay's brute-force throttle locks this
+// machine out after ten of them — for a mistake that is entirely local and knowable at startup.
+if (!TOKEN) {
+  console.error("REMOTECMD_TOKEN is not set. Set it to a token the relay accepts.");
+  process.exit(2);
+}
+
+// The relay serves a self-signed certificate, so verification has to be relaxed — but only for
+// connections to the relay. Setting NODE_TLS_REJECT_UNAUTHORIZED disabled it for the whole process,
+// including anything else this server might ever talk to.
+const agent = isHttps ? new https.Agent({ rejectUnauthorized: false }) : undefined;
 
 function buildUrl(endpoint, params = {}) {
   const url = new URL(endpoint, SERVER_URL);
-  url.searchParams.set("token", TOKEN);
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, v);
   }
@@ -38,9 +47,13 @@ function apiCall(method, endpoint, body = null, params = {}, isBinary = false, t
       path: url.pathname + url.search,
       method,
       timeout: timeoutMs,
+      agent,
+      // In the header, never the query string: URLs land in access logs, proxy logs and error
+      // pages, and a leaked relay token is remote code execution.
+      headers: { "X-Token": TOKEN },
     };
     if (body && !isBinary) {
-      options.headers = { "Content-Type": "application/json" };
+      options.headers["Content-Type"] = "application/json";
     }
 
     const req = transport_module.request(options, (res) => {
@@ -48,6 +61,13 @@ function apiCall(method, endpoint, body = null, params = {}, isBinary = false, t
       res.on("data", (chunk) => chunks.push(chunk));
       res.on("end", () => {
         const buf = Buffer.concat(chunks);
+        // Without this a 401, a 429 or a 500 came back to the agent as a perfectly ordinary tool
+        // result, so "the command produced no output" and "the relay refused the token" looked
+        // exactly alike.
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          reject(new Error(`relay returned HTTP ${res.statusCode}: ${buf.toString().slice(0, 500) || "(empty body)"}`));
+          return;
+        }
         if (isBinary && method === "GET") {
           resolve(buf);
         } else {
@@ -84,7 +104,9 @@ function uploadFile(localPath, remotePath, client) {
       path: url.pathname + url.search,
       method: "POST",
       timeout: 300000,
+      agent,
       headers: {
+        "X-Token": TOKEN,
         "Content-Type": "application/octet-stream",
         "Content-Length": fileData.length,
       },
@@ -94,10 +116,17 @@ function uploadFile(localPath, remotePath, client) {
       const chunks = [];
       res.on("data", (chunk) => chunks.push(chunk));
       res.on("end", () => {
+        const body = Buffer.concat(chunks).toString();
+        // The relay answers 502 when the client could not write the file and 504 when it never
+        // answered. Ignoring the status reported both as "Uploaded 12.4MB".
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          reject(new Error(`upload failed, relay returned HTTP ${res.statusCode}: ${body.slice(0, 500) || "(empty body)"}`));
+          return;
+        }
         try {
-          resolve(JSON.parse(Buffer.concat(chunks).toString()));
+          resolve(JSON.parse(body));
         } catch {
-          resolve(Buffer.concat(chunks).toString());
+          resolve(body);
         }
       });
     });
@@ -123,6 +152,8 @@ function downloadFile(remotePath, localPath, client) {
       path: url.pathname + url.search,
       method: "GET",
       timeout: 300000,
+      agent,
+      headers: { "X-Token": TOKEN },
     };
 
     const req = transport_module.request(options, (res) => {
@@ -136,10 +167,13 @@ function downloadFile(remotePath, localPath, client) {
           fs.writeFileSync(localPath, buf);
           resolve({ status: "ok", size: buf.length, localPath });
         } else {
+          // A 504 comes back with an empty body, and JSON.parse('') threw straight into a catch
+          // that produced { error: "" } — falsy, so the caller reported "Downloaded NaNMB".
           try {
-            resolve(JSON.parse(buf.toString()));
+            const parsed = JSON.parse(buf.toString());
+            resolve(parsed && parsed.error ? parsed : { error: `relay returned HTTP ${res.statusCode}` });
           } catch {
-            resolve({ error: buf.toString() });
+            resolve({ error: buf.toString() || `relay returned HTTP ${res.statusCode}` });
           }
         }
       });
