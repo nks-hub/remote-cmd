@@ -12,6 +12,9 @@ import path from "path";
 const SERVER_URL = process.env.REMOTECMD_URL || "https://localhost:7890";
 const TOKEN = process.env.REMOTECMD_TOKEN || "";
 const DEFAULT_CLIENT = process.env.REMOTECMD_DEFAULT_CLIENT || "";
+// Kept in step with RemoteCmd.Shared/ExecLimits.cs — the relay clamps to these anyway.
+const EXEC_DEFAULT_SECONDS = 60;
+const EXEC_MAX_SECONDS = 3600;
 const isHttps = SERVER_URL.startsWith("https");
 const transport_module = isHttps ? https : http;
 
@@ -26,7 +29,7 @@ function buildUrl(endpoint, params = {}) {
   return url;
 }
 
-function apiCall(method, endpoint, body = null, params = {}, isBinary = false) {
+function apiCall(method, endpoint, body = null, params = {}, isBinary = false, timeoutMs = 300000) {
   return new Promise((resolve, reject) => {
     const url = buildUrl(endpoint, params);
     const options = {
@@ -34,7 +37,7 @@ function apiCall(method, endpoint, body = null, params = {}, isBinary = false) {
       port: url.port,
       path: url.pathname + url.search,
       method,
-      timeout: 300000,
+      timeout: timeoutMs,
     };
     if (body && !isBinary) {
       options.headers = { "Content-Type": "application/json" };
@@ -182,8 +185,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           timeoutSeconds: {
             type: "number",
-            description: "Timeout in seconds (default 30, max 300)",
-            default: 30,
+            description: `How long the command may run before it is killed (default ${EXEC_DEFAULT_SECONDS}, max ${EXEC_MAX_SECONDS}). Raise it for builds and other long jobs.`,
+            default: EXEC_DEFAULT_SECONDS,
           },
           client: clientProp,
         },
@@ -260,14 +263,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case "remote_exec": {
+        const timeoutSeconds = args.timeoutSeconds || EXEC_DEFAULT_SECONDS;
         const result = await apiCall(
           "POST",
           "/api/exec",
-          {
-            command: args.command,
-            timeoutSeconds: args.timeoutSeconds || 30,
-          },
-          { client: resolveClient(args) }
+          { command: args.command, timeoutSeconds },
+          { client: resolveClient(args) },
+          false,
+          // Outlast the relay, which itself outlasts the command — otherwise this socket would give
+          // up first and a long command would look like a failure while it is still running.
+          (Math.min(timeoutSeconds, EXEC_MAX_SECONDS) + 60) * 1000
         );
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],

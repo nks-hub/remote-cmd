@@ -275,6 +275,74 @@ public class ServerIntegrationTests : IClassFixture<RemoteCmdFactory>
     }
 
     [Fact]
+    public async Task Exec_StoresItsOutput_ForTheStatusPageDetail()
+    {
+        var id = Guid.NewGuid().ToString("N");
+        var name = "detail-" + Guid.NewGuid().ToString("N")[..8];
+        await _http.GetAsync(Url("/api/poll", ("clientId", id), ("name", name)));
+
+        var longCommand = "echo " + new string('a', 200);
+        var execTask = _http.PostAsJsonAsync(
+            Url("/api/exec", ("client", name)),
+            new { command = longCommand, timeoutSeconds = 5 });
+
+        await Task.Delay(200);
+        var poll = await _http.GetFromJsonAsync<PollWithId>(Url("/api/poll", ("clientId", id), ("name", name)));
+        Assert.NotNull(poll?.RequestId);
+
+        var resultJson = System.Text.Json.JsonSerializer.Serialize(
+            new { output = "all good\n[STDERR]\nsomething went wrong", exitCode = 3 });
+        var encrypted = Crypto.Encrypt(Encoding.UTF8.GetBytes(resultJson));
+        using var content = new ByteArrayContent(encrypted);
+        await _http.PostAsync(Url("/api/result", ("clientId", id), ("requestId", poll!.RequestId!)), content);
+        await execTask;
+
+        var stored = await _http.GetFromJsonAsync<CommandDetail>(Url("/api/command", ("id", poll.RequestId!)));
+        Assert.NotNull(stored);
+        Assert.Equal(name, stored!.Client);
+        Assert.Equal(longCommand, stored.Command);       // full text, not the history excerpt
+        Assert.Equal("all good", stored.Stdout);
+        Assert.Equal("something went wrong", stored.Stderr);
+        Assert.Equal(3, stored.ExitCode);
+        Assert.False(stored.Truncated);
+
+        // The history line carries the id that links it to this record.
+        var history = await _http.GetFromJsonAsync<EventsResponse>(Url("/api/events", ("limit", "200")));
+        Assert.Contains(history!.Events, e => e.Kind == "exec" && e.Id == poll.RequestId);
+    }
+
+    [Theory]
+    [InlineData(0, 60)]      // nothing asked for → relay default
+    [InlineData(600, 600)]   // a long build is honoured, not capped at the old minute
+    [InlineData(99_999, 3600)]
+    public async Task Poll_HandsTheCommandsTimeoutToTheClient(int requested, int expected)
+    {
+        var id = Guid.NewGuid().ToString("N");
+        var name = "timeout-" + Guid.NewGuid().ToString("N")[..8];
+        await _http.GetAsync(Url("/api/poll", ("clientId", id), ("name", name)));
+
+        _ = _http.PostAsJsonAsync(Url("/api/exec", ("client", name)),
+            new { command = "slow-job", timeoutSeconds = requested });
+
+        PollWithTimeout? poll = null;
+        for (var i = 0; i < 50 && poll?.Command == null; i++)
+        {
+            poll = await _http.GetFromJsonAsync<PollWithTimeout>(Url("/api/poll", ("clientId", id), ("name", name)));
+            if (poll?.Command == null) await Task.Delay(20);
+        }
+
+        Assert.NotNull(poll?.Command);
+        Assert.Equal(expected, poll!.TimeoutSeconds);
+    }
+
+    [Fact]
+    public async Task Command_UnknownId_Returns404()
+    {
+        var res = await _http.GetAsync(Url("/api/command", ("id", "no-such-command")));
+        Assert.Equal(HttpStatusCode.NotFound, res.StatusCode);
+    }
+
+    [Fact]
     public async Task Exec_TimesOut_WhenClientDoesNotRespond()
     {
         var id = Guid.NewGuid().ToString("N");
@@ -323,7 +391,11 @@ public class ServerIntegrationTests : IClassFixture<RemoteCmdFactory>
 
     record PollDto(string? Command);
     record PollWithId(string? Command, string? RequestId);
+    record PollWithTimeout(string? Command, int TimeoutSeconds);
     record ExecResponse(string Output, int ExitCode);
+    record CommandDetail(string Id, string Client, string Command, string Stdout, string Stderr, int ExitCode, int DurationMs, bool Truncated);
+    record EventsResponse(List<EventEntry> Events);
+    record EventEntry(string Kind, string Client, string Message, string? Id);
     record ClientsResponse(int Count, int Connected, List<ClientEntry> Clients);
     record ClientEntry(string Id, string Name, bool Connected);
     record StatusAggregate(bool ClientConnected, int TotalClients, int ConnectedClients, string Encryption, bool Tls);

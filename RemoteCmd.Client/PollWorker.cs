@@ -16,7 +16,11 @@ namespace RemoteCmd.Client;
 /// </summary>
 public sealed class PollWorker : BackgroundService
 {
-    private const int CommandTimeoutMs = 60_000;
+    // Ceiling per captured stream. Well past any sane command's output, but low enough that a
+    // runaway one cannot exhaust the memory of the machine this client runs on.
+    private const int MaxStreamChars = 8 * 1024 * 1024;
+    private const string StreamCappedNote = "\n[TRUNCATED] output stopped at 8 MB";
+
     // After the process exits we wait at most this long for the pipes to drain: a detached child
     // (e.g. `nohup ... &`) can keep the write end open forever, so we return what we have and move on.
     private const int OutputGraceMs = 1_500;
@@ -85,7 +89,9 @@ public sealed class PollWorker : BackgroundService
                     var requestId = response.RequestId;
                     _log.LogInformation("[CMD{Id}] {Command}",
                         requestId is null ? "" : " " + requestId[..Math.Min(8, requestId.Length)], command);
-                    _ = HandleCommandAsync(http, resultUrl, command, requestId, stoppingToken);
+                    // A relay older than this field sends nothing, and Clamp turns that into the default.
+                    var timeoutSeconds = ExecLimits.Clamp(response.TimeoutSeconds);
+                    _ = HandleCommandAsync(http, resultUrl, command, requestId, timeoutSeconds, stoppingToken);
                 }
 
                 // 2. Poll for a file transfer, also dispatched off-loop (single-flight) so a large
@@ -134,12 +140,12 @@ public sealed class PollWorker : BackgroundService
         finally { _fileBusy = false; }
     }
 
-    private async Task HandleCommandAsync(HttpClient http, string resultUrl, string command, string? requestId, CancellationToken ct)
+    private async Task HandleCommandAsync(HttpClient http, string resultUrl, string command, string? requestId, int timeoutSeconds, CancellationToken ct)
     {
         _stats?.ExecStarted();
         try
         {
-            var (output, exitCode) = await ExecuteCommand(command, ct);
+            var (output, exitCode) = await ExecuteCommand(command, timeoutSeconds, ct);
             if (exitCode != 0) _log.LogWarning("[EXIT {Code}]", exitCode);
 
             var resultJson = JsonSerializer.Serialize(new CommandResult { Output = output, ExitCode = exitCode });
@@ -203,7 +209,7 @@ public sealed class PollWorker : BackgroundService
     internal static string DefaultShell()
         => RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "powershell.exe" : "/bin/bash";
 
-    private static async Task<(string output, int exitCode)> ExecuteCommand(string command, CancellationToken ct)
+    private static async Task<(string output, int exitCode)> ExecuteCommand(string command, int timeoutSeconds, CancellationToken ct)
     {
         try
         {
@@ -243,7 +249,7 @@ public sealed class PollWorker : BackgroundService
             var outPump = PumpAsync(process.StandardOutput, stdout, ct);
             var errPump = PumpAsync(process.StandardError, stderr, ct);
 
-            var exited = await WaitForExitAsync(process, CommandTimeoutMs, ct);
+            var exited = await WaitForExitAsync(process, timeoutSeconds * 1000, ct);
             var killed = false;
             if (!exited)
             {
@@ -265,7 +271,7 @@ public sealed class PollWorker : BackgroundService
 
             if (killed)
             {
-                const string note = "[KILLED] Command exceeded 60s timeout";
+                var note = $"[KILLED] Command exceeded {timeoutSeconds}s timeout";
                 return (combined.Length == 0 ? note : combined + "\n" + note, -1);
             }
 
@@ -281,7 +287,12 @@ public sealed class PollWorker : BackgroundService
         }
     }
 
-    /// <summary>Copy a redirected stream into <paramref name="sink"/> until EOF, tolerating pipe teardown.</summary>
+    /// <summary>
+    /// Copy a redirected stream into <paramref name="sink"/> until EOF, tolerating pipe teardown.
+    /// Keeps at most <see cref="MaxStreamChars"/>: a chatty command left running for an hour would
+    /// otherwise grow this buffer until the machine we are a guest on runs out of memory. The pipe
+    /// is still drained after the cap, so the child never blocks on a full one.
+    /// </summary>
     private static async Task PumpAsync(StreamReader reader, StringBuilder sink, CancellationToken ct)
     {
         var buffer = new char[4096];
@@ -289,7 +300,15 @@ public sealed class PollWorker : BackgroundService
         {
             int n;
             while ((n = await reader.ReadAsync(buffer.AsMemory(), ct)) > 0)
-                lock (sink) sink.Append(buffer, 0, n);
+            {
+                lock (sink)
+                {
+                    if (sink.Length >= MaxStreamChars) continue;
+                    var room = Math.Min(n, MaxStreamChars - sink.Length);
+                    sink.Append(buffer, 0, room);
+                    if (sink.Length >= MaxStreamChars) sink.Append(StreamCappedNote);
+                }
+            }
         }
         catch (OperationCanceledException) { }
         catch (Exception) { /* pipe closed / process disposed */ }

@@ -87,6 +87,7 @@ Crypto.Init(token);
 var startedUtc = DateTime.UtcNow;
 var clients = new ConcurrentDictionary<string, ClientSession>();
 var events = new EventLog();
+var commands = new CommandLog();
 var stats = new RelayStats();
 var authThrottle = new AuthThrottle();
 
@@ -160,13 +161,20 @@ if (dashboard)
 
 // Auth middleware. Any configured token is accepted; the one that matched is stashed on the
 // request so the client-facing handlers encrypt with that token's key.
+// Routing matches these routes without regard to case, so the gate in front of them must do the
+// same: a case-sensitive check let "/API/exec" miss the gate entirely and run commands untokened.
+var openPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+{
+    "/api/status", "/api/clients", "/api/events",
+};
+
 app.Use(async (context, next) =>
 {
     var path = context.Request.Path.Value ?? "";
     // /ui itself is a static shell with no data in it; it asks for the token in the browser and
     // sends it as a header on its own API calls, so it never has to travel in a URL.
-    var readOnly = path is "/api/status" or "/api/clients" or "/api/events";
-    if (path.StartsWith("/api/") && !(openStatus && readOnly))
+    var readOnly = openPaths.Contains(path.TrimEnd('/'));
+    if (context.Request.Path.StartsWithSegments("/api", StringComparison.OrdinalIgnoreCase))
     {
         var reqToken = context.Request.Query["token"].FirstOrDefault()
                        ?? context.Request.Headers["X-Token"].FirstOrDefault()
@@ -174,7 +182,16 @@ app.Use(async (context, next) =>
         // A valid token is always served — the throttle only slows down the guessing, so an
         // attacker sharing a NAT address with a real client can never lock that client out.
         var matched = tokens.FirstOrDefault(t => TokensEqual(reqToken, t));
-        if (matched is null)
+        if (matched is not null)
+        {
+            // Recorded even on the open endpoints, so a caller that did authenticate gets the full
+            // history rather than the redacted one an anonymous viewer sees.
+            context.Items[TokenItemKey] = matched;
+        }
+        // An open relay hands the overview to anyone who asks with no token at all. Offering a WRONG
+        // one is still a failed attempt anywhere, so guessing can never dodge the throttle by
+        // aiming at the open endpoints.
+        else if (!(openStatus && readOnly && string.IsNullOrEmpty(reqToken)))
         {
             var peer = context.Connection.RemoteIpAddress?.ToString() ?? "?";
             var now = DateTime.UtcNow;
@@ -188,7 +205,6 @@ app.Use(async (context, next) =>
             await context.Response.WriteAsync(throttled ? "Too many failed attempts" : "Invalid token");
             return;
         }
-        context.Items[TokenItemKey] = matched;
     }
     await next();
 });
@@ -202,7 +218,14 @@ app.MapGet("/api/poll", (HttpRequest req) =>
     while (session.CommandQueue.TryDequeue(out var pending))
     {
         if (pending.Cancelled) continue;
-        return Results.Ok(new { command = KeyFor(req).EncryptString(pending.Command), requestId = pending.RequestId });
+        // timeoutSeconds tells the client how long this command may run. Clients from before this
+        // field existed ignore it and fall back to their own built-in limit.
+        return Results.Ok(new
+        {
+            command = KeyFor(req).EncryptString(pending.Command),
+            requestId = pending.RequestId,
+            timeoutSeconds = pending.TimeoutSeconds,
+        });
     }
     return Results.Ok(new { command = (string?)null });
 });
@@ -308,17 +331,25 @@ app.MapPost("/api/exec", async (HttpRequest req) =>
 
     // Each exec gets its own correlated slot. Multiple execs (same or different sessions) run
     // concurrently — the client picks them up one per poll and returns each result by requestId.
-    var pending = new PendingCommand { Command = body.Command };
+    var timeout = ExecLimits.Clamp(body.TimeoutSeconds);
+    var pending = new PendingCommand { Command = body.Command, TimeoutSeconds = timeout };
     session.InFlight[pending.RequestId] = pending;
     session.CommandQueue.Enqueue(pending);
     Interlocked.Increment(ref stats.Execs);
-    events.Add("exec", session.Name, Excerpt(body.Command));
+    events.Add("exec", session.Name, Excerpt(body.Command), pending.RequestId);
 
-    var timeout = body.TimeoutSeconds > 0 ? Math.Min(body.TimeoutSeconds, 300) : 30;
-    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeout));
+    var execStartedUtc = DateTime.UtcNow;
+    // The name this command was dispatched to. A session can be renamed while the command is out
+    // (a client re-registering under a different --name), and the record should say where it went.
+    var targetName = session.Name;
+    // Outlast the client's own deadline by the grace window: a command killed exactly on time still
+    // has its output in flight, and reporting a relay timeout over it would throw that output away.
+    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeout + ExecLimits.RelayGraceSeconds));
     try
     {
         var result = await pending.Tcs.Task.WaitAsync(cts.Token);
+        commands.Add(pending.RequestId, execStartedUtc, targetName, body.Command,
+            result.Output, result.ExitCode, Elapsed(execStartedUtc));
         return Results.Ok(result);
     }
     catch (OperationCanceledException)
@@ -326,8 +357,11 @@ app.MapPost("/api/exec", async (HttpRequest req) =>
         pending.Cancelled = true;
         session.InFlight.TryRemove(pending.RequestId, out _);
         Interlocked.Increment(ref stats.Timeouts);
-        events.Add("timeout", session.Name, $"no result after {timeout}s");
-        return Results.Ok(new CommandResult { Output = $"[TIMEOUT] No response from '{session.Name}' after {timeout}s", ExitCode = -1 });
+        events.Add("timeout", targetName, $"no result after {timeout}s", pending.RequestId);
+        var timedOut = new CommandResult { Output = $"[TIMEOUT] No response from '{targetName}' after {timeout}s", ExitCode = -1 };
+        commands.Add(pending.RequestId, execStartedUtc, targetName, body.Command,
+            timedOut.Output, timedOut.ExitCode, Elapsed(execStartedUtc));
+        return Results.Ok(timedOut);
     }
 });
 
@@ -347,10 +381,10 @@ app.MapPost("/api/upload", async (HttpRequest req) =>
     await req.Body.CopyToAsync(ms);
     var data = ms.ToArray();
 
-    Console.WriteLine($"[UPLOAD] {session.Name}: {data.Length / 1024 / 1024}MB -> {remotePath}");
+    Console.WriteLine($"[UPLOAD] {session.Name}: {FormatBytes(data.Length)} -> {remotePath}");
     Interlocked.Increment(ref stats.Uploads);
     Interlocked.Add(ref stats.BytesUploaded, data.Length);
-    events.Add("upload", session.Name, $"{data.Length / 1024} kB -> {Excerpt(remotePath)}");
+    events.Add("upload", session.Name, $"{FormatBytes(data.Length)} -> {Excerpt(remotePath)}");
 
     session.PendingUpload = new FileTransfer { Path = remotePath, Data = data };
     session.UploadTcs = new TaskCompletionSource<bool>();
@@ -384,7 +418,6 @@ app.MapGet("/api/download", async (HttpRequest req) =>
 
     Console.WriteLine($"[DOWNLOAD] {session.Name}: <- {remotePath}");
     Interlocked.Increment(ref stats.Downloads);
-    events.Add("download", session.Name, Excerpt(remotePath));
 
     session.PendingDownload = new FileTransfer { Path = remotePath };
     session.DownloadTcs = new TaskCompletionSource<FileTransfer>();
@@ -392,16 +425,23 @@ app.MapGet("/api/download", async (HttpRequest req) =>
     using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
     try
     {
+        // Logged on completion rather than on request: the size is only known once the client has
+        // actually sent the bytes, and a history line reading "0 kB" would be a lie either way.
         var result = await session.DownloadTcs.Task.WaitAsync(cts.Token);
         if (result.Data == null)
+        {
+            events.Add("download", session.Name, $"failed <- {Excerpt(remotePath)}");
             return Results.NotFound(new { error = result.Error ?? "File not found" });
+        }
         Interlocked.Add(ref stats.BytesDownloaded, result.Data.Length);
+        events.Add("download", session.Name, $"{FormatBytes(result.Data.Length)} <- {Excerpt(remotePath)}");
         return Results.File(result.Data, "application/octet-stream", Path.GetFileName(remotePath));
     }
     catch (OperationCanceledException)
     {
         session.PendingDownload = null;
         session.DownloadTcs = null;
+        events.Add("download", session.Name, $"timeout <- {Excerpt(remotePath)}");
         return Results.StatusCode(504);
     }
 });
@@ -433,8 +473,19 @@ app.MapGet("/api/clients", () =>
 app.MapGet("/api/events", (HttpRequest req) =>
 {
     var limit = int.TryParse(req.Query["limit"].FirstOrDefault(), out var l) && l is > 0 and <= 500 ? l : 100;
+    // With --open-status this endpoint answers anonymous callers. A command line carries secrets
+    // just like its output does ("mysql -phunter2"), so the text is held back unless a token was
+    // presented; the timing, the kind and the client stay visible so the open view still shows life.
+    var authenticated = req.HttpContext.Items.ContainsKey(TokenItemKey);
     var recent = events.Snapshot().TakeLast(limit)
-        .Select(e => new { at = e.AtUtc, kind = e.Kind, client = e.Client, message = e.Message })
+        .Select(e => new
+        {
+            at = e.AtUtc,
+            kind = e.Kind,
+            client = e.Client,
+            message = authenticated || e.Kind != "exec" ? e.Message : "(command hidden — needs a token)",
+            id = e.Id,
+        })
         .ToList();
     return Results.Ok(new
     {
@@ -444,6 +495,18 @@ app.MapGet("/api/events", (HttpRequest req) =>
         stats = stats.Snapshot(),
         events = recent,
     });
+});
+
+// Output of one command, for the status page's detail view. Deliberately kept OUT of the
+// open-status allow-list in the auth middleware: stdout routinely carries passwords and keys, so it
+// stays behind the same token as /api/exec even when the rest of the dashboard is open.
+app.MapGet("/api/command", (HttpRequest req) =>
+{
+    var id = req.Query["id"].FirstOrDefault();
+    var record = string.IsNullOrEmpty(id) ? null : commands.Get(id);
+    return record is null
+        ? Results.NotFound(new { error = "No stored output for that command" })
+        : Results.Ok(record);
 });
 
 // Browser status page. Everything it needs comes from the two JSON endpoints above, and it reuses
@@ -489,6 +552,7 @@ app.MapGet("/", () => Results.Text(
     "GET  /api/status[?client=X]                - Check client(s)\n" +
     "GET  /api/clients                          - List all clients\n" +
     "GET  /api/events[?limit=N]                 - Recent relay events + counters\n" +
+    "GET  /api/command?id=X                     - Output of one command (never open)\n" +
     "POST /api/exec[?client=X]                  - Run command {\"command\":\"...\"}\n" +
     "POST /api/upload?path=...[&client=X]       - Upload file (binary body)\n" +
     "GET  /api/download?path=...[&client=X]     - Download file\n" +
@@ -506,6 +570,23 @@ static CryptoKey KeyFor(HttpRequest req)
 /// <summary>Short, non-secret label of a token for dashboards and logs.</summary>
 static string MaskToken(string t)
     => t.Length <= 4 ? new string('*', t.Length) : $"{t[..2]}…{t[^2..]}";
+
+/// <summary>
+/// Byte count in the largest unit that still reads honestly, so a 691-byte file shows as "691 B"
+/// instead of being rounded down to "0 kB". Invariant culture keeps the decimal point stable.
+/// </summary>
+static string FormatBytes(long bytes)
+{
+    const long kB = 1024, MB = kB * 1024, GB = MB * 1024;
+    return bytes < kB ? $"{bytes} B"
+        : bytes < MB ? FormattableString.Invariant($"{bytes / (double)kB:0.#} kB")
+        : bytes < GB ? FormattableString.Invariant($"{bytes / (double)MB:0.#} MB")
+        : FormattableString.Invariant($"{bytes / (double)GB:0.##} GB");
+}
+
+/// <summary>Milliseconds since a start stamp, floored at zero for a backwards clock.</summary>
+static int Elapsed(DateTime startedUtc)
+    => (int)Math.Max(0, (DateTime.UtcNow - startedUtc).TotalMilliseconds);
 
 /// <summary>One-line, length-capped form of user input for the event history.</summary>
 static string Excerpt(string s)
@@ -628,7 +709,8 @@ static TargetResolution ResolveTarget(HttpRequest req, ConcurrentDictionary<stri
 
 // === Models ===
 
-public record CommandRequest(string Command, int TimeoutSeconds = 30);
+/// <summary>Zero or less for <see cref="TimeoutSeconds"/> means the relay's default applies.</summary>
+public record CommandRequest(string Command, int TimeoutSeconds = 0);
 
 public record CommandResult
 {
@@ -677,6 +759,9 @@ public sealed class PendingCommand
 
     public string RequestId { get; } = Guid.NewGuid().ToString("N");
     public required string Command { get; init; }
+
+    /// <summary>How long the client may spend on this command, already clamped by the relay.</summary>
+    public int TimeoutSeconds { get; init; } = ExecLimits.DefaultSeconds;
     public TaskCompletionSource<CommandResult> Tcs { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     public long Seq { get; } = Interlocked.Increment(ref _seqCounter);
     public volatile bool Cancelled;

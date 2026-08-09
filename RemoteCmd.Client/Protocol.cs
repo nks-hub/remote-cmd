@@ -17,6 +17,11 @@ public sealed class PollResponse
 
     [JsonPropertyName("requestId")]
     public string? RequestId { get; set; }
+
+    /// <summary>How long this command may run. Absent from relays older than this field; zero then
+    /// falls back to the default.</summary>
+    [JsonPropertyName("timeoutSeconds")]
+    public int TimeoutSeconds { get; set; }
 }
 
 public sealed class EncryptedFilePoll
