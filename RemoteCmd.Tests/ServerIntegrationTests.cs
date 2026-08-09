@@ -46,6 +46,11 @@ public class ServerIntegrationTests : IClassFixture<RemoteCmdFactory>
         var fresh = _factory.WithWebHostBuilder(_ => { }).CreateClient();
         var res = await fresh.GetFromJsonAsync<ClientsResponse>(Url("/api/clients"));
         Assert.NotNull(res);
+        // The name promises emptiness; asserting only NotNull passed just as happily with a
+        // hundred sessions in the list.
+        Assert.Equal(0, res.Count);
+        Assert.Equal(0, res.Connected);
+        Assert.Empty(res.Clients);
     }
 
     [Fact]
@@ -264,6 +269,91 @@ public class ServerIntegrationTests : IClassFixture<RemoteCmdFactory>
         var bodyB = await (await execB).Content.ReadFromJsonAsync<ExecResponse>();
         Assert.Equal("out-A", bodyA!.Output);
         Assert.Equal("out-B", bodyB!.Output);
+    }
+
+    /// <summary>
+    /// A command that already timed out can still have its answer arrive. Routing that stale output
+    /// to whoever happens to be waiting hands one caller another command's stdout and exit code.
+    /// </summary>
+    [Fact]
+    public async Task LateResultOfATimedOutCommandDoesNotAnswerADifferentOne()
+    {
+        var id = Guid.NewGuid().ToString("N");
+        var name = "late-" + Guid.NewGuid().ToString("N")[..8];
+        await _http.GetAsync(Url("/api/poll", ("clientId", id), ("name", name)));
+
+        // First command: hand it out, then let it time out without ever answering.
+        var doomed = _http.PostAsJsonAsync(Url("/api/exec", ("client", name)),
+            new { command = "will-time-out", timeoutSeconds = 1 });
+        await Task.Delay(200);
+        var first = await _http.GetFromJsonAsync<PollWithId>(Url("/api/poll", ("clientId", id), ("name", name)));
+        Assert.NotNull(first?.RequestId);
+        await doomed;
+
+        // Second command, still waiting for its own answer.
+        var live = _http.PostAsJsonAsync(Url("/api/exec", ("client", name)),
+            new { command = "still-running", timeoutSeconds = 10 });
+        await Task.Delay(200);
+        var second = await _http.GetFromJsonAsync<PollWithId>(Url("/api/poll", ("clientId", id), ("name", name)));
+        Assert.NotNull(second?.RequestId);
+        Assert.NotEqual(first!.RequestId, second!.RequestId);
+
+        // The dead command finally answers. It must go nowhere.
+        await PostResult(id, first.RequestId!, "output-of-the-timed-out-command");
+        await PostResult(id, second.RequestId!, "output-of-the-live-command");
+
+        var body = await (await live).Content.ReadFromJsonAsync<ExecResponse>();
+        Assert.Equal("output-of-the-live-command", body!.Output);
+    }
+
+    /// <summary>
+    /// The client calls /api/file-done whether the write worked or not, so an upload that failed on
+    /// the far end must not be reported to the uploader as a completed transfer.
+    /// </summary>
+    [Fact]
+    public async Task UploadThatTheClientCouldNotWriteIsReportedAsAFailure()
+    {
+        var id = Guid.NewGuid().ToString("N");
+        var name = "badwrite-" + Guid.NewGuid().ToString("N")[..8];
+        await _http.GetAsync(Url("/api/poll", ("clientId", id), ("name", name)));
+
+        using var payload = new ByteArrayContent(Encoding.UTF8.GetBytes("some file bytes"));
+        var upload = _http.PostAsync(Url("/api/upload", ("path", "/read-only/nope.bin"), ("client", name)), payload);
+
+        await Task.Delay(200);
+        await _http.GetAsync(Url("/api/file-poll", ("clientId", id), ("name", name)));
+        await _http.PostAsync(Url("/api/file-done", ("clientId", id), ("name", name),
+            ("error", "Access to the path is denied.")), null);
+
+        var res = await upload;
+        Assert.NotEqual(HttpStatusCode.OK, res.StatusCode);
+        Assert.Contains("denied", await res.Content.ReadAsStringAsync());
+    }
+
+    /// <summary>
+    /// The throttle has unit tests, but nothing checked that the relay actually consults it — the
+    /// whole block could be deleted from the middleware and every test would stay green.
+    /// </summary>
+    [Fact]
+    public async Task GuessingTheTokenIsThrottledEndToEnd()
+    {
+        using var relay = new IsolatedFactory();
+        var http = relay.CreateClient();
+
+        var codes = new List<HttpStatusCode>();
+        for (var i = 0; i < AuthThrottle.MaxFailures + 3; i++)
+        {
+            var res = await http.GetAsync($"/api/clients?token=wrong-guess-{i}");
+            codes.Add(res.StatusCode);
+            if (res.StatusCode == HttpStatusCode.TooManyRequests)
+            {
+                Assert.NotNull(res.Headers.RetryAfter);
+                break;
+            }
+        }
+
+        Assert.Contains(HttpStatusCode.Unauthorized, codes);
+        Assert.Contains(HttpStatusCode.TooManyRequests, codes);
     }
 
     private async Task PostResult(string clientId, string requestId, string output)

@@ -82,7 +82,13 @@ public class MultiTokenTests : IClassFixture<MultiTokenFactory>
         var entry = list!.Clients.Single(c => c.Id == id);
 
         Assert.Equal($"{MultiTokenFactory.Second[..2]}…{MultiTokenFactory.Second[^2..]}", entry.Token);
-        Assert.NotNull(entry.Ip); // the address the client polled from, "" for the in-memory transport
+        // The masked label must never be the token itself — that is the whole point of masking.
+        Assert.DoesNotContain(MultiTokenFactory.Second, entry.Token);
+        // NotNull said nothing: the field is a non-nullable string and is never null even if the
+        // address were dropped entirely. The in-memory transport has no peer address, so the
+        // guarantee worth testing is that the field is present and carries no token.
+        Assert.NotNull(entry.Ip);
+        Assert.DoesNotContain(MultiTokenFactory.Second, entry.Ip);
     }
 
     [Fact]

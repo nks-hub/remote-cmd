@@ -46,7 +46,11 @@ public class ClientDashboardTests
         var text = ClientDashboard.Render(stats, log, width: 80, height: 12, nowUtc: DateTime.UtcNow);
 
         Assert.Contains("line-99", text);
-        Assert.DoesNotContain("line-0\n", text);
+        // "line-0\n" could never appear even in a broken render — the lines are padded and end with
+        // an escape sequence, so the assertion passed no matter what was drawn. Check the line that
+        // must have been dropped instead, with a word boundary so "line-0" does not match "line-90".
+        Assert.DoesNotMatch(@"line-0\b", text);
+        Assert.DoesNotMatch(@"line-50\b", text);
     }
 
     [Fact]

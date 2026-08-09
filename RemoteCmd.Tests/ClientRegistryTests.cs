@@ -57,7 +57,7 @@ public class ClientRegistryTests
             Id = "stuck",
             Name = "stuck",
             LastPoll = now.AddHours(-5),
-            UploadTcs = new TaskCompletionSource<bool>(),
+            UploadTcs = new TaskCompletionSource<string?>(),
             DownloadTcs = new TaskCompletionSource<FileTransfer>(),
         };
         session.InFlight[pending.RequestId] = pending;
@@ -68,7 +68,8 @@ public class ClientRegistryTests
         Assert.True(pending.Tcs.Task.IsCompleted);
         Assert.Equal(-1, (await pending.Tcs.Task).ExitCode);
         Assert.True(session.UploadTcs.Task.IsCompleted);
-        Assert.False(await session.UploadTcs.Task);
+        // A pruned session must unblock the uploader with a reason, not with a bare "not ok".
+        Assert.Equal("Session pruned", await session.UploadTcs.Task);
         Assert.True(session.DownloadTcs.Task.IsCompleted);
         Assert.Equal("Session pruned", (await session.DownloadTcs.Task).Error);
     }
