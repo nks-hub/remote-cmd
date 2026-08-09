@@ -27,6 +27,29 @@ public class StatusPageTests : IClassFixture<RemoteCmdFactory>
         Assert.DoesNotContain(RemoteCmdFactory.Token, html);
     }
 
+    /// <summary>
+    /// Every value the page shows comes from a machine someone else controls — a command line, a
+    /// file path, a client name. The page is only safe because it never assembles markup from that
+    /// data, so the absence of the assignment is the invariant worth guarding.
+    /// </summary>
+    [Fact]
+    public void ThePageNeverBuildsMarkupFromRelayData()
+    {
+        // The writes are what is banned, not the words: the page's own comments explain the rule
+        // and name the properties while doing so.
+        Assert.DoesNotMatch(@"(inner|outer)HTML\s*=", StatusPage.Html);
+        Assert.DoesNotMatch(@"insertAdjacentHTML\s*\(", StatusPage.Html);
+        Assert.DoesNotMatch(@"document\.write\s*\(", StatusPage.Html);
+    }
+
+    /// <summary>Self-contained: a relay on a closed network still has to render.</summary>
+    [Fact]
+    public void ThePageLoadsNothingFromTheInternet()
+    {
+        Assert.DoesNotContain("http://", StatusPage.Html.Replace("http://www.w3.org/2000/svg", ""));
+        Assert.DoesNotContain("https://", StatusPage.Html);
+    }
+
     [Fact]
     public async Task ApiAcceptsTheTokenAsAHeader()
     {
