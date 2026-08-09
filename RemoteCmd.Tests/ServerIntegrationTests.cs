@@ -331,6 +331,52 @@ public class ServerIntegrationTests : IClassFixture<RemoteCmdFactory>
     }
 
     /// <summary>
+    /// Two callers uploading to the same machine at once used to overwrite each other: the relay
+    /// kept a single slot, so the client was handed one transfer's path and the other's bytes and
+    /// wrote the wrong file. Each transfer now queues with its own id.
+    /// </summary>
+    [Fact]
+    public async Task ConcurrentUploadsToOneClientDoNotSwapTheirContents()
+    {
+        var id = Guid.NewGuid().ToString("N");
+        var name = "twofiles-" + Guid.NewGuid().ToString("N")[..8];
+        await _http.GetAsync(Url("/api/poll", ("clientId", id), ("name", name)));
+
+        using var firstBody = new ByteArrayContent(Encoding.UTF8.GetBytes("AAAA-first-file"));
+        using var secondBody = new ByteArrayContent(Encoding.UTF8.GetBytes("BBBB-second-file"));
+        var first = _http.PostAsync(Url("/api/upload", ("path", "/tmp/first.bin"), ("client", name)), firstBody);
+        var second = _http.PostAsync(Url("/api/upload", ("path", "/tmp/second.bin"), ("client", name)), secondBody);
+        await Task.Delay(300);
+
+        // Act as the client: take one transfer at a time and check its bytes match its path.
+        var seen = new Dictionary<string, string>();
+        for (var i = 0; i < 2; i++)
+        {
+            var poll = await _http.GetFromJsonAsync<EncryptedPoll>(Url("/api/file-poll", ("clientId", id), ("name", name)));
+            Assert.NotNull(poll?.E);
+            var meta = System.Text.Json.JsonSerializer.Deserialize<FileMeta>(
+                Crypto.DecryptString(poll!.E!),
+                new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            Assert.NotNull(meta?.TransferId);
+
+            var data = await _http.GetByteArrayAsync(Url("/api/file-data",
+                ("clientId", id), ("name", name), ("transferId", meta!.TransferId!)));
+            seen[meta.Path!] = Encoding.UTF8.GetString(Crypto.Decrypt(data));
+
+            await _http.PostAsync(Url("/api/file-done",
+                ("clientId", id), ("name", name), ("transferId", meta.TransferId!)), null);
+        }
+
+        Assert.Equal(HttpStatusCode.OK, (await first).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await second).StatusCode);
+        Assert.Equal("AAAA-first-file", seen["/tmp/first.bin"]);
+        Assert.Equal("BBBB-second-file", seen["/tmp/second.bin"]);
+    }
+
+    private record EncryptedPoll(string? E);
+    private record FileMeta(string? Action, string? Path, long Size, string? TransferId);
+
+    /// <summary>
     /// The throttle has unit tests, but nothing checked that the relay actually consults it — the
     /// whole block could be deleted from the middleware and every test would stay green.
     /// </summary>

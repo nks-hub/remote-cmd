@@ -168,6 +168,11 @@ public sealed class PollWorker : BackgroundService
     private async Task ReceiveFile(HttpClient http, FilePollMeta meta, string fileDataUrl, string fileDoneUrl, CancellationToken ct)
     {
         _log.LogInformation("[FILE] Receiving {Mb}MB -> {Path}", meta.Size / 1024 / 1024, meta.Path);
+        // Naming the transfer keeps the bytes and the path together: without it a second transfer
+        // starting on the relay could answer this request with the wrong file's contents.
+        var tag = meta.TransferId is null ? "" : $"&transferId={Uri.EscapeDataString(meta.TransferId)}";
+        fileDataUrl += tag;
+        fileDoneUrl += tag;
         try
         {
             var fileData = Crypto.Decrypt(await http.GetByteArrayAsync(fileDataUrl, ct));
@@ -189,6 +194,7 @@ public sealed class PollWorker : BackgroundService
     private async Task SendFile(HttpClient http, FilePollMeta meta, string fileUploadUrl, CancellationToken ct)
     {
         _log.LogInformation("[FILE] Uploading <- {Path}", meta.Path);
+        if (meta.TransferId is not null) fileUploadUrl += $"&transferId={Uri.EscapeDataString(meta.TransferId)}";
         try
         {
             if (!File.Exists(meta.Path))

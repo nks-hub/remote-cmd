@@ -39,8 +39,8 @@ public static class Dashboard
         {
             var age = c.LastPoll == DateTime.MinValue ? "-" : (int)(nowUtc - c.LastPoll).TotalSeconds + "s";
             var poll = c.IsConnected() ? age : age + "!"; // '!' = past the 10s connected window
-            var state = c.PendingUpload != null ? "UPLOAD"
-                      : c.PendingDownload != null ? "DOWNLOAD"
+            var state = !c.Uploads.Idle ? "UPLOAD"
+                      : !c.Downloads.Idle ? "DOWNLOAD"
                       : c.IsConnected() ? "idle" : "STALE";
             rows.Add(Row(
                 Trunc(c.Name, 17),

@@ -27,8 +27,10 @@ public static class ClientRegistry
                 // Fault any pending tasks so callers unblock promptly.
                 foreach (var pending in removed.InFlight.Values)
                     pending.Tcs.TrySetResult(new CommandResult { Output = "[ERROR] Session pruned", ExitCode = -1 });
-                removed.UploadTcs?.TrySetResult("Session pruned");
-                removed.DownloadTcs?.TrySetResult(new FileTransfer { Error = "Session pruned" });
+                // Everything queued, not just whatever happened to be in flight — a caller waiting
+                // behind two other transfers would otherwise sit out the full five minute timeout.
+                removed.Uploads.FailAll("Session pruned");
+                removed.Downloads.FailAll("Session pruned");
                 count++;
             }
         }

@@ -40,6 +40,13 @@ public sealed class FilePollMeta
 
     [JsonPropertyName("size")]
     public long Size { get; set; }
+
+    /// <summary>
+    /// Identifies this transfer. Echoed back on file-data, file-done and file-upload so the relay
+    /// can tell which one is being answered; relays from before this field simply omit it.
+    /// </summary>
+    [JsonPropertyName("transferId")]
+    public string? TransferId { get; set; }
 }
 
 public sealed class CommandResult
