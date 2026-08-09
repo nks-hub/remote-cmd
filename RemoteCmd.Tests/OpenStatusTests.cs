@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Net.Http.Json;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -114,7 +114,9 @@ public class OpenStatusFactory : WebApplicationFactory<Program>
         Environment.SetEnvironmentVariable("REMOTECMD_OPEN_STATUS", "1");
     }
 
-    protected override void ConfigureWebHost(IWebHostBuilder builder) => builder.UseEnvironment("Testing");
+    // The open dashboard is only open to this machine, so the test peer has to be one.
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+        => TestPeer.At(builder.UseEnvironment("Testing"), System.Net.IPAddress.Loopback);
 
     protected override void Dispose(bool disposing)
     {

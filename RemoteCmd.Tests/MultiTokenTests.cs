@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
@@ -123,7 +123,8 @@ public class MultiTokenFactory : WebApplicationFactory<Program>
         Environment.SetEnvironmentVariable("REMOTECMD_NO_TLS", "1");
     }
 
-    protected override void ConfigureWebHost(IWebHostBuilder builder) => builder.UseEnvironment("Testing");
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+        => TestPeer.At(builder.UseEnvironment("Testing"), System.Net.IPAddress.Loopback);
 
     protected override void Dispose(bool disposing)
     {

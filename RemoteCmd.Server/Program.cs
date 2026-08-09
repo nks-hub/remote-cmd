@@ -59,16 +59,19 @@ var port = int.TryParse(Environment.GetEnvironmentVariable("REMOTECMD_PORT"), ou
     ? p
     : 7890;
 
+// Always every interface: clients poll the relay from other machines. The open, tokenless view is
+// narrowed in the auth middleware instead — restricting the listener would take the clients down
+// with it, because the bind covers the whole server and not just /ui.
 if (noTls)
 {
-    builder.WebHost.UseUrls(RelayBinding.UrlFor(openStatus, noTls, port));
+    builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 }
 else
 {
     var certificate = RelayCertificate.LoadOrCreate(
         Path.Combine(AppContext.BaseDirectory, "remotecmd.pfx"), Console.Out);
 
-    builder.WebHost.UseUrls(RelayBinding.UrlFor(openStatus, noTls, port));
+    builder.WebHost.UseUrls($"https://0.0.0.0:{port}");
     builder.WebHost.ConfigureKestrel(o =>
     {
         o.Limits.MaxRequestBodySize = 200_000_000;
@@ -96,8 +99,7 @@ var authThrottle = new AuthThrottle();
 
 var protocol = noTls ? "http" : "https";
 Console.WriteLine($"=== Remote CMD Relay Server {RemoteCmd.Shared.VersionInfo.Version} ===");
-Console.WriteLine($"Listening on: {protocol}://{RelayBinding.HostFor(openStatus)}:{port}"
-                  + (openStatus ? "  (loopback only — --open-status serves the dashboard without a token)" : ""));
+Console.WriteLine($"Listening on: {protocol}://0.0.0.0:{port}");
 Console.WriteLine($"Tokens ({tokens.Count}): {string.Join(", ", tokens)}");
 Console.WriteLine($"TLS: {(noTls ? "disabled" : "enabled (self-signed)")}");
 Console.WriteLine($"Encryption: AES-256-GCM (always on)");
@@ -105,7 +107,7 @@ Console.WriteLine($"Multi-client: enabled");
 Console.WriteLine($"Session GC threshold: {staleAfter.TotalMinutes:N0} minutes");
 Console.WriteLine($"Live dashboard: {(dashboard ? "on (--dashboard)" : "off (add --dashboard)")}");
 Console.WriteLine(openStatus
-    ? $"Status page: {protocol}://127.0.0.1:{port}/ui  (open, no token, loopback only)"
+    ? $"Status page: {protocol}://<this-host>:{port}/ui  (no token needed from this machine; a token from anywhere else)"
     : $"Status page: {protocol}://<this-host>:{port}/ui");
 Console.WriteLine();
 Console.WriteLine("Client setup (run on target machine):");
@@ -194,10 +196,12 @@ app.Use(async (context, next) =>
             // history rather than the redacted one an anonymous viewer sees.
             context.Items[TokenItemKey] = matched;
         }
-        // An open relay hands the overview to anyone who asks with no token at all. Offering a WRONG
-        // one is still a failed attempt anywhere, so guessing can never dodge the throttle by
-        // aiming at the open endpoints.
-        else if (!(openStatus && readOnly && string.IsNullOrEmpty(reqToken)))
+        // An open relay hands the overview to whoever asks from this machine with no token at all —
+        // the point of the switch is that the dashboard just opens locally. From anywhere else a
+        // token is still required, because the history carries command lines and the stored output
+        // carries whatever those commands printed. Offering a WRONG token is a failed attempt
+        // everywhere, so guessing can never dodge the throttle by aiming at the open endpoints.
+        else if (!OpenStatus.AllowsAnonymous(openStatus, readOnly, reqToken, context.Connection.RemoteIpAddress))
         {
             var peer = context.Connection.RemoteIpAddress?.ToString() ?? "?";
             var now = DateTime.UtcNow;

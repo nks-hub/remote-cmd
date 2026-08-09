@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Net.Http.Json;
 using System.Text;
 using Microsoft.AspNetCore.Hosting;
@@ -550,7 +550,7 @@ public class RemoteCmdFactory : WebApplicationFactory<Program>
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
-        builder.UseEnvironment("Testing");
+        TestPeer.At(builder.UseEnvironment("Testing"), System.Net.IPAddress.Loopback);
     }
 }
 
@@ -558,6 +558,6 @@ public class IsolatedFactory : WebApplicationFactory<Program>
 {
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
-        builder.UseEnvironment("Testing");
+        TestPeer.At(builder.UseEnvironment("Testing"), System.Net.IPAddress.Loopback);
     }
 }
