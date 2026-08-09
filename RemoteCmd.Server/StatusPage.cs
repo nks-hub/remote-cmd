@@ -224,9 +224,9 @@ public static class StatusPage
     </svg>
     <span id="beatText"></span>
   </div>
-  <input id="q" type="search" placeholder="search command, client, message…" autocomplete="off" spellcheck="false">
-  <select id="fClient"><option value="">all clients</option></select>
-  <select id="fKind"><option value="">all events</option></select>
+  <input id="q" type="search" aria-label="search history" placeholder="search command, client, message…" autocomplete="off" spellcheck="false">
+  <select id="fClient" aria-label="filter by client"><option value="">all clients</option></select>
+  <select id="fKind" aria-label="filter by event kind"><option value="">all events</option></select>
   <label><input type="checkbox" id="live" checked> live</label>
 </header>
 
@@ -264,9 +264,9 @@ public static class StatusPage
     <div class="empty" id="noclients" hidden>no clients registered</div>
   </aside>
 
-  <aside id="detail" hidden>
+  <aside id="detail" role="dialog" aria-modal="true" aria-labelledby="dtitle" tabindex="-1" hidden>
     <div class="dhead"><b id="dtitle">command</b><button id="dclose" type="button">close</button></div>
-    <div id="detailBody"></div>
+    <div id="detailBody" aria-live="polite"></div>
   </aside>
 </div>
 
@@ -306,16 +306,20 @@ if (fromUrl) {
 }
 
 function showGate(message, hideBody) {
+  // Only steal the caret the first time the prompt appears: stealing it on every repeat would pull
+  // the operator out of the search box a few seconds after they clicked into it.
+  const opening = gate.hidden;
   gateWanted = true;
-  gateErr.textContent = message || '';
+  if (message !== null) gateErr.textContent = message || '';
   gate.hidden = false;
   if (hideBody) {
     token = null;
     sessionStorage.removeItem('rcmd-token');
     sections.forEach((el) => { el.hidden = true; });
+    closeDetail();
     setBeat('dead', 'needs a token');
   }
-  $('token').focus();
+  if (opening) $('token').focus();
 }
 
 gate.addEventListener('submit', (e) => {
@@ -334,10 +338,22 @@ gate.addEventListener('submit', (e) => {
 });
 
 async function api(path) {
-  const res = await fetch(path, { headers: token ? { 'X-Token': token } : {} });
+  // A relay behind a dropped VPN accepts the connection and then says nothing, so without a deadline
+  // the request never settles, the page never notices, and the pending fetches pile up.
+  const res = await fetch(path, {
+    headers: token ? { 'X-Token': token } : {},
+    signal: AbortSignal.timeout(8000),
+  });
   if (res.status === 401 || res.status === 429) {
     const err = new Error('auth');
     err.auth = res.status;
+    throw err;
+  }
+  // A 500 or a proxy's HTML error page would otherwise die inside res.json() and be reported as
+  // "no reply", sending whoever reads it off to check a network that is working fine.
+  if (!res.ok) {
+    const err = new Error('http');
+    err.status = res.status;
     throw err;
   }
   return res.json();
@@ -420,6 +436,9 @@ function setBeat(mode, text) {
   beatCountdown = null;
   if (mode !== 'live') { if (beat) { beat.cancel(); beat = null; } return; }
   if (REDUCE) {
+    // Dropping the handle without cancelling would leave visibilitychange replaying a three second
+    // sweep on a tab whose owner just asked for no motion at all.
+    if (beat) { beat.cancel(); beat = null; }
     // No sweep to watch, so the same information arrives as a plain countdown.
     let left = 3;
     $('beatText').textContent = left + 's';
@@ -442,7 +461,10 @@ document.addEventListener('visibilitychange', () => {
 // The relay's history is a ring, so old entries fall out of it. Binning the current snapshot would
 // therefore *shrink* the bars in the past — a chart that rewrites history is worse than no chart.
 // Events are accumulated client-side into per-minute buckets instead, deduped by their content.
-const seen = new Set();
+// The dedup keys are kept per minute alongside the counts, so pruning an old minute drops its keys
+// with it. A flat Set that got cleared wholesale would let the next snapshot's overlap be counted a
+// second time and visibly inflate the bars that are still on screen.
+const seenByMinute = new Map();
 const buckets = new Map();
 const CH = { exec: 'exec', upload: 'xfer', download: 'xfer', connect: 'conn', timeout: 'fault', auth: 'fault', gc: 'gc' };
 const CHANNELS = ['fault', 'exec', 'xfer', 'conn', 'gc'];
@@ -451,22 +473,45 @@ const KEEP_MINUTES = 240;
 let ringSaturated = false;
 
 function absorb(events) {
+  const nowMin = Math.floor(Date.now() / 60000);
   for (const e of events) {
-    const key = `${e.at}|${e.kind}|${e.client}|${e.message}|${e.id || ''}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
     const t = Date.parse(e.at);
     if (!t) continue;
-    const idx = Math.floor(t / 60000);
+    // A client clock running ahead of the relay would park events in bins that never scroll into
+    // view and never get pruned, so anything from the future is treated as "now".
+    const idx = Math.min(Math.floor(t / 60000), nowMin);
+    const key = `${e.at}|${e.kind}|${e.client}|${e.message}|${e.id || ''}`;
+    let keys = seenByMinute.get(idx);
+    if (!keys) { keys = new Set(); seenByMinute.set(idx, keys); }
+    if (keys.has(key)) continue;
+    keys.add(key);
     const b = buckets.get(idx) || { fault: 0, exec: 0, xfer: 0, conn: 0, gc: 0, n: 0 };
     b[CH[e.kind] || 'gc']++;
     b.n++;
     buckets.set(idx, b);
   }
-  const floor = Math.floor(Date.now() / 60000) - KEEP_MINUTES;
+  const floor = nowMin - KEEP_MINUTES;
   for (const k of [...buckets.keys()]) if (k < floor) buckets.delete(k);
-  // ponytail: blunt ceiling on the dedup set; it refills within one tick if it ever trips.
-  if (seen.size > 6000) seen.clear();
+  for (const k of [...seenByMinute.keys()]) if (k < floor) seenByMinute.delete(k);
+}
+
+// A relay that restarted is a different relay: its counters are back at zero, its history is gone
+// and its saturation no longer says anything. Carrying any of that across would show a silenced
+// auth alarm, a hatched blind spot for events that never existed, and a nonsense throughput delta.
+function resetForNewRelay() {
+  prev = null;
+  seenByMinute.clear();
+  buckets.clear();
+  ringSaturated = false;
+  nowHistory = [];
+  lastDrawn = null;
+  lastClients = null;
+  drawnKeys = new Set();
+  clientAges = [];
+  authBase = 0;
+  authBaseAt = '';
+  sessionStorage.removeItem('rcmd-auth-base');
+  sessionStorage.removeItem('rcmd-auth-at');
 }
 
 const histSvg = $('histo');
@@ -621,7 +666,8 @@ function setTile(k, value, sub, opts) {
   const o = opts || {};
   const changed = t.val.textContent !== String(value);
   t.val.textContent = value;
-  t.sub.replaceChildren(txt(sub));
+  // null means "this tile owns its own sub-line" — the auth tile keeps a live button down there.
+  if (sub !== null) t.sub.replaceChildren(txt(sub));
   t.box.classList.toggle('alarm', !!o.alarm);
   t.box.classList.toggle('quiet', !!o.quiet);
   // Flashing four numbers every three seconds is exactly what people stop looking at, so only the
@@ -693,7 +739,7 @@ function renderDeck(clients, info) {
     { quiet: vol === 0 });
 
   const sinceBase = Math.max(0, s.authFailures - authBase);
-  setTile('auth', s.authFailures, '', { alarm: sinceBase > 0, quiet: s.authFailures === 0, flash: true });
+  setTile('auth', s.authFailures, null, { alarm: sinceBase > 0, quiet: s.authFailures === 0, flash: true });
   renderAuthSub(sinceBase);
   if (fresh && s.authFailures > prev.authFailures) setChip('auth', `+${s.authFailures - prev.authFailures}`);
 
@@ -712,14 +758,15 @@ function renderDeck(clients, info) {
 
 // authFailures only ever climbs, so a delta-based alarm misses a brute force that started before
 // the page was opened. The tile latches until it is explicitly dismissed.
-function renderAuthSub(sinceBase) {
+// The label and the button are built once and only their text changes: rebuilding them every three
+// seconds destroyed the node mid-click, so the button could not reliably be pressed at all.
+function buildAuthSub() {
   const sub = tiles.auth.sub;
-  sub.replaceChildren();
-  if (sinceBase <= 0) { sub.append(txt('none')); return; }
-  sub.append(txt(`${sinceBase}× rejected${authBaseAt ? ' since ' + authBaseAt : ''} `));
+  const label = document.createElement('span');
   const b = document.createElement('button');
   b.id = 'dismiss';
   b.type = 'button';
+  b.hidden = true;
   b.append(txt('clear'));
   b.addEventListener('click', () => {
     authBase = latest ? latest.stats.authFailures : authBase;
@@ -729,7 +776,20 @@ function renderAuthSub(sinceBase) {
     renderAuthSub(0);
     tiles.auth.box.classList.remove('alarm');
   });
-  sub.append(b);
+  sub.replaceChildren(label, b);
+  tiles.auth.label = label;
+  tiles.auth.button = b;
+}
+
+function renderAuthSub(sinceBase) {
+  const { label, button } = tiles.auth;
+  if (sinceBase <= 0) {
+    label.textContent = 'none';
+    button.hidden = true;
+    return;
+  }
+  label.textContent = `${sinceBase}× rejected${authBaseAt ? ' since ' + authBaseAt : ''} `;
+  button.hidden = false;
 }
 
 function recentLabel() {
@@ -752,20 +812,22 @@ let clientAges = [];
 
 function renderSessions(clients) {
   const tbody = document.querySelector('#tbl tbody');
+  // secondsAgo is deliberately NOT in the signature: it changes every second and would rebuild the
+  // rows out from under a click. The baseline it feeds is refreshed separately, below.
   const signature = JSON.stringify(clients.clients.map((c) => [c.id, c.name, c.state, c.running, c.queued, c.served, c.token, c.ip]));
   $('ccount').textContent = clients.count ? `${clients.connected} online` : '';
   $('noclients').hidden = clients.count > 0;
   $('clientBox').hidden = clients.count === 0;
 
-  const prevStates = lastClients || {};
-  if (signature === lastClients?.sig) { stampAges(); return; }
+  const prevStates = lastClients ? lastClients.states : null;
+  if (signature === (lastClients && lastClients.sig)) { refreshAges(clients); stampAges(); return; }
 
   tbody.replaceChildren();
   clientAges = [];
   for (const c of clients.clients) {
     const tr = document.createElement('tr');
     tr.className = c.state === 'stale' ? 'stale' : c.state === 'idle' ? 'idle' : 'busy';
-    if (prevStates.states && prevStates.states[c.id] && prevStates.states[c.id] !== c.state) tr.classList.add('changed');
+    if (prevStates && prevStates.get(c.id) && prevStates.get(c.id) !== c.state) tr.classList.add('changed');
     const arrow = c.state === 'upload' ? '↑ upload' : c.state === 'download' ? '↓ download' : c.state;
     const last = cell('—', 'lp');
     tr.append(
@@ -773,14 +835,35 @@ function renderSessions(clients) {
       cell(`${c.running}/${c.queued}`), cell(c.served),
     );
     // The rail is narrow; the fields that are read once a day rather than once a minute live here.
-    tr.title = `${c.name}\nid ${c.id}\naddress ${c.ip || 'unknown'}\ntoken ${c.token}\nconnected ${dur(c.connectedForSeconds)}`;
+    // The name is chosen on the client machine, so its newlines are flattened rather than allowed to
+    // forge extra lines in the tooltip.
+    tr.title = `${flat(c.name)}\nid ${c.id}\naddress ${c.ip || 'unknown'}\ntoken ${c.token}\nconnected ${dur(c.connectedForSeconds)}`;
     tbody.append(tr);
-    clientAges.push({ td: last, base: c.secondsAgo, at: Date.now() });
+    clientAges.push({ id: c.id, td: last, base: c.secondsAgo, at: Date.now() });
   }
-  const states = {};
-  for (const c of clients.clients) states[c.id] = c.state;
+  // A plain object would let a client calling itself "__proto__" or "constructor" collide with
+  // Object.prototype and mis-report every state change.
+  const states = new Map(clients.clients.map((c) => [c.id, c.state]));
   lastClients = { sig: signature, states };
+  refreshAges(clients);
   stampAges();
+}
+
+const flat = (s) => String(s).replace(/\s+/g, ' ').trim();
+
+// The rows survive a tick untouched when nothing structural changed, so their poll baseline has to
+// be re-stamped here. Without it a perfectly healthy client that simply sits idle drifts past the
+// "late" and "dead" thresholds on screen while the relay keeps reporting secondsAgo: 0 — and the
+// LINK tile, built from the same payload, cheerfully says everything is online.
+function refreshAges(clients) {
+  const byId = new Map(clients.clients.map((c) => [c.id, c]));
+  const now = Date.now();
+  for (const a of clientAges) {
+    const c = byId.get(a.id);
+    if (!c) continue;
+    a.base = c.secondsAgo;
+    a.at = now;
+  }
 }
 
 // The relay's secondsAgo is a snapshot; without this the page would show a frozen client as "3s"
@@ -855,6 +938,10 @@ function renderStream(info) {
   filterChanged = false;
 
   const tbody = document.querySelector('#hist tbody');
+  // Rebuilding throws away the focused row, so j/k navigation would snap back to the top every time
+  // a row aged into the next bucket. Remember where the caret was and put it back.
+  const focused = document.activeElement;
+  const focusedId = focused && tbody.contains(focused) ? focused.dataset.id : null;
   tbody.replaceChildren();
   let staggered = 0;
   for (const r of shaped) {
@@ -866,6 +953,10 @@ function renderStream(info) {
       tr.dataset.id = e.id;
       tr.tabIndex = 0;
       tr.title = 'show output';
+      // A screen reader would otherwise announce "table row" and give no hint that Enter does
+      // anything at all.
+      tr.setAttribute('role', 'button');
+      tr.setAttribute('aria-label', `show output of ${e.kind} on ${flat(e.client)} at ${localTime(e.when)}`);
       if (e.id === state.selected) tr.className = 'sel';
     }
     if (animate && !drawnKeys.has(r.key) && staggered < 6) {
@@ -884,6 +975,10 @@ function renderStream(info) {
     tbody.append(tr);
   }
   drawnKeys = new Set(shaped.map((r) => r.key));
+  if (focusedId) {
+    const back = tbody.querySelector(`tr[data-id="${CSS.escape(focusedId)}"]`);
+    if (back) back.focus({ preventScroll: true });
+  }
 }
 
 function msgCell(message) {
@@ -908,18 +1003,31 @@ function select(id) {
   loadDetail(id);
 }
 
+// Where the caret was before the panel took over, so closing it can hand the caret back instead of
+// dropping it on <body> with no way to return to the row by keyboard.
+let returnFocusTo = null;
+
 function openDetail() {
+  if ($('detail').hidden) returnFocusTo = state.selected;
   $('main').classList.add('detail-open');
   $('backdrop').hidden = false;
   $('detail').hidden = false;
+  $('dclose').focus({ preventScroll: true });
 }
 
 function closeDetail() {
+  if ($('detail').hidden) return;
+  const back = returnFocusTo;
   $('main').classList.remove('detail-open');
   $('backdrop').hidden = true;
   $('detail').hidden = true;
   state.selected = null;
+  returnFocusTo = null;
   if (latest) renderStream(latest);
+  if (back) {
+    const row = document.querySelector(`#hist tbody tr[data-id="${CSS.escape(back)}"]`);
+    if (row) row.focus({ preventScroll: true });
+  }
 }
 
 $('dclose').addEventListener('click', closeDetail);
@@ -950,12 +1058,16 @@ async function loadDetail(id) {
   try {
     d = await api('/api/command?id=' + encodeURIComponent(id));
   } catch (err) {
+    // Two quick clicks race, and the slower answer must not repaint a panel that has moved on.
+    if (state.selected !== id) return;
     // Without --open-status the whole API needs a token; ask for one without hiding the page.
     if (err.auth === 401) { detailNote('this relay needs a token'); showGate('', false); }
     else if (err.auth === 429) detailNote('too many attempts — wait a few minutes');
+    else if (err.status) detailNote(`relay answered ${err.status}`);
     else detailNote('relay unreachable');
     return;
   }
+  if (state.selected !== id) return;
   if (!d || d.error) {
     detailNote(d && d.error ? d.error : 'no stored output — the command may still be running');
     return;
@@ -994,8 +1106,15 @@ $('live').addEventListener('change', () => {
 // Terminal muscle memory: the page sits next to one all day.
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !$('detail').hidden) { closeDetail(); return; }
-  const typing = /^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName);
+  // Ctrl+L, Cmd+L, Ctrl+J and friends belong to the browser. Without this the address-bar shortcut
+  // also switched off polling, and the operator came back to a frozen dashboard with no clue why.
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const typing = /^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName)
+    || document.activeElement.isContentEditable;
   if (typing) return;
+  // While the output panel is up it owns the keyboard; otherwise j/k would scroll a table the
+  // operator cannot even see behind the backdrop.
+  if (!$('detail').hidden) return;
   const rows = [...document.querySelectorAll('#hist tbody tr[data-id]')];
   if (e.key === '/') { e.preventDefault(); $('q').focus(); }
   else if (e.key === 'l') { $('live').checked = !$('live').checked; $('live').dispatchEvent(new Event('change')); }
@@ -1022,39 +1141,66 @@ function renderChips(info) {
   );
 }
 
+let inFlight = false;
+
 async function tick() {
+  // With the prompt up and no token in hand, every refresh is two more failed attempts. The relay's
+  // own brute-force throttle then locks the operator's address out within fifteen seconds, and the
+  // 401s flood the 500-entry history until nothing else is left in it. Wait for the submit instead.
+  if (gateWanted && !token) return;
+  // A stalled relay must not let requests pile up behind each other; the pile also makes the byte
+  // rate nonsense, because dt collapses when they all resolve at once.
+  if (inFlight) return;
+  inFlight = true;
   let clients, info;
   try {
     [clients, info] = await Promise.all([api('/api/clients'), api('/api/events?limit=500')]);
   } catch (e) {
     // A relay started with --open-status serves these without a token, so the form only appears
     // when the relay actually demands one. The heartbeat is deliberately not restarted here.
-    if (e.auth === 401) showGate(token ? 'wrong token' : '', true);
+    if (e.auth === 401) showGate(token ? 'wrong token' : null, true);
     else if (e.auth === 429) showGate('too many attempts — wait a few minutes', true);
+    else if (e.status) setBeat('dead', `relay error ${e.status}`);
     else setBeat('dead', 'no reply');
+    return;
+  } finally {
+    inFlight = false;
+  }
+
+  try {
+    // Counters that went backwards mean a different process is answering now.
+    if (prev && info.uptimeSeconds < prev.uptime) resetForNewRelay();
+
+    if (!gateWanted) gate.hidden = true;
+    sections.forEach((el2) => { el2.hidden = false; });
+    latest = info;
+    if (info.events.length >= 500) ringSaturated = true;
+
+    renderChips(info);
+    absorb(info.events);
+    renderDeck(clients, info);
+    renderHistogram(info.events.length);
+    renderSessions(clients);
+    renderStream(info);
+
+    // The tab is 100px wide and hidden behind a terminal most of the day; make it say something.
+    const running = clients.clients.reduce((a, c) => a + c.running, 0);
+    const stale = clients.count > clients.connected;
+    document.title = running ? `(${running} run) RemoteCmd` : stale ? '[!] RemoteCmd' : 'RemoteCmd relay';
+  } catch (e) {
+    // A payload that parsed but did not have the shape the page expects would otherwise leave the
+    // last good numbers frozen on screen under a heartbeat still claiming to be live — for a
+    // monitoring page that is a worse failure than saying nothing at all.
+    setBeat('dead', 'bad reply');
     return;
   }
 
-  if (!gateWanted) gate.hidden = true;
-  sections.forEach((el2) => { el2.hidden = false; });
-  latest = info;
-  if (info.events.length >= 500) ringSaturated = true;
-
+  // Restarted only once everything actually repainted, so the sweep means what it looks like.
   setBeat('live', '');
-  renderChips(info);
-  absorb(info.events);
-  renderDeck(clients, info);
-  renderHistogram(info.events.length);
-  renderSessions(clients);
-  renderStream(info);
-
-  // The tab is 100px wide and hidden behind a terminal most of the day; make it say something.
-  const running = clients.clients.reduce((a, c) => a + c.running, 0);
-  const stale = clients.count > clients.connected;
-  document.title = running ? `(${running} run) RemoteCmd` : stale ? '[!] RemoteCmd' : 'RemoteCmd relay';
 }
 
 buildDeck();
+buildAuthSub();
 buildHistogram();
 setBeat('paused', '');
 tick();
