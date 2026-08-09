@@ -61,14 +61,14 @@ var port = int.TryParse(Environment.GetEnvironmentVariable("REMOTECMD_PORT"), ou
 
 if (noTls)
 {
-    builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
+    builder.WebHost.UseUrls(RelayBinding.UrlFor(openStatus, noTls, port));
 }
 else
 {
     var certificate = RelayCertificate.LoadOrCreate(
         Path.Combine(AppContext.BaseDirectory, "remotecmd.pfx"), Console.Out);
 
-    builder.WebHost.UseUrls($"https://0.0.0.0:{port}");
+    builder.WebHost.UseUrls(RelayBinding.UrlFor(openStatus, noTls, port));
     builder.WebHost.ConfigureKestrel(o =>
     {
         o.Limits.MaxRequestBodySize = 200_000_000;
@@ -96,14 +96,17 @@ var authThrottle = new AuthThrottle();
 
 var protocol = noTls ? "http" : "https";
 Console.WriteLine($"=== Remote CMD Relay Server {RemoteCmd.Shared.VersionInfo.Version} ===");
-Console.WriteLine($"Listening on: {protocol}://0.0.0.0:{port}");
+Console.WriteLine($"Listening on: {protocol}://{RelayBinding.HostFor(openStatus)}:{port}"
+                  + (openStatus ? "  (loopback only — --open-status serves the dashboard without a token)" : ""));
 Console.WriteLine($"Tokens ({tokens.Count}): {string.Join(", ", tokens)}");
 Console.WriteLine($"TLS: {(noTls ? "disabled" : "enabled (self-signed)")}");
 Console.WriteLine($"Encryption: AES-256-GCM (always on)");
 Console.WriteLine($"Multi-client: enabled");
 Console.WriteLine($"Session GC threshold: {staleAfter.TotalMinutes:N0} minutes");
 Console.WriteLine($"Live dashboard: {(dashboard ? "on (--dashboard)" : "off (add --dashboard)")}");
-Console.WriteLine($"Status page: {protocol}://<this-host>:{port}/ui{(openStatus ? "  (open, no token)" : "")}");
+Console.WriteLine(openStatus
+    ? $"Status page: {protocol}://127.0.0.1:{port}/ui  (open, no token, loopback only)"
+    : $"Status page: {protocol}://<this-host>:{port}/ui");
 Console.WriteLine();
 Console.WriteLine("Client setup (run on target machine):");
 Console.WriteLine($"  RemoteCmd.Client.exe <THIS_SERVER_IP> {token}");
@@ -254,29 +257,44 @@ app.MapPost("/api/result", async (HttpRequest req) =>
     return Results.Ok();
 });
 
+// One transfer at a time per client, handed out with its id. Uploads go first: they are already
+// buffered on the relay, so finishing them frees that memory soonest.
 app.MapGet("/api/file-poll", (HttpRequest req) =>
 {
     var session = TouchSession(req, clients, events);
 
-    if (session.PendingUpload != null)
+    var upload = session.Uploads.Lease();
+    if (upload != null)
     {
-        var meta = JsonSerializer.Serialize(new { action = "upload", path = session.PendingUpload.Path, size = session.PendingUpload.Data!.Length });
+        var meta = JsonSerializer.Serialize(new
+        {
+            action = "upload", path = upload.Path, size = upload.Data!.Length, transferId = upload.Id,
+        });
         return Results.Ok(new { e = KeyFor(req).EncryptString(meta) });
     }
-    if (session.PendingDownload != null)
+
+    var download = session.Downloads.Lease();
+    if (download != null)
     {
-        var meta = JsonSerializer.Serialize(new { action = "download", path = session.PendingDownload.Path ?? "", size = 0 });
+        var meta = JsonSerializer.Serialize(new
+        {
+            action = "download", path = download.Path, size = 0, transferId = download.Id,
+        });
         return Results.Ok(new { e = KeyFor(req).EncryptString(meta) });
     }
+
     return Results.Ok(new { e = (string?)null });
 });
 
 app.MapGet("/api/file-data", (HttpRequest req) =>
 {
     var session = TouchSession(req, clients, events);
-    if (session.PendingUpload?.Data == null) return Results.NotFound();
-    var encrypted = KeyFor(req).Encrypt(session.PendingUpload.Data);
-    return Results.File(encrypted, "application/octet-stream");
+    var wanted = req.Query["transferId"].FirstOrDefault();
+    var job = session.Uploads.Current;
+    // A stale id means the client is asking for a transfer that has already been settled; sending
+    // it the current one instead is how the wrong bytes reached the wrong path.
+    if (job?.Data == null || (!string.IsNullOrEmpty(wanted) && job.Id != wanted)) return Results.NotFound();
+    return Results.File(KeyFor(req).Encrypt(job.Data), "application/octet-stream");
 });
 
 // The client reports here once it has finished writing the file. It calls this whether the write
@@ -286,8 +304,8 @@ app.MapPost("/api/file-done", (HttpRequest req) =>
 {
     var session = TouchSession(req, clients, events);
     var error = req.Query["error"].FirstOrDefault();
-    session.PendingUpload = null;
-    session.UploadTcs?.TrySetResult(string.IsNullOrEmpty(error) ? null : error);
+    var job = session.Uploads.Release(req.Query["transferId"].FirstOrDefault());
+    job?.Done.TrySetResult(string.IsNullOrEmpty(error) ? null : error);
     return Results.Ok();
 });
 
@@ -295,11 +313,12 @@ app.MapPost("/api/file-upload", async (HttpRequest req) =>
 {
     var session = TouchSession(req, clients, events);
     var error = req.Query["error"].FirstOrDefault();
+    var job = session.Downloads.Release(req.Query["transferId"].FirstOrDefault());
+    if (job == null) return Results.Ok();
+
     if (!string.IsNullOrEmpty(error))
     {
-        session.DownloadTcs?.TrySetResult(new FileTransfer { Error = error });
-        session.PendingDownload = null;
-        session.DownloadTcs = null;
+        job.Result.TrySetResult(new FileTransfer { Error = error });
         return Results.Ok();
     }
 
@@ -308,14 +327,12 @@ app.MapPost("/api/file-upload", async (HttpRequest req) =>
     try
     {
         var decrypted = KeyFor(req).Decrypt(ms.ToArray());
-        session.DownloadTcs?.TrySetResult(new FileTransfer { Data = decrypted });
+        job.Result.TrySetResult(new FileTransfer { Data = decrypted });
     }
     catch (Exception ex)
     {
-        session.DownloadTcs?.TrySetResult(new FileTransfer { Error = $"[DECRYPT ERROR] {ex.Message}" });
+        job.Result.TrySetResult(new FileTransfer { Error = $"[DECRYPT ERROR] {ex.Message}" });
     }
-    session.PendingDownload = null;
-    session.DownloadTcs = null;
     return Results.Ok();
 });
 
@@ -393,13 +410,13 @@ app.MapPost("/api/upload", async (HttpRequest req) =>
     Interlocked.Add(ref stats.BytesUploaded, data.Length);
     events.Add("upload", session.Name, $"{FormatBytes(data.Length)} -> {Excerpt(remotePath)}");
 
-    session.PendingUpload = new FileTransfer { Path = remotePath, Data = data };
-    session.UploadTcs = new TaskCompletionSource<string?>();
+    var job = new FileJob { Path = remotePath, Data = data };
+    session.Uploads.Enqueue(job);
 
     using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
     try
     {
-        var error = await session.UploadTcs.Task.WaitAsync(cts.Token);
+        var error = await job.Done.Task.WaitAsync(cts.Token);
         if (error != null)
         {
             events.Add("upload", session.Name, $"failed -> {Excerpt(remotePath)}");
@@ -409,8 +426,9 @@ app.MapPost("/api/upload", async (HttpRequest req) =>
     }
     catch (OperationCanceledException)
     {
-        session.PendingUpload = null;
-        session.UploadTcs = null;
+        // Only this transfer is abandoned. Clearing the whole slot used to cancel a completely
+        // different upload that happened to be in progress.
+        session.Uploads.Release(job.Id);
         events.Add("upload", session.Name, $"timeout -> {Excerpt(remotePath)}");
         // A timeout is a failure; answering 200 let every caller treat it as a completed upload.
         return Results.Json(new { error = "Upload timeout" }, statusCode: 504);
@@ -432,15 +450,15 @@ app.MapGet("/api/download", async (HttpRequest req) =>
     Console.WriteLine($"[DOWNLOAD] {session.Name}: <- {remotePath}");
     Interlocked.Increment(ref stats.Downloads);
 
-    session.PendingDownload = new FileTransfer { Path = remotePath };
-    session.DownloadTcs = new TaskCompletionSource<FileTransfer>();
+    var job = new FileJob { Path = remotePath };
+    session.Downloads.Enqueue(job);
 
     using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
     try
     {
         // Logged on completion rather than on request: the size is only known once the client has
         // actually sent the bytes, and a history line reading "0 kB" would be a lie either way.
-        var result = await session.DownloadTcs.Task.WaitAsync(cts.Token);
+        var result = await job.Result.Task.WaitAsync(cts.Token);
         if (result.Data == null)
         {
             events.Add("download", session.Name, $"failed <- {Excerpt(remotePath)}");
@@ -452,8 +470,8 @@ app.MapGet("/api/download", async (HttpRequest req) =>
     }
     catch (OperationCanceledException)
     {
-        session.PendingDownload = null;
-        session.DownloadTcs = null;
+        // Abandon only this transfer, not whatever else the client is in the middle of.
+        session.Downloads.Release(job.Id);
         events.Add("download", session.Name, $"timeout <- {Excerpt(remotePath)}");
         return Results.StatusCode(504);
     }
@@ -477,7 +495,7 @@ app.MapGet("/api/clients", () =>
             running = c.InFlight.Count,
             queued = c.CommandQueue.Count,
             served = Interlocked.Read(ref c.CommandsServed),
-            state = c.PendingUpload != null ? "upload" : c.PendingDownload != null ? "download" : c.IsConnected() ? "idle" : "stale",
+            state = !c.Uploads.Idle ? "upload" : !c.Downloads.Idle ? "download" : c.IsConnected() ? "idle" : "stale",
             connectedForSeconds = (int)(DateTime.UtcNow - c.ConnectedSince).TotalSeconds
         }).ToList();
     return Results.Ok(new { count = list.Count, connected = list.Count(x => x.connected), clients = list });
@@ -488,8 +506,8 @@ app.MapGet("/api/events", (HttpRequest req) =>
     var limit = int.TryParse(req.Query["limit"].FirstOrDefault(), out var l) && l is > 0 and <= 500 ? l : 100;
     // With --open-status this endpoint answers anonymous callers and shows everything, command
     // lines included. That switch exists precisely to make the dashboard usable without a token,
-    // and the relay listens on localhost only - whoever reaches the port is already on the machine
-    // and can read the same commands from the process list.
+    // and it is what forces the relay onto loopback (see RelayBinding) — whoever reaches the port
+    // is then genuinely on this machine and can read the same commands from the process list.
     var recent = events.Snapshot().TakeLast(limit)
         .Select(e => new
         {
@@ -511,8 +529,8 @@ app.MapGet("/api/events", (HttpRequest req) =>
 });
 
 // Output of one command, for the status page's detail view. Open together with the rest of the
-// dashboard under --open-status: the detail is the whole point of the page, and the relay listens
-// on localhost, so it hides nothing that is not already readable on the machine itself.
+// dashboard under --open-status: the detail is the whole point of the page, and that mode binds to
+// loopback, so it hides nothing that is not already readable on the machine itself.
 app.MapGet("/api/command", (HttpRequest req) =>
 {
     var id = req.Query["id"].FirstOrDefault();
@@ -762,11 +780,10 @@ public class ClientSession
     public ConcurrentQueue<PendingCommand> CommandQueue { get; } = new();
     public ConcurrentDictionary<string, PendingCommand> InFlight { get; } = new();
 
-    public FileTransfer? PendingUpload { get; set; }
-    /// <summary>Completes with null when the client wrote the file, or with its error text.</summary>
-    public TaskCompletionSource<string?>? UploadTcs { get; set; }
-    public FileTransfer? PendingDownload { get; set; }
-    public TaskCompletionSource<FileTransfer>? DownloadTcs { get; set; }
+    // Queued rather than single-slot: two callers transferring to the same machine at once used to
+    // overwrite each other's transfer, and the client wrote one file's bytes to the other's path.
+    public TransferQueue Uploads { get; } = new();
+    public TransferQueue Downloads { get; } = new();
 
     public bool IsConnected() => (DateTime.UtcNow - LastPoll).TotalSeconds < 10;
 }
