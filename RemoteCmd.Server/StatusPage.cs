@@ -154,8 +154,10 @@ public static class StatusPage
   #streamBox { border:1px solid var(--grid); }
 
   td.msg { white-space:normal; }
-  td.msg > div { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
-                 overflow:hidden; max-width:110ch; word-break:break-word; }
+  /* Three lines, and the full text is on the cell's tooltip: a command cut mid-path is worth
+     nothing to whoever is reading the history. */
+  td.msg > div { display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical;
+                 overflow:hidden; max-width:140ch; word-break:break-word; }
   td.ts, td.tag { color:var(--dim); }
   td.tag { font-weight:600; letter-spacing:.05em; }
   .gut { width:3px; padding:0; border-bottom:none; }
@@ -984,6 +986,9 @@ function renderStream(info) {
 function msgCell(message) {
   const td = document.createElement('td');
   td.className = 'msg';
+  // Whatever the clamp hides is still one hover away. A property, not markup, so relay text stays
+  // text no matter what it contains.
+  td.title = message;
   const div = document.createElement('div');
   div.append(txt(message));
   td.append(div);

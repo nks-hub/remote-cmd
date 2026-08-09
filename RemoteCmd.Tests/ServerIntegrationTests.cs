@@ -331,6 +331,36 @@ public class ServerIntegrationTests : IClassFixture<RemoteCmdFactory>
     }
 
     /// <summary>
+    /// History lines used to be cut at 60 characters, which truncated nearly every real command and
+    /// every absolute path — the reader saw "cd /Users/x/project &amp;&amp; tar -xzf /Users/x/pro…" and had
+    /// to guess the rest.
+    /// </summary>
+    [Fact]
+    public async Task HistoryKeepsEnoughOfACommandToBeReadable()
+    {
+        var id = Guid.NewGuid().ToString("N");
+        var name = "long-" + Guid.NewGuid().ToString("N")[..8];
+        await _http.GetAsync(Url("/api/poll", ("clientId", id), ("name", name)));
+
+        // A realistic length: two absolute paths and a couple of flags.
+        var command = "cd /Users/someone/projects/mobile-app && tar -xzf /Users/someone/downloads/"
+                      + "sources-2026-08-09.tgz --strip-components=1 -C ./vendor/generated && echo done";
+        Assert.True(command.Length is > 100 and < 400, $"fixture is {command.Length} chars");
+
+        await _http.PostAsJsonAsync(Url("/api/exec", ("client", name)),
+            new { command, timeoutSeconds = 1 });
+
+        var events = await _http.GetFromJsonAsync<HistoryDto>(Url("/api/events", ("limit", "200")));
+        var line = events!.Events.Last(e => e.Kind == "exec" && e.Client == name);
+
+        Assert.Equal(command, line.Message);
+        Assert.DoesNotContain("…", line.Message);
+    }
+
+    private record HistoryDto(List<HistoryLine> Events);
+    private record HistoryLine(string Kind, string Client, string Message);
+
+    /// <summary>
     /// Two callers uploading to the same machine at once used to overwrite each other: the relay
     /// kept a single slot, so the client was handed one transfer's path and the other's bytes and
     /// wrote the wrong file. Each transfer now queues with its own id.

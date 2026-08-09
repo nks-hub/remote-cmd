@@ -626,11 +626,20 @@ static string FormatBytes(long bytes)
 static int Elapsed(DateTime startedUtc)
     => (int)Math.Max(0, (DateTime.UtcNow - startedUtc).TotalMilliseconds);
 
-/// <summary>One-line, length-capped form of user input for the event history.</summary>
+/// <summary>
+/// One-line, length-capped form of user input for the event history.
+///
+/// The cap used to be 60 characters, which cut nearly every real command and every absolute path in
+/// half — a history line reading "cd /Users/x/project &amp;&amp; tar -xzf /Users/x/pro…" tells the reader
+/// nothing they could not have guessed. The history is a ring of 500 entries, so even at this
+/// length it costs a few hundred kilobytes at worst.
+/// </summary>
+const int ExcerptLength = 400;
+
 static string Excerpt(string s)
 {
     s = s.ReplaceLineEndings(" ").Trim();
-    return s.Length <= 60 ? s : s[..59] + "…";
+    return s.Length <= ExcerptLength ? s : s[..(ExcerptLength - 1)] + "…";
 }
 
 static string? ExtractBearer(string? authHeader)
