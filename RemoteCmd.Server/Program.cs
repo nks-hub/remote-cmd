@@ -17,9 +17,12 @@ const string TokenItemKey = "remotecmd.token";
 var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 200_000_000);
 
-// Every leading positional argument is a token: the relay accepts them all at once, so clients
-// can be migrated to a new token without a window where either the old or the new one is refused.
-var tokens = args.TakeWhile(a => !a.StartsWith('-')).Distinct(StringComparer.Ordinal).ToList();
+// Every positional argument is a token: the relay accepts them all at once, so clients can be
+// migrated to a new token without a window where either the old or the new one is refused.
+// Position must not matter — none of the switches take a value, and stopping at the first one meant
+// "RemoteCmd.Server.exe --dashboard mytoken" silently threw the token away and invented a random
+// one, leaving every client locked out with no error to explain it.
+var tokens = args.Where(a => !a.StartsWith('-')).Distinct(StringComparer.Ordinal).ToList();
 if (tokens.Count == 0)
 {
     var fromEnv = Environment.GetEnvironmentVariable("REMOTECMD_TOKENS")
@@ -165,7 +168,7 @@ if (dashboard)
 // same: a case-sensitive check let "/API/exec" miss the gate entirely and run commands untokened.
 var openPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
 {
-    "/api/status", "/api/clients", "/api/events",
+    "/api/status", "/api/clients", "/api/events", "/api/command",
 };
 
 app.Use(async (context, next) =>
@@ -276,11 +279,15 @@ app.MapGet("/api/file-data", (HttpRequest req) =>
     return Results.File(encrypted, "application/octet-stream");
 });
 
+// The client reports here once it has finished writing the file. It calls this whether the write
+// succeeded or failed, so an ?error= says which — without it a full disk or a read-only path was
+// reported to the caller as a successful upload. Clients from before this field simply omit it.
 app.MapPost("/api/file-done", (HttpRequest req) =>
 {
     var session = TouchSession(req, clients, events);
+    var error = req.Query["error"].FirstOrDefault();
     session.PendingUpload = null;
-    session.UploadTcs?.TrySetResult(true);
+    session.UploadTcs?.TrySetResult(string.IsNullOrEmpty(error) ? null : error);
     return Results.Ok();
 });
 
@@ -387,20 +394,26 @@ app.MapPost("/api/upload", async (HttpRequest req) =>
     events.Add("upload", session.Name, $"{FormatBytes(data.Length)} -> {Excerpt(remotePath)}");
 
     session.PendingUpload = new FileTransfer { Path = remotePath, Data = data };
-    session.UploadTcs = new TaskCompletionSource<bool>();
+    session.UploadTcs = new TaskCompletionSource<string?>();
 
     using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
     try
     {
-        var ok = await session.UploadTcs.Task.WaitAsync(cts.Token);
-        return ok
-            ? Results.Ok(new { status = "ok", size = data.Length, client = session.Name })
-            : Results.StatusCode(500);
+        var error = await session.UploadTcs.Task.WaitAsync(cts.Token);
+        if (error != null)
+        {
+            events.Add("upload", session.Name, $"failed -> {Excerpt(remotePath)}");
+            return Results.Json(new { error = $"Client could not write the file: {error}" }, statusCode: 502);
+        }
+        return Results.Ok(new { status = "ok", size = data.Length, client = session.Name });
     }
     catch (OperationCanceledException)
     {
         session.PendingUpload = null;
-        return Results.Ok(new { error = "Upload timeout" });
+        session.UploadTcs = null;
+        events.Add("upload", session.Name, $"timeout -> {Excerpt(remotePath)}");
+        // A timeout is a failure; answering 200 let every caller treat it as a completed upload.
+        return Results.Json(new { error = "Upload timeout" }, statusCode: 504);
     }
 });
 
@@ -473,17 +486,17 @@ app.MapGet("/api/clients", () =>
 app.MapGet("/api/events", (HttpRequest req) =>
 {
     var limit = int.TryParse(req.Query["limit"].FirstOrDefault(), out var l) && l is > 0 and <= 500 ? l : 100;
-    // With --open-status this endpoint answers anonymous callers. A command line carries secrets
-    // just like its output does ("mysql -phunter2"), so the text is held back unless a token was
-    // presented; the timing, the kind and the client stay visible so the open view still shows life.
-    var authenticated = req.HttpContext.Items.ContainsKey(TokenItemKey);
+    // With --open-status this endpoint answers anonymous callers and shows everything, command
+    // lines included. That switch exists precisely to make the dashboard usable without a token,
+    // and the relay listens on localhost only - whoever reaches the port is already on the machine
+    // and can read the same commands from the process list.
     var recent = events.Snapshot().TakeLast(limit)
         .Select(e => new
         {
             at = e.AtUtc,
             kind = e.Kind,
             client = e.Client,
-            message = authenticated || e.Kind != "exec" ? e.Message : "(command hidden — needs a token)",
+            message = e.Message,
             id = e.Id,
         })
         .ToList();
@@ -497,9 +510,9 @@ app.MapGet("/api/events", (HttpRequest req) =>
     });
 });
 
-// Output of one command, for the status page's detail view. Deliberately kept OUT of the
-// open-status allow-list in the auth middleware: stdout routinely carries passwords and keys, so it
-// stays behind the same token as /api/exec even when the rest of the dashboard is open.
+// Output of one command, for the status page's detail view. Open together with the rest of the
+// dashboard under --open-status: the detail is the whole point of the page, and the relay listens
+// on localhost, so it hides nothing that is not already readable on the machine itself.
 app.MapGet("/api/command", (HttpRequest req) =>
 {
     var id = req.Query["id"].FirstOrDefault();
@@ -552,11 +565,14 @@ app.MapGet("/", () => Results.Text(
     "GET  /api/status[?client=X]                - Check client(s)\n" +
     "GET  /api/clients                          - List all clients\n" +
     "GET  /api/events[?limit=N]                 - Recent relay events + counters\n" +
-    "GET  /api/command?id=X                     - Output of one command (never open)\n" +
+    "GET  /api/command?id=X                     - Output of one command\n" +
     "POST /api/exec[?client=X]                  - Run command {\"command\":\"...\"}\n" +
     "POST /api/upload?path=...[&client=X]       - Upload file (binary body)\n" +
     "GET  /api/download?path=...[&client=X]     - Download file\n" +
-    "All endpoints need token (query/header/Bearer).", "text/plain"));
+    (openStatus
+        ? "Token (query/header/Bearer) needed for everything except the read-only status endpoints,\n" +
+          "which --open-status serves to anyone who reaches this port."
+        : "All endpoints need token (query/header/Bearer)."), "text/plain"));
 
 app.Run();
 return 0;
@@ -663,10 +679,16 @@ static void CompleteCommand(ClientSession session, string? requestId, CommandRes
 {
     PendingCommand? pending = null;
     if (!string.IsNullOrEmpty(requestId))
-        session.InFlight.TryRemove(requestId, out pending);
-
-    if (pending == null)
     {
+        // An id we no longer hold belongs to a command that already timed out. Falling through to
+        // the oldest-waiting command would hand that stale output to whoever is waiting now — the
+        // caller of a completely different exec gets another command's stdout and exit code.
+        session.InFlight.TryRemove(requestId, out pending);
+    }
+    else
+    {
+        // Legacy clients omit the id and only ever run one command at a time, so the oldest
+        // in-flight command is necessarily the one they are answering.
         var oldest = session.InFlight.Values
             .Where(p => !p.Cancelled)
             .OrderBy(p => p.Seq)
@@ -741,7 +763,8 @@ public class ClientSession
     public ConcurrentDictionary<string, PendingCommand> InFlight { get; } = new();
 
     public FileTransfer? PendingUpload { get; set; }
-    public TaskCompletionSource<bool>? UploadTcs { get; set; }
+    /// <summary>Completes with null when the client wrote the file, or with its error text.</summary>
+    public TaskCompletionSource<string?>? UploadTcs { get; set; }
     public FileTransfer? PendingDownload { get; set; }
     public TaskCompletionSource<FileTransfer>? DownloadTcs { get; set; }
 

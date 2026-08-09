@@ -27,7 +27,7 @@ public static class ClientRegistry
                 // Fault any pending tasks so callers unblock promptly.
                 foreach (var pending in removed.InFlight.Values)
                     pending.Tcs.TrySetResult(new CommandResult { Output = "[ERROR] Session pruned", ExitCode = -1 });
-                removed.UploadTcs?.TrySetResult(false);
+                removed.UploadTcs?.TrySetResult("Session pruned");
                 removed.DownloadTcs?.TrySetResult(new FileTransfer { Error = "Session pruned" });
                 count++;
             }

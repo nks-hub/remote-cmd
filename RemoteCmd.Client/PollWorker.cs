@@ -180,7 +180,9 @@ public sealed class PollWorker : BackgroundService
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _log.LogError("[FILE ERROR] {Message}", ex.Message);
-            await http.PostAsync(fileDoneUrl, null, ct);
+            // Report WHY. Calling file-done bare told the relay the write had succeeded, so a full
+            // disk or a read-only path came back to the uploader as a completed transfer.
+            await http.PostAsync($"{fileDoneUrl}&error={Uri.EscapeDataString(ex.Message)}", null, ct);
         }
     }
 
