@@ -3,7 +3,7 @@ using System.Text.Json.Serialization;
 namespace RemoteCmd.Client;
 
 /// <summary>Connection settings shared by console and service hosting.</summary>
-public sealed record ClientConfig(string ServerArg, string Token, string Name)
+public sealed record ClientConfig(string ServerArg, string Token, string Name, bool KeepAwake = false)
 {
     public string BaseUrl => ServerArg.StartsWith("http")
         ? ServerArg.TrimEnd('/')

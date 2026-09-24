@@ -52,6 +52,10 @@ static async Task RunHost(ClientConfig config, bool dashboard)
     builder.Services.AddWindowsService(o => o.ServiceName = "RemoteCmdClient");
     builder.Services.AddSystemd();
 
+    using var keepAwake = config.KeepAwake
+        ? KeepAwake.Start(message => Console.Error.WriteLine(message))
+        : null;
+
     if (dashboard && !Console.IsOutputRedirected)
     {
         // Split-screen console: a fixed stats header + a scrolling log fed by ILogger.
@@ -110,13 +114,14 @@ static int SafeHeight() { try { return Console.WindowHeight > 0 ? Console.Window
 static string Mask(string token)
     => token.Length <= 4 ? new string('*', token.Length) : token[..2] + new string('*', token.Length - 4) + token[^2..];
 
-// Parse: [command] <server> <token> [--name X] [--service-name N] [--dashboard]
+// Parse: [command] <server> <token> [--name X] [--service-name N] [--dashboard] [--keep-awake]
 // Returns null config when a connection is required but server/token are missing.
 static (ClientConfig? config, string serviceName, bool dashboard) ParseServiceArgs(string[] args, bool requireConnection)
 {
     var serviceName = "RemoteCmdClient";
     string? server = null, token = null, name = null;
     var dashboard = false;
+    var keepAwake = false;
     var positional = new List<string>();
 
     // Skip a leading verb (install-service / uninstall-service).
@@ -128,6 +133,7 @@ static (ClientConfig? config, string serviceName, bool dashboard) ParseServiceAr
         {
             case "--service": break; // host-mode marker, no value
             case "--dashboard": dashboard = true; break;
+            case "--keep-awake": keepAwake = true; break;
             case "--name" when i + 1 < args.Length: name = args[++i]; break;
             case "--service-name" when i + 1 < args.Length: serviceName = args[++i]; break;
             default: positional.Add(args[i]); break;
@@ -144,7 +150,7 @@ static (ClientConfig? config, string serviceName, bool dashboard) ParseServiceAr
     }
 
     var config = server is not null && token is not null
-        ? new ClientConfig(server, token, name ?? Environment.MachineName)
+        ? new ClientConfig(server, token, name ?? Environment.MachineName, keepAwake)
         : null;
     return (config, serviceName, dashboard);
 }
@@ -154,16 +160,17 @@ static void PrintUsage()
     Console.WriteLine($"RemoteCmd Client {ClientStats.Version}");
     Console.WriteLine();
     Console.WriteLine("Run (console/foreground):");
-    Console.WriteLine("  RemoteCmd.Client <server> <token> [--name <alias>] [--dashboard]");
+    Console.WriteLine("  RemoteCmd.Client <server> <token> [--name <alias>] [--dashboard] [--keep-awake]");
     Console.WriteLine();
     Console.WriteLine("  --dashboard   live status header (version, connection, polls, running) + scrolling log");
+    Console.WriteLine("  --keep-awake  keep the machine from sleeping while the client runs");
     Console.WriteLine("  --version     print version and exit");
     Console.WriteLine();
     Console.WriteLine("Run as a service host (used internally by SCM/systemd):");
     Console.WriteLine("  RemoteCmd.Client --service <server> <token> [--name <alias>]");
     Console.WriteLine();
     Console.WriteLine("Register as a system service (Windows Service / systemd; needs admin/root):");
-    Console.WriteLine("  RemoteCmd.Client install-service <server> <token> [--name <alias>] [--service-name <name>]");
+    Console.WriteLine("  RemoteCmd.Client install-service <server> <token> [--name <alias>] [--service-name <name>] [--keep-awake]");
     Console.WriteLine("  RemoteCmd.Client uninstall-service [--service-name <name>]");
     Console.WriteLine();
     Console.WriteLine($"Default service name: {defaultServiceName}");

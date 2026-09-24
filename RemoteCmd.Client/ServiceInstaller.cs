@@ -36,7 +36,8 @@ public static class ServiceInstaller
     }
 
     private static string BuildServiceArgs(ClientConfig config)
-        => $"--service {Quote(config.ServerArg)} {Quote(config.Token)} --name {Quote(config.Name)}";
+        => $"--service {Quote(config.ServerArg)} {Quote(config.Token)} --name {Quote(config.Name)}"
+           + (config.KeepAwake ? " --keep-awake" : "");
 
     private static int InstallWindows(string serviceName, string exePath, ClientConfig config)
     {
