@@ -113,6 +113,18 @@ document.getElementById('f').addEventListener('submit', async (e) => {
     <div id="pending"></div>
   </section>
 
+  <section id="agents">
+    <h2>AI agents (MCP)</h2>
+    <p>Agents connect to the relay's MCP endpoint and sign in through the browser; each sign-in waits here
+       until you approve it. Check that the code matches the one on the agent's page.</p>
+    <div id="oauthPending"><p class="muted">No agent is waiting.</p></div>
+    <p style="margin-top:12px">Add the relay to Claude Code:</p>
+    <div class="row"><b>From this machine</b></div>
+    <pre id="mcpLocal"></pre>
+    <div class="row"><b>From another machine</b></div>
+    <pre id="mcpRemote"></pre>
+  </section>
+
   <section>
     <h2>Relay address</h2>
     <p>The address machines use to reach this relay. It goes into the install commands above.</p>
@@ -216,6 +228,8 @@ async function loadPending() {
 async function loadInfo() {
   const info = await api('/api/admin/info');
   $('ver').textContent = `v${info.version}`;
+  $('mcpLocal').textContent = `claude mcp add --transport http remote-cmd http://localhost:${info.adminPort}/mcp`;
+  $('mcpRemote').textContent = `claude mcp add --transport http remote-cmd ${info.publicUrl}/mcp`;
   $('url').value = info.publicUrl;
   $('urlNote').textContent = info.publicUrlSet ? '' : '(guessed — save it if machines reach the relay by another address)';
   $('tlsNote').textContent = info.tls
@@ -226,6 +240,28 @@ async function loadInfo() {
     : 'Not set. The dashboard listens on this machine only, so anyone with a session on it can open it.';
   $('pwClear').hidden = !info.passwordSet;
   $('logout').hidden = !info.passwordSet;
+}
+
+async function loadOAuth() {
+  const { pending } = await api('/api/admin/oauth/pending');
+  if (!pending.length) {
+    $('oauthPending').replaceChildren(el('p', 'No agent is waiting.', 'muted'));
+    return;
+  }
+  $('oauthPending').replaceChildren(...pending.map((p) => {
+    const row = el('div', null, 'row');
+    row.style.margin = '8px 0';
+    row.append(el('span', p.userCode, 'code'), el('b', p.client), el('span', `returns to ${p.redirect} · ${ago(p.createdUtc)}`, 'muted'));
+    for (const [label, decision, cls] of [['Approve', 'approve', 'primary'], ['Deny', 'deny', 'danger']]) {
+      const b = el('button', label, cls);
+      b.addEventListener('click', async () => {
+        await api(`/api/admin/oauth/${encodeURIComponent(p.id)}/${decision}`, 'POST');
+        loadOAuth(); loadCreds();
+      });
+      row.append(b);
+    }
+    return row;
+  }));
 }
 
 async function loadCreds() {
@@ -301,8 +337,10 @@ $('logout').addEventListener('click', async () => {
   location.href = '/login';
 });
 
-loadInfo(); loadPending(); loadCreds();
+loadInfo(); loadPending(); loadCreds(); loadOAuth();
 setInterval(() => { loadCreds(); loadPending(); }, 5000);
+setInterval(loadOAuth, 2000);
+if (location.hash === '#agents') $('agents').scrollIntoView();
 </script>
 </body>
 </html>

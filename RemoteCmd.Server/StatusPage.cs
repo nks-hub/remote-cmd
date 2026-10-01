@@ -205,6 +205,8 @@ public static class StatusPage
         font-size:12px; line-height:1.5; }
   .note { color:var(--sig); margin-bottom:10px; }
   .ok { color:var(--dim); } .bad { color:var(--bad); }
+  #agentBar { display:block; padding:10px var(--gut); background:var(--sig); color:#fff; font-family:var(--face);
+              font-weight:600; text-decoration:none; }
   [hidden] { display:none !important; }
 
   @media (prefers-reduced-motion: reduce) {
@@ -233,6 +235,8 @@ public static class StatusPage
   <label><input type="checkbox" id="live" checked> live</label>
   <a class="btn" href="/manage">Pair &amp; manage</a>
 </header>
+
+<a id="agentBar" href="/manage#agents" hidden></a>
 
 <form id="gate" hidden>
   <input id="token" type="password" placeholder="relay token" autocomplete="off" spellcheck="false">
@@ -340,6 +344,22 @@ gate.addEventListener('submit', (e) => {
   tick();
   if (state.selected) loadDetail(state.selected);
 });
+
+// An agent waiting for approval is the one thing on this page that needs a person right now.
+async function checkAgents() {
+  try {
+    const res = await fetch('/api/admin/oauth/pending', { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) return;
+    const { pending } = await res.json();
+    const bar = $('agentBar');
+    bar.hidden = pending.length === 0;
+    bar.textContent = pending.length === 1
+      ? `${pending[0].client} is waiting for approval (code ${pending[0].userCode}) — review`
+      : `${pending.length} AI agents are waiting for approval — review`;
+  } catch { /* the main refresh reports connection problems */ }
+}
+setInterval(checkAgents, 3000);
+checkAgents();
 
 async function api(path) {
   // A relay behind a dropped VPN accepts the connection and then says nothing, so without a deadline

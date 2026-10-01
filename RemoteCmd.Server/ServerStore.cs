@@ -52,6 +52,8 @@ public sealed class ServerSettings
     /// <summary>PBKDF2 hash of the dashboard password, or null for an open (loopback-only) dashboard.</summary>
     public string? DashboardPassword { get; set; }
     public List<Credential> Credentials { get; set; } = [];
+    /// <summary>MCP clients that registered for OAuth; kept so they need not register again after a restart.</summary>
+    public List<OAuthClient> OAuthClients { get; set; } = [];
 }
 
 /// <summary>
@@ -182,6 +184,23 @@ public sealed class ServerStore
             Save();
             return credential;
         }
+    }
+
+    public OAuthClient RegisterOAuthClient(OAuthClient client)
+    {
+        lock (_gate)
+        {
+            // Every MCP client registers itself, possibly on each run; the list must not grow forever.
+            if (_settings.OAuthClients.Count >= 200) _settings.OAuthClients.RemoveAt(0);
+            _settings.OAuthClients.Add(client);
+            Save();
+            return client;
+        }
+    }
+
+    public OAuthClient? FindOAuthClient(string clientId)
+    {
+        lock (_gate) return _settings.OAuthClients.FirstOrDefault(c => c.ClientId == clientId);
     }
 
     public bool Revoke(string id)

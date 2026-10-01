@@ -202,6 +202,12 @@ app.Use(async (context, next) =>
             context.Response.StatusCode = 404;
             return;
         }
+        // MCP and its OAuth flow authenticate on their own (bearer token, PKCE, dashboard approval).
+        if (IsMcpPath(path))
+        {
+            await next();
+            return;
+        }
 
         var signedIn = !store.HasPassword || adminGate.IsValid(context.Request.Cookies[AdminGate.CookieName], now);
         var signInPath = path.Equals("/login", StringComparison.OrdinalIgnoreCase)
@@ -227,6 +233,12 @@ app.Use(async (context, next) =>
     }
 
     // --- The relay listener, reachable from the network ---
+
+    if (IsMcpPath(path))
+    {
+        await next();
+        return;
+    }
 
     if (dashboardOnly.Contains(path) || path.StartsWith("/api/admin", StringComparison.OrdinalIgnoreCase))
     {
@@ -399,16 +411,21 @@ app.MapPost("/api/exec", async (HttpRequest req) =>
     if (target.Error != null)
         return Results.Ok(new CommandResult { Output = $"[ERROR] {target.Error}", ExitCode = -1 });
 
-    var session = target.Session!;
+    return Results.Ok(await RunCommand(target.Session!, body.Command, body.TimeoutSeconds));
+});
 
-    // Each exec gets its own correlated slot. Multiple execs (same or different sessions) run
-    // concurrently — the client picks them up one per poll and returns each result by requestId.
-    var timeout = ExecLimits.Clamp(body.TimeoutSeconds);
-    var pending = new PendingCommand { Command = body.Command, TimeoutSeconds = timeout };
+// === Relay operations, shared by the REST API and by MCP ===
+
+// Each exec gets its own correlated slot. Multiple execs (same or different sessions) run
+// concurrently — the client picks them up one per poll and returns each result by requestId.
+async Task<CommandResult> RunCommand(ClientSession session, string command, int requestedTimeout)
+{
+    var timeout = ExecLimits.Clamp(requestedTimeout);
+    var pending = new PendingCommand { Command = command, TimeoutSeconds = timeout };
     session.InFlight[pending.RequestId] = pending;
     session.CommandQueue.Enqueue(pending);
     Interlocked.Increment(ref stats.Execs);
-    events.Add("exec", session.Name, Excerpt(body.Command), pending.RequestId);
+    events.Add("exec", session.Name, Excerpt(command), pending.RequestId);
 
     var execStartedUtc = DateTime.UtcNow;
     // The name this command was dispatched to. A session can be renamed while the command is out
@@ -420,9 +437,9 @@ app.MapPost("/api/exec", async (HttpRequest req) =>
     try
     {
         var result = await pending.Tcs.Task.WaitAsync(cts.Token);
-        commands.Add(pending.RequestId, execStartedUtc, targetName, body.Command,
+        commands.Add(pending.RequestId, execStartedUtc, targetName, command,
             result.Output, result.ExitCode, Elapsed(execStartedUtc));
-        return Results.Ok(result);
+        return result;
     }
     catch (OperationCanceledException)
     {
@@ -431,27 +448,15 @@ app.MapPost("/api/exec", async (HttpRequest req) =>
         Interlocked.Increment(ref stats.Timeouts);
         events.Add("timeout", targetName, $"no result after {timeout}s", pending.RequestId);
         var timedOut = new CommandResult { Output = $"[TIMEOUT] No response from '{targetName}' after {timeout}s", ExitCode = -1 };
-        commands.Add(pending.RequestId, execStartedUtc, targetName, body.Command,
+        commands.Add(pending.RequestId, execStartedUtc, targetName, command,
             timedOut.Output, timedOut.ExitCode, Elapsed(execStartedUtc));
-        return Results.Ok(timedOut);
+        return timedOut;
     }
-});
+}
 
-app.MapPost("/api/upload", async (HttpRequest req) =>
+// Hands a file to a client and waits for it to be written. Null on success, else why it failed.
+async Task<string?> PushFile(ClientSession session, string remotePath, byte[] data)
 {
-    var remotePath = req.Query["path"].FirstOrDefault();
-    if (string.IsNullOrEmpty(remotePath))
-        return Results.BadRequest(new { error = "Missing ?path= parameter" });
-
-    var target = ResolveTarget(req, clients);
-    if (target.Error != null)
-        return Results.BadRequest(new { error = target.Error });
-
-    var session = target.Session!;
-
-    var data = await ReadBodyAsync(req);
-    TrimWhenDone(req, data.Length);
-
     Console.WriteLine($"[UPLOAD] {session.Name}: {FormatBytes(data.Length)} -> {remotePath}");
     Interlocked.Increment(ref stats.Uploads);
     Interlocked.Add(ref stats.BytesUploaded, data.Length);
@@ -464,12 +469,9 @@ app.MapPost("/api/upload", async (HttpRequest req) =>
     try
     {
         var error = await job.Done.Task.WaitAsync(cts.Token);
-        if (error != null)
-        {
-            events.Add("upload", session.Name, $"failed -> {Excerpt(remotePath)}");
-            return Results.Json(new { error = $"Client could not write the file: {error}" }, statusCode: 502);
-        }
-        return Results.Ok(new { status = "ok", size = data.Length, client = session.Name });
+        if (error == null) return null;
+        events.Add("upload", session.Name, $"failed -> {Excerpt(remotePath)}");
+        return $"Client could not write the file: {error}";
     }
     catch (OperationCanceledException)
     {
@@ -477,23 +479,13 @@ app.MapPost("/api/upload", async (HttpRequest req) =>
         // different upload that happened to be in progress.
         session.Uploads.Release(job.Id);
         events.Add("upload", session.Name, $"timeout -> {Excerpt(remotePath)}");
-        // A timeout is a failure; answering 200 let every caller treat it as a completed upload.
-        return Results.Json(new { error = "Upload timeout" }, statusCode: 504);
+        return "Upload timeout";
     }
-});
+}
 
-app.MapGet("/api/download", async (HttpRequest req) =>
+// Fetches a file from a client. Data is null when it failed, with the reason in Error.
+async Task<FileTransfer> PullFile(ClientSession session, string remotePath)
 {
-    var remotePath = req.Query["path"].FirstOrDefault();
-    if (string.IsNullOrEmpty(remotePath))
-        return Results.BadRequest(new { error = "Missing ?path= parameter" });
-
-    var target = ResolveTarget(req, clients);
-    if (target.Error != null)
-        return Results.BadRequest(new { error = target.Error });
-
-    var session = target.Session!;
-
     Console.WriteLine($"[DOWNLOAD] {session.Name}: <- {remotePath}");
     Interlocked.Increment(ref stats.Downloads);
 
@@ -509,25 +501,23 @@ app.MapGet("/api/download", async (HttpRequest req) =>
         if (result.Data == null)
         {
             events.Add("download", session.Name, $"failed <- {Excerpt(remotePath)}");
-            return Results.NotFound(new { error = result.Error ?? "File not found" });
+            return new FileTransfer { Error = result.Error ?? "File not found" };
         }
         Interlocked.Add(ref stats.BytesDownloaded, result.Data.Length);
         events.Add("download", session.Name, $"{FormatBytes(result.Data.Length)} <- {Excerpt(remotePath)}");
-        TrimWhenDone(req, result.Data.Length);
-        return SendBytes(result.Data, Path.GetFileName(remotePath));
+        return result;
     }
     catch (OperationCanceledException)
     {
         // Abandon only this transfer, not whatever else the client is in the middle of.
         session.Downloads.Release(job.Id);
         events.Add("download", session.Name, $"timeout <- {Excerpt(remotePath)}");
-        return Results.StatusCode(504);
+        return new FileTransfer { Error = "Download timeout" };
     }
-});
+}
 
-// === Info endpoints ===
-
-app.MapGet("/api/clients", () =>
+// The client list as /api/clients and the MCP tool both report it.
+object ClientList()
 {
     var list = clients.Values
         .OrderBy(c => c.Name)
@@ -546,8 +536,56 @@ app.MapGet("/api/clients", () =>
             state = !c.Uploads.Idle ? "upload" : !c.Downloads.Idle ? "download" : c.IsConnected() ? "idle" : "stale",
             connectedForSeconds = (int)(DateTime.UtcNow - c.ConnectedSince).TotalSeconds
         }).ToList();
-    return Results.Ok(new { count = list.Count, connected = list.Count(x => x.connected), clients = list });
+    return new { count = list.Count, connected = list.Count(x => x.connected), clients = list };
+}
+
+app.MapPost("/api/upload", async (HttpRequest req) =>
+{
+    var remotePath = req.Query["path"].FirstOrDefault();
+    if (string.IsNullOrEmpty(remotePath))
+        return Results.BadRequest(new { error = "Missing ?path= parameter" });
+
+    var target = ResolveTarget(req, clients);
+    if (target.Error != null)
+        return Results.BadRequest(new { error = target.Error });
+
+    var session = target.Session!;
+
+    var data = await ReadBodyAsync(req);
+    TrimWhenDone(req, data.Length);
+
+    var error = await PushFile(session, remotePath, data);
+    return error switch
+    {
+        null => Results.Ok(new { status = "ok", size = data.Length, client = session.Name }),
+        // A timeout is a failure; answering 200 let every caller treat it as a completed upload.
+        "Upload timeout" => Results.Json(new { error }, statusCode: 504),
+        _ => Results.Json(new { error }, statusCode: 502),
+    };
 });
+
+app.MapGet("/api/download", async (HttpRequest req) =>
+{
+    var remotePath = req.Query["path"].FirstOrDefault();
+    if (string.IsNullOrEmpty(remotePath))
+        return Results.BadRequest(new { error = "Missing ?path= parameter" });
+
+    var target = ResolveTarget(req, clients);
+    if (target.Error != null)
+        return Results.BadRequest(new { error = target.Error });
+
+    var session = target.Session!;
+
+    var result = await PullFile(session, remotePath);
+    if (result.Data == null)
+        return result.Error == "Download timeout" ? Results.StatusCode(504) : Results.NotFound(new { error = result.Error });
+    TrimWhenDone(req, result.Data.Length);
+    return SendBytes(result.Data, Path.GetFileName(remotePath));
+});
+
+// === Info endpoints ===
+
+app.MapGet("/api/clients", () => Results.Ok(ClientList()));
 
 app.MapGet("/api/events", (HttpRequest req) =>
 {
@@ -624,6 +662,8 @@ app.MapGet("/api/status", (HttpRequest req) =>
 var relay = new RelayContext(store, storePath, pairings, adminGate, authThrottle, stats, clients, events,
     port, adminPort, noTls, certSha256);
 AdminEndpoints.Map(app, relay);
+McpEndpoints.Map(app, relay, new OAuthServer(store), new McpOps(
+    name => ResolveClient(name, clients), RunCommand, PushFile, PullFile, ClientList));
 app.MapGet("/manage", () => Results.Content(AdminPage.Manage, "text/html; charset=utf-8"));
 app.MapGet("/login", () => Results.Content(AdminPage.Login, "text/html; charset=utf-8"));
 
@@ -679,6 +719,11 @@ static async Task RejectAsync(HttpContext context, AuthThrottle throttle, RelayS
     if (throttled) context.Response.Headers.RetryAfter = (AuthThrottle.LockoutMinutes * 60).ToString();
     await context.Response.WriteAsync(throttled ? "Too many failed attempts" : message);
 }
+
+static bool IsMcpPath(string path)
+    => path.Equals("/mcp", StringComparison.OrdinalIgnoreCase)
+       || path.StartsWith("/oauth/", StringComparison.OrdinalIgnoreCase)
+       || path.StartsWith("/.well-known/", StringComparison.OrdinalIgnoreCase);
 
 static int? EnvPort(string name)
     => int.TryParse(Environment.GetEnvironmentVariable(name), out var v) && v is > 0 and < 65536 ? v : null;
@@ -843,9 +888,13 @@ static void CompleteCommand(ClientSession session, string? requestId, CommandRes
 }
 
 static TargetResolution ResolveTarget(HttpRequest req, ConcurrentDictionary<string, ClientSession> clients)
-{
-    var clientParam = req.Query["client"].FirstOrDefault();
+    => ResolveClient(req.Query["client"].FirstOrDefault(), clients);
 
+/// <summary>
+/// The session a command goes to: the named one, or the only connected one when no name is given.
+/// </summary>
+static TargetResolution ResolveClient(string? clientParam, ConcurrentDictionary<string, ClientSession> clients)
+{
     if (!string.IsNullOrEmpty(clientParam))
     {
         var s = FindByNameOrId(clients, clientParam);
