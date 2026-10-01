@@ -13,13 +13,25 @@ public class StatusPageTests : IClassFixture<RemoteCmdFactory>
 {
     private readonly HttpClient _http;
 
-    public StatusPageTests(RemoteCmdFactory factory) => _http = factory.CreateClient();
+    public StatusPageTests(RemoteCmdFactory factory)
+        => _http = factory.CreateClient(new Microsoft.AspNetCore.Mvc.Testing.WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
+
+    /// <summary>An old bookmark opened on the relay's own machine is sent to the dashboard.</summary>
+    [Fact]
+    public async Task OnThisMachineTheOldPageAddressLeadsToTheDashboard()
+    {
+        var res = await _http.GetAsync("/ui");
+        Assert.Equal(HttpStatusCode.Redirect, res.StatusCode);
+        Assert.Equal("http://localhost:7891/", res.Headers.Location?.ToString());
+    }
 
     [Fact]
-    public async Task ThePageIsNotServedOnTheRelayPort()
+    public async Task FromTheNetworkThePagesDoNotExist()
     {
-        Assert.Equal(HttpStatusCode.NotFound, (await _http.GetAsync("/ui")).StatusCode);
-        Assert.Equal(HttpStatusCode.NotFound, (await _http.GetAsync("/manage")).StatusCode);
+        using var relay = new RemotePeerRelay();
+        var http = relay.CreateClient();
+        Assert.Equal(HttpStatusCode.NotFound, (await http.GetAsync("/ui")).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, (await http.GetAsync("/manage")).StatusCode);
     }
 
     /// <summary>
@@ -97,4 +109,14 @@ public class StatusPageTests : IClassFixture<RemoteCmdFactory>
         Assert.Contains("Remote CMD Relay Server", body);
         Assert.DoesNotContain("Connected clients", body);
     }
+}
+
+/// <summary>A relay whose requests all come from another machine on the network.</summary>
+public sealed class RemotePeerRelay : Microsoft.AspNetCore.Mvc.Testing.WebApplicationFactory<Program>
+{
+    public RemotePeerRelay() => TestConfig.Fresh();
+
+    protected override void ConfigureWebHost(Microsoft.AspNetCore.Hosting.IWebHostBuilder builder)
+        => TestPeer.At(Microsoft.AspNetCore.Hosting.HostingAbstractionsWebHostBuilderExtensions.UseEnvironment(builder, "Testing"),
+            IPAddress.Parse("203.0.113.7"));
 }

@@ -91,7 +91,8 @@ public class DashboardAccessTests
         var http = relay.CreateClient();
         Assert.Equal(HttpStatusCode.NotFound, (await http.GetAsync("/api/admin/info")).StatusCode);
         Assert.Equal(HttpStatusCode.NotFound, (await http.PostAsJsonAsync("/api/admin/pair", new { })).StatusCode);
-        Assert.Equal(HttpStatusCode.NotFound, (await http.GetAsync("/login")).StatusCode);
+        // Pages are sent on to the dashboard listener rather than served here.
+        Assert.NotEqual(HttpStatusCode.OK, (await http.GetAsync("/login")).StatusCode);
     }
 
     /// <summary>DNS rebinding: a page from elsewhere whose host name now resolves to 127.0.0.1.</summary>

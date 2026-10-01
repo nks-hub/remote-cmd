@@ -244,6 +244,14 @@ app.Use(async (context, next) =>
 
     if (dashboardOnly.Contains(path) || path.StartsWith("/api/admin", StringComparison.OrdinalIgnoreCase))
     {
+        // An old bookmark to the relay port's /ui, opened on this machine, lands on the dashboard.
+        // From anywhere else the dashboard does not exist as far as the network is concerned.
+        if (HttpMethods.IsGet(context.Request.Method) && !path.StartsWith("/api", StringComparison.OrdinalIgnoreCase)
+            && context.Connection.RemoteIpAddress is { } peer && System.Net.IPAddress.IsLoopback(peer.IsIPv4MappedToIPv6 ? peer.MapToIPv4() : peer))
+        {
+            context.Response.Redirect($"http://localhost:{adminPort}{(path.Equals("/ui", StringComparison.OrdinalIgnoreCase) ? "/" : path)}");
+            return;
+        }
         context.Response.StatusCode = 404;
         return;
     }
