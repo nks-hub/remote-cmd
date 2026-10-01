@@ -134,10 +134,14 @@ public sealed class PollWorker : BackgroundService
         _log.LogInformation("Remote CMD Client stopped.");
     }
 
-    private async Task RunFileTransferAsync(Task transfer)
+    private async Task RunFileTransferAsync(Task<long> transfer)
     {
-        try { await transfer; }
+        long bytes = 0;
+        try { bytes = await transfer; }
         finally { _fileBusy = false; }
+        // Only here, once the transfer's own frame has completed: its buffers are still reachable
+        // from inside it, so a collection there would find nothing to free.
+        MemoryTrim.AfterTransfer(bytes);
     }
 
     private async Task HandleCommandAsync(HttpClient http, string resultUrl, string command, string? requestId, int timeoutSeconds, CancellationToken ct)
@@ -165,7 +169,7 @@ public sealed class PollWorker : BackgroundService
         }
     }
 
-    private async Task ReceiveFile(HttpClient http, FilePollMeta meta, string fileDataUrl, string fileDoneUrl, CancellationToken ct)
+    private async Task<long> ReceiveFile(HttpClient http, FilePollMeta meta, string fileDataUrl, string fileDoneUrl, CancellationToken ct)
     {
         _log.LogInformation("[FILE] Receiving {Mb}MB -> {Path}", meta.Size / 1024 / 1024, meta.Path);
         // Naming the transfer keeps the bytes and the path together: without it a second transfer
@@ -189,20 +193,23 @@ public sealed class PollWorker : BackgroundService
             // disk or a read-only path came back to the uploader as a completed transfer.
             await http.PostAsync($"{fileDoneUrl}&error={Uri.EscapeDataString(ex.Message)}", null, ct);
         }
+        return meta.Size;
     }
 
-    private async Task SendFile(HttpClient http, FilePollMeta meta, string fileUploadUrl, CancellationToken ct)
+    private async Task<long> SendFile(HttpClient http, FilePollMeta meta, string fileUploadUrl, CancellationToken ct)
     {
         _log.LogInformation("[FILE] Uploading <- {Path}", meta.Path);
         if (meta.TransferId is not null) fileUploadUrl += $"&transferId={Uri.EscapeDataString(meta.TransferId)}";
+        long size = 0;
         try
         {
             if (!File.Exists(meta.Path))
             {
                 await http.PostAsync($"{fileUploadUrl}&error={Uri.EscapeDataString("File not found: " + meta.Path)}", null, ct);
-                return;
+                return 0;
             }
             var fileData = await File.ReadAllBytesAsync(meta.Path!, ct);
+            size = fileData.Length;
             using var content = new ByteArrayContent(Crypto.Encrypt(fileData));
             await http.PostAsync(fileUploadUrl, content, ct);
             _log.LogInformation("[FILE] Uploaded {Mb}MB <- {Path}", fileData.Length / 1024 / 1024, meta.Path);
@@ -212,6 +219,7 @@ public sealed class PollWorker : BackgroundService
             _log.LogError("[FILE ERROR] {Message}", ex.Message);
             await http.PostAsync($"{fileUploadUrl}&error={Uri.EscapeDataString(ex.Message)}", null, ct);
         }
+        return size;
     }
 
     internal static string DefaultShell()

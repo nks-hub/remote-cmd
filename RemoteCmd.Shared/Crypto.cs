@@ -38,17 +38,12 @@ public sealed class CryptoKey
     {
         if (data.Length < 28) throw new CryptographicException("Invalid encrypted data");
 
-        var nonce = new byte[12];
-        var tag = new byte[16];
-        var ciphertext = new byte[data.Length - 28];
-
-        Buffer.BlockCopy(data, 0, nonce, 0, 12);
-        Buffer.BlockCopy(data, 12, tag, 0, 16);
-        Buffer.BlockCopy(data, 28, ciphertext, 0, ciphertext.Length);
-
-        var plaintext = new byte[ciphertext.Length];
+        // Slices instead of copies: for a file transfer the ciphertext is the whole file, and
+        // copying it out first held three full-size arrays at once instead of two.
+        var span = data.AsSpan();
+        var plaintext = new byte[data.Length - 28];
         using var aes = new AesGcm(_key, 16);
-        aes.Decrypt(nonce, ciphertext, tag, plaintext);
+        aes.Decrypt(span[..12], span[28..], span[12..28], plaintext);
         return plaintext;
     }
 

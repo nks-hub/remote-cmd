@@ -86,6 +86,7 @@ namespace RemoteCmd.Client48
                                 ReceiveFile(http, path, size, fileDataUrl, fileDoneUrl, log);
                             else if (action == "download" && !string.IsNullOrEmpty(path))
                                 SendFile(http, path, fileUploadUrl, log);
+                            ReleaseTransferMemory();
                         }
 
                         retryDelay = 1;
@@ -188,6 +189,19 @@ namespace RemoteCmd.Client48
                 exitCode = -1;
                 return "[EXEC ERROR] " + ex.Message;
             }
+        }
+
+        /// <summary>
+        /// A transfer leaves its buffers on the large object heap, which only a full collection
+        /// sweeps — and an idle client allocates too little to ever trigger one, so the memory of
+        /// the last file stayed resident for good. Transfers are rare; one compacting collection
+        /// after each is cheap.
+        /// </summary>
+        private static void ReleaseTransferMemory()
+        {
+            System.Runtime.GCSettings.LargeObjectHeapCompactionMode =
+                System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
+            GC.Collect();
         }
 
         private static void WaitOrCancel(int ms, CancellationToken ct)

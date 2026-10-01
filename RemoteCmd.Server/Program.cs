@@ -405,6 +405,7 @@ app.MapPost("/api/upload", async (HttpRequest req) =>
     var session = target.Session!;
 
     var data = await ReadBodyAsync(req);
+    TrimWhenDone(req, data.Length);
 
     Console.WriteLine($"[UPLOAD] {session.Name}: {FormatBytes(data.Length)} -> {remotePath}");
     Interlocked.Increment(ref stats.Uploads);
@@ -467,6 +468,7 @@ app.MapGet("/api/download", async (HttpRequest req) =>
         }
         Interlocked.Add(ref stats.BytesDownloaded, result.Data.Length);
         events.Add("download", session.Name, $"{FormatBytes(result.Data.Length)} <- {Excerpt(remotePath)}");
+        TrimWhenDone(req, result.Data.Length);
         return SendBytes(result.Data, Path.GetFileName(remotePath));
     }
     catch (OperationCanceledException)
@@ -700,6 +702,14 @@ static ClientSession TouchSession(HttpRequest req, ConcurrentDictionary<string, 
 // for the socket, keeping the pool at a few buffers per connection.
 static IResult SendBytes(byte[] data, string? fileName = null)
     => Results.Stream(new MemoryStream(data, writable: false), "application/octet-stream", fileName);
+
+// The transfer's arrays stay reachable until the response has gone out, so the trim waits for that.
+static void TrimWhenDone(HttpRequest req, long bytes)
+    => req.HttpContext.Response.OnCompleted(() =>
+    {
+        MemoryTrim.AfterTransfer(bytes);
+        return Task.CompletedTask;
+    });
 
 // A growing MemoryStream doubles its buffer on the way up and ToArray copies it once more, so a
 // 150 MB upload used to churn through several large-object-heap arrays for one file. With a known
