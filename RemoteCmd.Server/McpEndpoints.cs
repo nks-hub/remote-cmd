@@ -421,15 +421,15 @@ public static class McpEndpoints
         <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
         <title>RemoteCmd — {{System.Net.WebUtility.HtmlEncode(title)}}</title>
         <style>
-          :root { color-scheme: light dark; --bg:#f5f2ec; --fg:#181512; --dim:#6a6255; --sig:#a85e00; --panel:#fff; --grid:#dcd5c8; }
-          @media (prefers-color-scheme: dark) { :root { --bg:#0f0e0c; --fg:#e6e0d4; --dim:#948c7c; --sig:#ffae3b; --panel:#15130f; --grid:#2a2620; } }
+          :root { color-scheme: light dark; --bg:#eef1f4; --fg:#1b2430; --dim:#5b6878; --sig:#0e7c86; --panel:#fff; --grid:#cfd6de; }
+          @media (prefers-color-scheme: dark) { :root { --bg:#13181f; --fg:#e4e9ef; --dim:#8b97a6; --sig:#3cc4c9; --panel:#1a212a; --grid:#2c3642; } }
           body { margin:0; min-height:100vh; display:grid; place-items:center; background:var(--bg); color:var(--fg);
                  font:15px/1.55 "Segoe UI", -apple-system, system-ui, sans-serif; }
           main { max-width:520px; margin:24px; padding:24px 28px; background:var(--panel); border:1px solid var(--grid); border-radius:8px; }
-          h1 { font-size:13px; letter-spacing:.14em; text-transform:uppercase; color:var(--dim); margin:0 0 14px; }
+          h1 { font-size:17px; font-weight:650; margin:0 0 14px; }
           .code { font:600 34px/1.2 ui-monospace, Consolas, monospace; letter-spacing:.12em; color:var(--sig); margin:18px 0; }
           .muted { color:var(--dim); } a { color:var(--sig); }
         </style></head>
-        <body><main><h1>RemoteCmd · {{System.Net.WebUtility.HtmlEncode(title)}}</h1>{{body}}</main></body></html>
+        <body><main><h1>{{System.Net.WebUtility.HtmlEncode(title)}}</h1>{{body}}</main></body></html>
         """;
 }

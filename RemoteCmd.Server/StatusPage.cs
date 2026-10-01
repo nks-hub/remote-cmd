@@ -13,18 +13,19 @@ public static class StatusPage
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>RemoteCmd relay</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='5.2' fill='none' stroke='%23c07a12' stroke-width='2.4'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='5.2' fill='none' stroke='%230e7c86' stroke-width='2.4'/%3E%3C/svg%3E">
 <style>
-  /* PHOSPHOR DECK — an amber dispatch desk. Warm graphite instead of slate, one amber accent, red
-     for broken, blue for transfers. Nothing else carries colour: "fine" is meant to be invisible.
-     At rest the only thing that moves on the page is the 14px poll heartbeat, so any motion in the
-     corner of the eye is a real event. */
+  /* PATCH PANEL — the colours of network cabling on brushed aluminium. Teal is "a signal is on
+     the line", cobalt is data moving, ochre is "this one needs an update", brick is broken.
+     Nothing else carries colour: "fine" is meant to be invisible. At rest the only thing that
+     moves on the page is the 14px poll heartbeat, so any motion in the corner of the eye is a
+     real event. */
   :root {
     color-scheme: light dark;
-    --bg:#f5f2ec; --panel:#fff; --raise:#ede8df; --grid:#dcd5c8; --grid-soft:#e8e2d6;
-    --fg:#181512; --dim:#6a6255; --faint:#9a9184;
-    --sig:#a85e00; --bad:#c0271a; --xfer:#2a4fbf;
-    --t0:22%; --t1:11%; --t2:5%;
+    --bg:#eef1f4; --panel:#fff; --raise:#e3e8ee; --grid:#cfd6de; --grid-soft:#e1e6ec;
+    --fg:#1b2430; --dim:#5b6878; --faint:#8d98a6;
+    --sig:#0e7c86; --bad:#c2412d; --xfer:#2f5bea; --warn:#a8670f;
+    --t0:20%; --t1:10%; --t2:4%;
     --gut: clamp(14px, 1.2vw, 32px);
     --rail: 46px;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", "Cascadia Mono", "Segoe UI Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
@@ -32,9 +33,9 @@ public static class StatusPage
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg:#0f0e0c; --panel:#15130f; --raise:#1d1a15; --grid:#2a2620; --grid-soft:#201d18;
-      --fg:#e6e0d4; --dim:#948c7c; --faint:#5d5648;
-      --sig:#ffae3b; --bad:#ff5747; --xfer:#7fa6ff;
+      --bg:#13181f; --panel:#1a212a; --raise:#222b36; --grid:#2c3642; --grid-soft:#222a34;
+      --fg:#e4e9ef; --dim:#8b97a6; --faint:#5c6878;
+      --sig:#3cc4c9; --bad:#ff7a63; --xfer:#7c9bff; --warn:#e2b04a;
       --t0:26%; --t1:12%; --t2:5%;
     }
   }
@@ -49,8 +50,7 @@ public static class StatusPage
   #rail { position:sticky; top:0; z-index:20; height:var(--rail); background:var(--bg);
           border-bottom:1px solid var(--grid); display:flex; align-items:center; gap:10px;
           padding-inline:var(--gut); }
-  .brand { font-size:11px; font-weight:600; letter-spacing:.16em; text-transform:uppercase;
-           white-space:nowrap; }
+  .brand { font-size:14px; font-weight:650; white-space:nowrap; }
   .brand i { font-style:normal; color:var(--faint); }
   #chips { display:flex; gap:8px; align-items:center; color:var(--dim); font-size:11px;
            white-space:nowrap; }
@@ -86,8 +86,9 @@ public static class StatusPage
   @media (min-width:900px)  { #deck { grid-template-columns:repeat(4,1fr); } }
   @media (min-width:1500px) { #deck { grid-template-columns:repeat(10,1fr); }
                               .kpi.hero { grid-column:span 2; } }
-  .kpi .lbl { font-size:10px; font-weight:600; letter-spacing:.13em; text-transform:uppercase;
-              color:var(--dim); display:flex; align-items:baseline; gap:6px; }
+  .kpi .lbl { font-size:12px; font-weight:600; color:var(--dim); display:flex; align-items:baseline; gap:6px; }
+  .kpi.warn { box-shadow:inset 2px 0 0 var(--warn); }
+  .kpi.warn .sub { color:var(--warn); font-weight:600; }
   .kpi .val { display:block; margin:7px 0 3px; font-family:var(--mono); font-weight:600;
               font-size:clamp(18px,1.1vw,22px); letter-spacing:-.01em; line-height:1; }
   .kpi.hero .val { font-size:clamp(28px,2.1vw,40px); letter-spacing:-.02em; }
@@ -138,16 +139,14 @@ public static class StatusPage
                                   border:1px solid var(--grid); max-height:none; overflow:visible; }
     .main.detail-open ~ #backdrop { display:none !important; }
   }
-  h2 { font-size:11px; text-transform:uppercase; letter-spacing:.16em; color:var(--dim);
-       margin:0 0 7px; display:flex; align-items:baseline; gap:10px; font-weight:600; }
+  h2 { font-size:14px; color:var(--fg); margin:0 0 7px; display:flex; align-items:baseline; gap:10px; font-weight:650; }
   h2 .n { color:var(--faint); letter-spacing:0; font-family:var(--mono); font-size:11px; }
   h2 .burst { color:var(--sig); font-family:var(--mono); letter-spacing:0; }
 
   table { border-collapse:collapse; width:100%; table-layout:fixed; }
   th, td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--grid-soft);
            vertical-align:top; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  th { color:var(--dim); font-size:10px; font-weight:600; letter-spacing:.11em;
-       text-transform:uppercase; background:var(--bg); }
+  th { color:var(--dim); font-size:11.5px; font-weight:600; background:var(--bg); }
   tr:last-child td { border-bottom:none; }
   #stream th { position:sticky; top:var(--rail); z-index:3; }
   #clientBox { max-height:min(46vh,560px); overflow:auto; border:1px solid var(--grid); }
@@ -180,6 +179,12 @@ public static class StatusPage
   #hist tr:focus-visible td { outline:1px solid var(--sig); outline-offset:-1px; }
 
   #tbl td.st { font-weight:600; }
+  #tbl td.who { white-space:normal; }
+  #tbl td.who b { display:block; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #tbl td.who small { display:block; color:var(--dim); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #tbl td.ver { color:var(--dim); }
+  #tbl td.ver.old { color:var(--warn); font-weight:600; }
+  #chips .warn { color:var(--warn); font-weight:600; }
   #tbl tr.stale td.st { color:var(--bad); }
   #tbl tr.stale td.gut { background:var(--bad); }
   #tbl tr.busy td.gut { background:var(--xfer); }
@@ -198,8 +203,7 @@ public static class StatusPage
   #dclose { cursor:pointer; }
   .kv { display:grid; grid-template-columns:auto 1fr; gap:3px 16px; margin-bottom:12px; }
   .kv span { color:var(--dim); }
-  .dlabel { font-family:var(--face); font-size:10px; text-transform:uppercase; letter-spacing:.13em;
-            color:var(--dim); margin:12px 0 5px; font-weight:600; }
+  .dlabel { font-family:var(--face); font-size:12px; color:var(--dim); margin:12px 0 5px; font-weight:600; }
   pre { margin:0; padding:9px 10px; background:var(--raise); border:1px solid var(--grid);
         border-radius:4px; white-space:pre-wrap; word-break:break-word; max-height:38vh; overflow:auto;
         font-size:12px; line-height:1.5; }
@@ -253,20 +257,20 @@ public static class StatusPage
 
 <div class="main" id="main">
   <section id="stream">
-    <h2>Stream <span class="n" id="count"></span><span class="burst" id="burst"></span></h2>
+    <h2>Activity <span class="n" id="count"></span><span class="burst" id="burst"></span></h2>
     <div id="streamBox"><table id="hist">
       <colgroup><col style="width:3px"><col style="width:84px"><col style="width:54px"><col style="width:132px"><col></colgroup>
-      <thead><tr><th class="gut"></th><th>time</th><th>event</th><th>client</th><th>detail</th></tr></thead>
+      <thead><tr><th class="gut"></th><th>Time</th><th>Event</th><th>Machine</th><th>Detail</th></tr></thead>
       <tbody></tbody>
     </table></div>
     <div class="empty" id="noevents" hidden>nothing yet</div>
   </section>
 
   <aside id="clients">
-    <h2>Clients <span class="n" id="ccount"></span></h2>
+    <h2>Machines <span class="n" id="ccount"></span></h2>
     <div id="clientBox"><table id="tbl">
-      <colgroup><col style="width:3px"><col><col style="width:74px"><col style="width:46px"><col style="width:42px"><col style="width:40px"></colgroup>
-      <thead><tr><th class="gut"></th><th>name</th><th>state</th><th>last</th><th>r/q</th><th>srv</th></tr></thead>
+      <colgroup><col style="width:3px"><col><col style="width:62px"><col style="width:74px"><col style="width:46px"><col style="width:42px"></colgroup>
+      <thead><tr><th class="gut"></th><th>Machine</th><th>Version</th><th>State</th><th>Last</th><th title="running / queued">r/q</th></tr></thead>
       <tbody></tbody>
     </table></div>
     <div class="empty" id="noclients" hidden>no clients registered</div>
@@ -647,14 +651,14 @@ function renderHistogram(eventCount) {
 
 // ---------------------------------------------------------------- KPI deck
 const KPIS = [
-  { k: 'link', label: 'link', hero: true },
-  { k: 'now', label: 'now', hero: true, spark: true },
-  { k: 'exec', label: 'exec', delta: true },
-  { k: 'tmo', label: 'timeout rate', delta: true },
-  { k: 'xfer', label: 'transfers' },
-  { k: 'vol', label: 'volume' },
-  { k: 'auth', label: 'auth', delta: true },
-  { k: 'relay', label: 'relay' },
+  { k: 'link', label: 'Online', hero: true },
+  { k: 'now', label: 'Running now', hero: true, spark: true },
+  { k: 'exec', label: 'Commands', delta: true },
+  { k: 'tmo', label: 'Timeout rate', delta: true },
+  { k: 'xfer', label: 'Transfers' },
+  { k: 'vol', label: 'Volume' },
+  { k: 'auth', label: 'Refused', delta: true },
+  { k: 'relay', label: 'Relay' },
 ];
 const tiles = {};
 let prev = null;
@@ -699,6 +703,7 @@ function setTile(k, value, sub, opts) {
   if (sub !== null) t.sub.replaceChildren(txt(sub));
   t.box.classList.toggle('alarm', !!o.alarm);
   t.box.classList.toggle('quiet', !!o.quiet);
+  t.box.classList.toggle('warn', !!o.warn);
   // Flashing four numbers every three seconds is exactly what people stop looking at, so only the
   // three tiles that mean something get it, and only when the value really moved.
   if (changed && o.flash && !REDUCE) {
@@ -774,7 +779,11 @@ function renderDeck(clients, info) {
 
   // The tile is one tenth of the deck, so the token count lives in the rail and the tooltip; only
   // the transport, which is the part that can be wrong, gets the line.
-  setTile('relay', dur(info.uptimeSeconds), info.tls ? 'TLS' : 'PLAIN HTTP', { quiet: false });
+  setTile('relay', `v${info.version}`,
+    info.outdated ? `update to v${info.latest}`
+      : !info.latest ? 'release unknown (offline?)'
+      : info.latest === info.version ? 'latest release' : `release is v${info.latest}`,
+    { quiet: false, warn: !!info.outdated });
   tiles.relay.sub.classList.toggle('bad', !info.tls);
   tiles.relay.box.title = `${info.tokens} token(s) accepted · up ${dur(info.uptimeSeconds)}`;
 
@@ -843,7 +852,7 @@ function renderSessions(clients) {
   const tbody = document.querySelector('#tbl tbody');
   // secondsAgo is deliberately NOT in the signature: it changes every second and would rebuild the
   // rows out from under a click. The baseline it feeds is refreshed separately, below.
-  const signature = JSON.stringify(clients.clients.map((c) => [c.id, c.name, c.state, c.running, c.queued, c.served, c.token, c.ip]));
+  const signature = JSON.stringify(clients.clients.map((c) => [c.id, c.name, c.state, c.running, c.queued, c.served, c.token, c.ip, c.host, c.user, c.version, c.outdated]));
   $('ccount').textContent = clients.count ? `${clients.connected} online` : '';
   $('noclients').hidden = clients.count > 0;
   $('clientBox').hidden = clients.count === 0;
@@ -859,14 +868,21 @@ function renderSessions(clients) {
     if (prevStates && prevStates.get(c.id) && prevStates.get(c.id) !== c.state) tr.classList.add('changed');
     const arrow = c.state === 'upload' ? '↑ upload' : c.state === 'download' ? '↓ download' : c.state;
     const last = cell('—', 'lp');
-    tr.append(
-      cell('', 'gut'), cell(c.name), cell(arrow, 'st'), last,
-      cell(`${c.running}/${c.queued}`), cell(c.served),
-    );
+    // The alias on top, the real host and account beneath: two machines both called "build" are
+    // still told apart at a glance.
+    const who = el('td', 'who');
+    who.append(el('b', '', c.name));
+    const host = [c.host, c.user].filter(Boolean).join(' \\ ');
+    if (host && flat(host) !== flat(c.name)) who.append(el('small', '', host));
+    const ver = cell(c.version ? `v${c.version}` : '—', c.outdated ? 'ver old' : 'ver');
+    if (c.outdated) ver.title = 'A newer release is available';
+    tr.append(cell('', 'gut'), who, ver, cell(arrow, 'st'), last, cell(`${c.running}/${c.queued}`));
     // The rail is narrow; the fields that are read once a day rather than once a minute live here.
-    // The name is chosen on the client machine, so its newlines are flattened rather than allowed to
-    // forge extra lines in the tooltip.
-    tr.title = `${flat(c.name)}\nid ${c.id}\naddress ${c.ip || 'unknown'}\ntoken ${c.token}\nconnected ${dur(c.connectedForSeconds)}`;
+    // Everything here comes from the client machine, so newlines are flattened rather than allowed
+    // to forge extra lines in the tooltip.
+    tr.title = `${flat(c.name)}\nhost ${flat(c.host || 'unknown')}\nuser ${flat(c.user || 'unknown')}\nsystem ${flat(c.os || 'unknown')}` +
+      `\nversion ${flat(c.version || 'unknown')}\nid ${c.id}\naddress ${c.ip || 'unknown'}\ncredential ${c.token}` +
+      `\ncommands served ${c.served}\nconnected ${dur(c.connectedForSeconds)}`;
     tbody.append(tr);
     clientAges.push({ id: c.id, td: last, base: c.secondsAgo, at: Date.now() });
   }
@@ -1167,9 +1183,13 @@ function renderChips(info) {
   c.replaceChildren(
     el('span', '', `up ${dur(info.uptimeSeconds)}`),
     el('span', 'sep'),
-    el('span', info.tls ? '' : 'bad', info.tls ? 'TLS' : 'PLAIN HTTP'),
+    el('span', info.tls ? '' : 'bad', info.tls ? 'TLS' : 'plain HTTP'),
     el('span', 'sep'),
-    el('span', '', `${info.tokens} token(s)`),
+    el('span', '', `${info.tokens} credential(s)`),
+    el('span', 'sep'),
+    info.outdated
+      ? el('span', 'warn', `v${info.version}, v${info.latest} available`)
+      : el('span', '', info.latest === info.version ? `v${info.version}, up to date` : `v${info.version}`),
   );
 }
 

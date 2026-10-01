@@ -11,37 +11,40 @@ public static class AdminPage
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='5.2' fill='none' stroke='%23c07a12' stroke-width='2.4'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='5.2' fill='none' stroke='%230e7c86' stroke-width='2.4'/%3E%3C/svg%3E">
 <style>
   :root {
     color-scheme: light dark;
-    --bg:#f5f2ec; --panel:#fff; --raise:#ede8df; --grid:#dcd5c8;
-    --fg:#181512; --dim:#6a6255; --faint:#9a9184; --sig:#a85e00; --bad:#c0271a;
+    --bg:#eef1f4; --panel:#fff; --raise:#e3e8ee; --grid:#cfd6de;
+    --fg:#1b2430; --dim:#5b6878; --faint:#8d98a6; --sig:#0e7c86; --bad:#c2412d;
     --gut: clamp(14px, 1.2vw, 32px);
     --mono: ui-monospace, SFMono-Regular, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
     --face: "Segoe UI Variable Text", "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, system-ui, sans-serif;
   }
   @media (prefers-color-scheme: dark) {
-    :root { --bg:#0f0e0c; --panel:#15130f; --raise:#1d1a15; --grid:#2a2620;
-            --fg:#e6e0d4; --dim:#948c7c; --faint:#5d5648; --sig:#ffae3b; --bad:#ff5747; }
+    :root { --bg:#13181f; --panel:#1a212a; --raise:#222b36; --grid:#2c3642;
+            --fg:#e4e9ef; --dim:#8b97a6; --faint:#5c6878; --sig:#3cc4c9; --bad:#ff7a63; }
   }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.5 var(--face); }
   header { position:sticky; top:0; display:flex; align-items:center; gap:12px; height:46px;
            padding-inline:var(--gut); border-bottom:1px solid var(--grid); background:var(--bg); }
-  .brand { font-size:11px; font-weight:600; letter-spacing:.16em; text-transform:uppercase; }
+  .brand { font-size:14px; font-weight:650; }
   .brand i { font-style:normal; color:var(--faint); }
   .grow { flex:1; }
   main { max-width:980px; padding:16px var(--gut) 48px; display:grid; gap:18px; }
   section { background:var(--panel); border:1px solid var(--grid); border-radius:6px; padding:14px 16px; }
-  h2 { margin:0 0 10px; font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--dim); }
+  h2 { margin:0 0 8px; font-size:15px; font-weight:650; }
   p { margin:0 0 10px; color:var(--dim); }
   input, select, button, .btn { font:inherit; padding:6px 10px; border:1px solid var(--grid); border-radius:4px;
                                 background:var(--panel); color:var(--fg); }
   button, .btn { cursor:pointer; text-decoration:none; }
-  button.primary { background:var(--sig); border-color:var(--sig); color:#fff; }
+  button.primary { background:var(--sig); border-color:var(--sig); color:#fff; font-weight:600; }
+  @media (prefers-color-scheme: dark) { button.primary { color:#0b2224; } }
+  :focus-visible { outline:2px solid var(--sig); outline-offset:2px; }
   button.danger { color:var(--bad); }
   .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .row input:not([type=checkbox]) { min-width:min(280px, 100%); }
   .code { font:600 28px/1.2 var(--mono); letter-spacing:.12em; color:var(--sig); }
   pre { margin:4px 0 10px; padding:8px 10px; background:var(--raise); border-radius:4px; font:12px/1.45 var(--mono);
         white-space:pre-wrap; word-break:break-all; }
@@ -119,10 +122,7 @@ document.getElementById('f').addEventListener('submit', async (e) => {
        until you approve it. Check that the code matches the one on the agent's page.</p>
     <div id="oauthPending"><p class="muted">No agent is waiting.</p></div>
     <p style="margin-top:12px">Add the relay to Claude Code:</p>
-    <div class="row"><b>From this machine</b></div>
-    <pre id="mcpLocal"></pre>
-    <div class="row"><b>From another machine</b></div>
-    <pre id="mcpRemote"></pre>
+    <div id="mcpCmds"></div>
   </section>
 
   <section>
@@ -228,8 +228,16 @@ async function loadPending() {
 async function loadInfo() {
   const info = await api('/api/admin/info');
   $('ver').textContent = `v${info.version}`;
-  $('mcpLocal').textContent = `claude mcp add --transport http remote-cmd http://localhost:${info.adminPort}/mcp`;
-  $('mcpRemote').textContent = `claude mcp add --transport http remote-cmd ${info.publicUrl}/mcp`;
+  const mcp = [
+    ['From this machine', `claude mcp add --transport http remote-cmd http://localhost:${info.adminPort}/mcp`],
+    [info.tls ? 'From another machine (it must trust the relay's self-signed certificate)' : 'From another machine',
+     `claude mcp add --transport http remote-cmd ${info.publicUrl}/mcp`],
+  ];
+  $('mcpCmds').replaceChildren(...mcp.flatMap(([label, cmd]) => {
+    const row = el('div', null, 'row');
+    row.append(el('b', label), copyButton(cmd));
+    return [row, el('pre', cmd)];
+  }));
   $('url').value = info.publicUrl;
   $('urlNote').textContent = info.publicUrlSet ? '' : '(guessed — save it if machines reach the relay by another address)';
   $('tlsNote').textContent = info.tls

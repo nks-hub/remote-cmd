@@ -100,6 +100,8 @@ var events = new EventLog();
 var commands = new CommandLog();
 var stats = new RelayStats();
 var authThrottle = new AuthThrottle();
+var releases = new ReleaseCheck();
+releases.Start(app.Lifetime.ApplicationStopping);
 
 var protocol = noTls ? "http" : "https";
 Console.WriteLine($"=== Remote CMD Relay Server {RemoteCmd.Shared.VersionInfo.Version} ===");
@@ -534,7 +536,12 @@ object ClientList()
             queued = c.CommandQueue.Count,
             served = Interlocked.Read(ref c.CommandsServed),
             state = !c.Uploads.Idle ? "upload" : !c.Downloads.Idle ? "download" : c.IsConnected() ? "idle" : "stale",
-            connectedForSeconds = (int)(DateTime.UtcNow - c.ConnectedSince).TotalSeconds
+            connectedForSeconds = (int)(DateTime.UtcNow - c.ConnectedSince).TotalSeconds,
+            host = c.HostName,
+            user = c.User,
+            os = c.Os,
+            version = c.Version,
+            outdated = releases.IsOutdated(c.Version),
         }).ToList();
     return new { count = list.Count, connected = list.Count(x => x.connected), clients = list };
 }
@@ -609,6 +616,9 @@ app.MapGet("/api/events", (HttpRequest req) =>
         uptimeSeconds = (int)(DateTime.UtcNow - startedUtc).TotalSeconds,
         tls = !noTls,
         tokens = store.Count,
+        version = RemoteCmd.Shared.VersionInfo.Version,
+        latest = releases.Latest,
+        outdated = releases.IsOutdated(RemoteCmd.Shared.VersionInfo.Version),
         stats = stats.Snapshot(),
         events = recent,
     });
@@ -720,6 +730,9 @@ static async Task RejectAsync(HttpContext context, AuthThrottle throttle, RelayS
     await context.Response.WriteAsync(throttled ? "Too many failed attempts" : message);
 }
 
+/// <summary>Client-supplied text, kept to a sane length for the dashboard.</summary>
+static string Clip(string value) => value.Length <= 160 ? value : value[..160];
+
 static bool IsMcpPath(string path)
     => path.Equals("/mcp", StringComparison.OrdinalIgnoreCase)
        || path.StartsWith("/oauth/", StringComparison.OrdinalIgnoreCase)
@@ -813,6 +826,12 @@ static ClientSession TouchSession(HttpRequest req, ConcurrentDictionary<string, 
         }
         session.Name = name;
     }
+    // Reported by clients from 2.6 on; older ones send nothing and keep what is known.
+    var q = req.Query;
+    if (q["v"].FirstOrDefault() is { Length: > 0 } version) session.Version = Clip(version);
+    if (q["host"].FirstOrDefault() is { Length: > 0 } host) session.HostName = Clip(host);
+    if (q["user"].FirstOrDefault() is { Length: > 0 } user) session.User = Clip(user);
+    if (q["os"].FirstOrDefault() is { Length: > 0 } os) session.Os = Clip(os);
     session.LastPoll = DateTime.UtcNow;
     return session;
 }
@@ -945,6 +964,10 @@ public class ClientSession
     public DateTime ConnectedSince { get; set; } = DateTime.UtcNow;
     public string TokenLabel { get; set; } = "";  // masked token this client authenticates with
     public string CredentialId { get; set; } = "";
+    public string Version { get; set; } = "";
+    public string HostName { get; set; } = "";
+    public string User { get; set; } = "";
+    public string Os { get; set; } = "";
     public string RemoteIp { get; set; } = "";    // address the client last polled from
     public long CommandsServed;   // total results delivered; mutable field for Interlocked
 

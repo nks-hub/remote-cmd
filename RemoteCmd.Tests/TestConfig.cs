@@ -10,6 +10,8 @@ public static class TestConfig
     {
         var path = Path.Combine(Path.GetTempPath(), "remotecmd-tests", Guid.NewGuid().ToString("N"), "server.json");
         Environment.SetEnvironmentVariable("REMOTECMD_CONFIG", path);
+        // Tests must not depend on reaching GitHub.
+        Environment.SetEnvironmentVariable("REMOTECMD_NO_UPDATE_CHECK", "1");
         return path;
     }
 }

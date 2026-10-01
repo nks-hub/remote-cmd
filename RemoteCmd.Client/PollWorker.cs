@@ -45,7 +45,7 @@ public sealed class PollWorker : BackgroundService
         var clientId = ResolveClientId(_config.Name);
         // The token goes in a header, not the query string: URLs end up in server access logs,
         // proxy logs and error pages, and a leaked one is remote code execution.
-        var qs = $"?clientId={clientId}&name={Uri.EscapeDataString(_config.Name)}";
+        var qs = $"?clientId={clientId}&name={Uri.EscapeDataString(_config.Name)}&{MachineInfo.Query()}";
 
         var pollUrl = $"{baseUrl}/api/poll{qs}";
         var resultUrl = $"{baseUrl}/api/result{qs}";

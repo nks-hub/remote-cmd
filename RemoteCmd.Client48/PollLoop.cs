@@ -31,7 +31,12 @@ namespace RemoteCmd.Client48
             var baseUrl = config.BaseUrl;
             var clientId = ResolveClientId(config.Name);
             // Token travels in a header — query strings land in access and proxy logs.
-            var qs = "?clientId=" + clientId + "&name=" + Uri.EscapeDataString(config.Name);
+            // Who and what this is, for the relay's dashboard; relays that do not know the fields ignore them.
+            var qs = "?clientId=" + clientId + "&name=" + Uri.EscapeDataString(config.Name)
+                     + "&v=" + Uri.EscapeDataString(typeof(PollLoop).Assembly.GetName().Version.ToString(3))
+                     + "&host=" + Uri.EscapeDataString(Environment.MachineName)
+                     + "&user=" + Uri.EscapeDataString(Environment.UserName)
+                     + "&os=" + Uri.EscapeDataString(Environment.OSVersion.VersionString + " (.NET Framework)");
 
             var pollUrl = baseUrl + "/api/poll" + qs;
             var resultUrl = baseUrl + "/api/result" + qs;
