@@ -1,8 +1,12 @@
 /// <summary>
-/// Single-file status page, served by the loopback dashboard listener at / and /ui. It carries no
-/// data itself and reads everything from the JSON endpoints; the dashboard's own session (or no
-/// session at all, without a password) is what lets those answer.
-/// Everything on it is built from text nodes — no markup is ever assembled from relay data.
+/// The dashboard's main page, served by the loopback dashboard listener at / and /ui. Machines come
+/// first, as a panel of ports: each shows whether it is on the line, what it really is (host,
+/// account, system) and whether its client is current. Under them a command line runs something on
+/// any machine directly, and the activity log below can be narrowed to one machine with a click.
+///
+/// It carries no data itself and reads everything from the JSON endpoints. Everything on it is built
+/// from text nodes — no markup is ever assembled from relay data, all of which comes from machines
+/// someone else controls.
 /// </summary>
 public static class StatusPage
 {
@@ -13,1251 +17,554 @@ public static class StatusPage
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>RemoteCmd relay</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='5.2' fill='none' stroke='%230e7c86' stroke-width='2.4'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='2' y='4' width='12' height='8' rx='2' fill='none' stroke='%230e7c86' stroke-width='2'/%3E%3Ccircle cx='6' cy='8' r='1.3' fill='%230e7c86'/%3E%3Ccircle cx='10' cy='8' r='1.3' fill='%230e7c86'/%3E%3C/svg%3E">
 <style>
-  /* PATCH PANEL — the colours of network cabling on brushed aluminium. Teal is "a signal is on
-     the line", cobalt is data moving, ochre is "this one needs an update", brick is broken.
-     Nothing else carries colour: "fine" is meant to be invisible. At rest the only thing that
-     moves on the page is the 14px poll heartbeat, so any motion in the corner of the eye is a
-     real event. */
+  /* PATCH PANEL — machines are ports on a panel, each with its own status light. Teal: on the line.
+     Cobalt: data moving. Ochre: needs an update. Brick: lost or failed. Nothing else carries colour,
+     so a glance down the panel shows only what needs attention. */
   :root {
     color-scheme: light dark;
-    --bg:#eef1f4; --panel:#fff; --raise:#e3e8ee; --grid:#cfd6de; --grid-soft:#e1e6ec;
+    --bg:#eef1f4; --panel:#fff; --raise:#e3e8ee; --grid:#cfd6de; --soft:#e4e9ee;
     --fg:#1b2430; --dim:#5b6878; --faint:#8d98a6;
-    --sig:#0e7c86; --bad:#c2412d; --xfer:#2f5bea; --warn:#a8670f;
-    --t0:20%; --t1:10%; --t2:4%;
-    --gut: clamp(14px, 1.2vw, 32px);
-    --rail: 46px;
-    --mono: ui-monospace, SFMono-Regular, "SF Mono", "Cascadia Mono", "Segoe UI Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+    --on:#0e7c86; --xfer:#2f5bea; --warn:#a8670f; --bad:#c2412d;
+    --onText:#fff;
+    --mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
     --face: "Segoe UI Variable Text", "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, system-ui, sans-serif;
+    --gut: clamp(14px, 2vw, 32px);
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg:#13181f; --panel:#1a212a; --raise:#222b36; --grid:#2c3642; --grid-soft:#222a34;
+      --bg:#13181f; --panel:#1a212a; --raise:#222b36; --grid:#2c3642; --soft:#222a34;
       --fg:#e4e9ef; --dim:#8b97a6; --faint:#5c6878;
-      --sig:#3cc4c9; --bad:#ff7a63; --xfer:#7c9bff; --warn:#e2b04a;
-      --t0:26%; --t1:12%; --t2:5%;
+      --on:#3cc4c9; --xfer:#7c9bff; --warn:#e2b04a; --bad:#ff7a63;
+      --onText:#0b2224;
     }
   }
-  * { box-sizing: border-box; }
-  body { margin:0; padding:0; background:var(--bg); color:var(--fg);
-         font:12.5px/1.45 var(--mono); }
-  /* Two voices: anything the relay said is monospace, anything the developer wrote is the UI face. */
-  .lbl, h2, th, button, label, .brand { font-family:var(--face); }
-  b, .val, td, input, select { font-variant-numeric: tabular-nums; }
-
-  /* ---------- A. header rail ---------- */
-  #rail { position:sticky; top:0; z-index:20; height:var(--rail); background:var(--bg);
-          border-bottom:1px solid var(--grid); display:flex; align-items:center; gap:10px;
-          padding-inline:var(--gut); }
-  .brand { font-size:14px; font-weight:650; white-space:nowrap; }
-  .brand i { font-style:normal; color:var(--faint); }
-  #chips { display:flex; gap:8px; align-items:center; color:var(--dim); font-size:11px;
-           white-space:nowrap; }
-  #chips .sep { width:1px; height:16px; background:var(--grid); }
-  #chips .bad { color:var(--bad); }
-  .grow { flex:1 1 auto; }
-  #beat { display:flex; align-items:center; gap:6px; color:var(--dim); font-size:11px;
-          white-space:nowrap; }
-  #ring { stroke:var(--sig); }
-  #ring.dead { stroke:var(--bad); }
-  #ring.paused { stroke:var(--faint); }
-  #rail input, #rail select, #gate input, #gate button, #dclose, .btn {
-    text-decoration:none;
-    font:inherit; font-family:var(--face); font-size:12px; padding:5px 8px;
-    background:var(--panel); color:var(--fg); border:1px solid var(--grid); border-radius:4px; }
-  #rail label { color:var(--dim); display:flex; align-items:center; gap:5px; font-size:12px; }
-  #q { min-width:220px; flex:0 1 300px; }
-  @media (max-width: 1100px) { #chips { display:none; } }
-  @media (max-width: 760px) { #rail { height:auto; padding-block:8px; flex-wrap:wrap; } }
-
-  /* ---------- gate ---------- */
-  #gate { display:flex; gap:8px; align-items:center; padding:16px var(--gut); flex-wrap:wrap; }
-  #gate input { min-width:280px; padding:8px 10px; }
-  #gate button { padding:8px 16px; cursor:pointer; }
-  #gate .err { color:var(--bad); }
-
-  /* ---------- B. KPI deck ---------- */
-  #deckWrap { padding:12px var(--gut); }
-  /* Hairlines are grid gaps, not borders — no doubled-up rules between tiles. */
-  #deck { display:grid; gap:1px; background:var(--grid); border:1px solid var(--grid); }
-  .kpi { background:var(--panel); padding:9px 13px 10px; min-width:0; position:relative; }
-  @media (max-width:899px)  { #deck { grid-template-columns:repeat(2,1fr); } }
-  @media (min-width:900px)  { #deck { grid-template-columns:repeat(4,1fr); } }
-  @media (min-width:1500px) { #deck { grid-template-columns:repeat(10,1fr); }
-                              .kpi.hero { grid-column:span 2; } }
-  .kpi .lbl { font-size:12px; font-weight:600; color:var(--dim); display:flex; align-items:baseline; gap:6px; }
-  .kpi.warn { box-shadow:inset 2px 0 0 var(--warn); }
-  .kpi.warn .sub { color:var(--warn); font-weight:600; }
-  .kpi .val { display:block; margin:7px 0 3px; font-family:var(--mono); font-weight:600;
-              font-size:clamp(18px,1.1vw,22px); letter-spacing:-.01em; line-height:1; }
-  .kpi.hero .val { font-size:clamp(28px,2.1vw,40px); letter-spacing:-.02em; }
-  .kpi .sub { font-size:11px; color:var(--dim); min-height:16px; display:block;
-              overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .kpi .chip { font-size:11px; font-weight:600; color:var(--sig); margin-left:auto; }
-  .kpi.alarm { box-shadow:inset 2px 0 0 var(--bad); }
-  .kpi.alarm .val { color:var(--bad); }
-  .kpi.quiet .val, .kpi.quiet .sub { color:var(--faint); }
-  .val.flash { animation:flash 320ms ease-out; }
-  @keyframes flash { from { color:var(--sig); } to { color:inherit; } }
-  .chip.rise { animation:rise 140ms ease-out; }
-  @keyframes rise { from { opacity:0; transform:translateX(6px); } to { opacity:1; transform:none; } }
-  #spark { display:block; width:100%; height:14px; }
-  #spark polyline { fill:none; stroke:var(--sig); stroke-width:1.4; vector-effect:non-scaling-stroke; }
-  #dismiss { border:0; background:none; color:var(--bad); font-size:11px; cursor:pointer;
-             padding:0; text-decoration:underline; font-family:var(--face); }
-
-  /* ---------- C. activity ---------- */
-  #activity { padding:0 var(--gut) 4px; }
-  #actHead { display:flex; align-items:baseline; gap:10px; }
-  /* The baseline keeps the panel legible when the window is quiet and there is nothing to draw. */
-  #histo { display:block; width:100%; height:76px; border-bottom:1px solid var(--grid); }
-  @media (max-width:899px) { #histo { height:52px; } }
-  /* Pre-allocated rects: a transition only fires on a node that already had a computed value, so
-     the bars are created once and only their geometry is rewritten. */
-  #histo rect.bar { transition: y 300ms ease-out, height 300ms ease-out; }
-  #histo rect.blind { fill:var(--faint); opacity:.10; }
-  #histo line.edge { stroke:var(--grid); stroke-width:1; vector-effect:non-scaling-stroke; }
-  .ch-fault { fill:var(--bad); } .ch-exec { fill:var(--sig); } .ch-xfer { fill:var(--xfer); }
-  .ch-conn { fill:var(--dim); } .ch-gc { fill:var(--faint); }
-  #histNote { color:var(--faint); font-size:11px; padding-top:2px; display:flex; gap:14px;
-              flex-wrap:wrap; }
-  #histNote i { font-style:normal; }
-  #histNote .key::before { content:"\2588"; margin-right:4px; }
-  .key.fault { color:var(--bad); } .key.exec { color:var(--sig); } .key.xfer { color:var(--xfer); }
-
-  /* ---------- D. main ---------- */
-  .main { display:grid; gap:var(--gut); padding:10px var(--gut) 40px; align-items:start;
-          grid-template-columns:minmax(0,1fr); }
-  @media (min-width:1280px) { .main { grid-template-columns:minmax(0,1fr) clamp(340px,22vw,420px); } }
-  /* A hidden grid item still holds its track, so the third column only exists while a command is
-     actually selected. */
-  @media (min-width:2200px) {
-    /* Column order follows the DOM: stream, client rail, detail. The output is the wide one. */
-    .main.detail-open { grid-template-columns:minmax(0,1fr) clamp(340px,14vw,420px) clamp(480px,24vw,680px); }
-    .main.detail-open > #detail { position:static; width:auto; inset:auto; box-shadow:none;
-                                  border:1px solid var(--grid); max-height:none; overflow:visible; }
-    .main.detail-open ~ #backdrop { display:none !important; }
-  }
-  h2 { font-size:14px; color:var(--fg); margin:0 0 7px; display:flex; align-items:baseline; gap:10px; font-weight:650; }
-  h2 .n { color:var(--faint); letter-spacing:0; font-family:var(--mono); font-size:11px; }
-  h2 .burst { color:var(--sig); font-family:var(--mono); letter-spacing:0; }
-
-  table { border-collapse:collapse; width:100%; table-layout:fixed; }
-  th, td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--grid-soft);
-           vertical-align:top; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  th { color:var(--dim); font-size:11.5px; font-weight:600; background:var(--bg); }
-  tr:last-child td { border-bottom:none; }
-  #stream th { position:sticky; top:var(--rail); z-index:3; }
-  #clientBox { max-height:min(46vh,560px); overflow:auto; border:1px solid var(--grid); }
-  #clientBox th { position:sticky; top:0; z-index:2; }
-  #streamBox { border:1px solid var(--grid); }
-
-  td.msg { white-space:normal; }
-  /* Three lines, and the full text is on the cell's tooltip: a command cut mid-path is worth
-     nothing to whoever is reading the history. */
-  td.msg > div { display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical;
-                 overflow:hidden; max-width:140ch; word-break:break-word; }
-  td.ts, td.tag { color:var(--dim); }
-  td.tag { font-weight:600; letter-spacing:.05em; }
-  .gut { width:3px; padding:0; border-bottom:none; }
-
-  #hist tr[data-id] { cursor:pointer; }
-  #hist tr[data-id]:hover td { background:var(--raise); }
-  #hist tr.sel td { background:var(--raise); }
-  #hist tr.sel td.ts { box-shadow:inset 2px 0 0 var(--sig); }
-  /* Age is four static buckets recomputed on every repaint — a fade would say "just arrived" and
-     then make everything identical, which is useless to anyone glancing over after four minutes. */
-  #hist tr[data-age="0"] td { background:color-mix(in oklab, var(--heat) var(--t0), transparent);
-                              box-shadow:inset 0 1px 0 color-mix(in oklab, var(--heat) 30%, transparent); }
-  #hist tr[data-age="0"] td.ts { box-shadow:inset 2px 0 0 var(--heat); }
-  #hist tr[data-age="1"] td { background:color-mix(in oklab, var(--heat) var(--t1), transparent); }
-  #hist tr[data-age="1"] td.ts { box-shadow:inset 2px 0 0 color-mix(in oklab, var(--heat) 45%, transparent); }
-  #hist tr[data-age="2"] td { background:color-mix(in oklab, var(--heat) var(--t2), transparent); }
-  #hist tr.in { animation:rowIn 160ms ease-out backwards; }
-  @keyframes rowIn { from { opacity:0; transform:translateY(-4px); } to { opacity:1; transform:none; } }
-  #hist tr:focus-visible td { outline:1px solid var(--sig); outline-offset:-1px; }
-
-  #tbl td.st { font-weight:600; }
-  #tbl td.who { white-space:normal; }
-  #tbl td.who b { display:block; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  #tbl td.who small { display:block; color:var(--dim); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  #tbl td.ver { color:var(--dim); }
-  #tbl td.ver.old { color:var(--warn); font-weight:600; }
-  #chips .warn { color:var(--warn); font-weight:600; }
-  #tbl tr.stale td.st { color:var(--bad); }
-  #tbl tr.stale td.gut { background:var(--bad); }
-  #tbl tr.busy td.gut { background:var(--xfer); }
-  #tbl tr.idle td.gut { background:var(--grid); }
-  #tbl td.late { color:var(--dim); font-style:italic; }
-  #tbl td.dead { color:var(--bad); }
-  #tbl tr.changed td { animation:wash 900ms ease-out; }
-  @keyframes wash { from { background:var(--raise); } to { background:transparent; } }
-
-  .empty { color:var(--faint); padding:10px 2px; }
-  #backdrop { position:fixed; inset:0; background:rgba(0,0,0,.35); border:0; padding:0; z-index:30; }
-  #detail { position:fixed; top:0; right:0; bottom:0; width:min(660px,96vw); overflow:auto; z-index:31;
-            background:var(--panel); border-left:1px solid var(--grid); padding:14px 16px 32px;
-            box-shadow:-10px 0 26px rgba(0,0,0,.22); }
-  .dhead { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:12px; }
-  #dclose { cursor:pointer; }
-  .kv { display:grid; grid-template-columns:auto 1fr; gap:3px 16px; margin-bottom:12px; }
-  .kv span { color:var(--dim); }
-  .dlabel { font-family:var(--face); font-size:12px; color:var(--dim); margin:12px 0 5px; font-weight:600; }
-  pre { margin:0; padding:9px 10px; background:var(--raise); border:1px solid var(--grid);
-        border-radius:4px; white-space:pre-wrap; word-break:break-word; max-height:38vh; overflow:auto;
-        font-size:12px; line-height:1.5; }
-  .note { color:var(--sig); margin-bottom:10px; }
-  .ok { color:var(--dim); } .bad { color:var(--bad); }
-  #agentBar { display:block; padding:10px var(--gut); background:var(--sig); color:#fff; font-family:var(--face);
-              font-weight:600; text-decoration:none; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 var(--face); }
+  button, input, select { font:inherit; color:inherit; }
+  :focus-visible { outline:2px solid var(--on); outline-offset:2px; }
   [hidden] { display:none !important; }
+  .mono { font-family:var(--mono); }
+  .dim { color:var(--dim); }
 
-  @media (prefers-reduced-motion: reduce) {
-    *, *::before, *::after { animation-duration:.01ms !important; animation-iteration-count:1 !important;
-                             transition-duration:.01ms !important; }
+  /* ---------- header ---------- */
+  header { position:sticky; top:0; z-index:20; display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+           padding:10px var(--gut); background:var(--bg); border-bottom:1px solid var(--grid); }
+  .brand { font-weight:700; font-size:16px; letter-spacing:-.01em; }
+  #relayLine { color:var(--dim); font-size:13px; display:flex; gap:12px; flex-wrap:wrap; }
+  #relayLine .warn { color:var(--warn); font-weight:600; }
+  #relayLine .bad { color:var(--bad); font-weight:600; }
+  .grow { flex:1; }
+  .btn { padding:7px 12px; border:1px solid var(--grid); border-radius:6px; background:var(--panel); color:var(--fg);
+         text-decoration:none; cursor:pointer; white-space:nowrap; }
+  .btn:hover { border-color:var(--dim); }
+  .btn.go { background:var(--on); border-color:var(--on); color:var(--onText); font-weight:600; }
+  #beat { width:9px; height:9px; border-radius:50%; background:var(--faint); }
+  #beat.live { background:var(--on); }
+  #beat.dead { background:var(--bad); }
+  #agentBar { display:block; padding:11px var(--gut); background:var(--on); color:var(--onText); font-weight:600;
+              text-decoration:none; }
+
+  main { padding:18px var(--gut) 48px; display:grid; gap:26px; }
+  h2 { margin:0; font-size:17px; font-weight:650; }
+  .secHead { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:10px; }
+  .secHead .dim { font-size:13px; }
+
+  /* ---------- machines: the panel ---------- */
+  .seg { display:inline-flex; border:1px solid var(--grid); border-radius:6px; overflow:hidden; }
+  .seg button { border:0; background:var(--panel); padding:4px 10px; cursor:pointer; font-size:13px; }
+  .seg button[aria-pressed="true"] { background:var(--fg); color:var(--bg); }
+  #ports { display:grid; gap:12px; grid-template-columns:repeat(auto-fill, minmax(270px, 1fr)); }
+  .port { position:relative; background:var(--panel); border:1px solid var(--grid); border-radius:8px;
+          padding:12px 14px 12px 20px; display:grid; gap:2px; cursor:pointer; text-align:left; }
+  .port::before { content:""; position:absolute; left:0; top:10px; bottom:10px; width:5px; border-radius:0 3px 3px 0;
+                  background:var(--faint); }
+  .port.on::before { background:var(--on); }
+  .port.busy::before { background:var(--xfer); }
+  .port.lost::before { background:var(--bad); }
+  .port.lost { opacity:.72; }
+  .port.picked { border-color:var(--fg); box-shadow:inset 0 0 0 1px var(--fg); }
+  .port .alias { font-size:16px; font-weight:650; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding-right:70px; }
+  .port .host { font-family:var(--mono); font-size:12.5px; color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .port .sys { font-size:12.5px; color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .port .foot { display:flex; gap:10px; align-items:center; margin-top:8px; font-size:12.5px; color:var(--dim); flex-wrap:wrap; }
+  .port .state { position:absolute; top:12px; right:12px; font-size:12px; font-weight:600; color:var(--dim); }
+  .port.on .state { color:var(--on); } .port.busy .state { color:var(--xfer); } .port.lost .state { color:var(--bad); }
+  .ver { font-family:var(--mono); font-size:12px; padding:1px 6px; border-radius:4px; background:var(--raise); color:var(--dim); }
+  .ver.old { background:color-mix(in oklab, var(--warn) 18%, transparent); color:var(--warn); font-weight:600; }
+  .empty { padding:22px; border:1px dashed var(--grid); border-radius:8px; color:var(--dim); }
+  .empty a { color:var(--on); font-weight:600; }
+
+  /* ---------- run a command ---------- */
+  #run { background:var(--panel); border:1px solid var(--grid); border-radius:8px; padding:12px 14px; display:grid; gap:10px; }
+  #runForm { display:grid; grid-template-columns: minmax(140px, 200px) 1fr 92px auto; gap:8px; }
+  @media (max-width: 760px) { #runForm { grid-template-columns:1fr; } }
+  #runForm select, #runForm input { padding:8px 10px; border:1px solid var(--grid); border-radius:6px; background:var(--bg); min-width:0; }
+  #cmd { font-family:var(--mono); font-size:13px; }
+  #runOut { margin:0; }
+  #runMeta { font-size:13px; color:var(--dim); display:flex; gap:12px; align-items:center; }
+  #runMeta .bad { color:var(--bad); font-weight:600; }
+  pre { margin:0; padding:10px 12px; background:var(--raise); border-radius:6px; font:12.5px/1.5 var(--mono);
+        white-space:pre-wrap; word-break:break-word; max-height:42vh; overflow:auto; }
+
+  /* ---------- activity + numbers ---------- */
+  .lower { display:grid; gap:22px; grid-template-columns:minmax(0, 1fr); align-items:start; }
+  @media (min-width:1100px) { .lower { grid-template-columns:minmax(0, 1fr) 300px; } }
+  #filters { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  #filters input, #filters select { padding:6px 9px; border:1px solid var(--grid); border-radius:6px; background:var(--panel); }
+  #q { min-width:220px; }
+  .chip { display:inline-flex; gap:6px; align-items:center; padding:4px 8px 4px 10px; border-radius:999px;
+          background:var(--fg); color:var(--bg); font-size:13px; }
+  .chip button { border:0; background:none; color:inherit; cursor:pointer; padding:0 2px; font-size:15px; line-height:1; }
+  #log { background:var(--panel); border:1px solid var(--grid); border-radius:8px; overflow:hidden; }
+  table { width:100%; border-collapse:collapse; table-layout:fixed; }
+  td { padding:7px 10px; border-bottom:1px solid var(--soft); vertical-align:top; overflow:hidden; text-overflow:ellipsis; }
+  tr:last-child td { border-bottom:0; }
+  td.t { width:92px; white-space:nowrap; color:var(--dim); font-family:var(--mono); font-size:12.5px; }
+  td.k { width:96px; font-size:12.5px; color:var(--dim); white-space:nowrap; }
+  td.k::before { content:""; display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:7px; background:var(--faint); }
+  tr.exec td.k::before { background:var(--on); } tr.xfer td.k::before { background:var(--xfer); }
+  tr.bad td.k::before { background:var(--bad); } tr.bad td.k { color:var(--bad); }
+  td.m { width:150px; white-space:nowrap; font-weight:600; }
+  td.d { font-family:var(--mono); font-size:12.5px; white-space:pre-wrap; word-break:break-word; }
+  tr[data-id] { cursor:pointer; }
+  tr[data-id]:hover td { background:var(--raise); }
+  @media (max-width: 760px) { td.m { width:96px; } td.k { width:70px; } }
+  #more { display:block; width:100%; border:0; border-top:1px solid var(--soft); background:none; padding:9px; cursor:pointer; color:var(--dim); }
+
+  #numbers { background:var(--panel); border:1px solid var(--grid); border-radius:8px; padding:14px; display:grid; gap:12px; }
+  .num { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+  .num b { font-size:20px; font-weight:650; font-variant-numeric:tabular-nums; }
+  .num span { color:var(--dim); font-size:13px; }
+  .num.alarm b { color:var(--bad); }
+  #spark { width:100%; height:44px; display:block; }
+  #spark rect { fill:var(--on); }
+  #spark rect.bad { fill:var(--bad); }
+
+  /* ---------- command detail ---------- */
+  #detail { position:fixed; top:0; right:0; bottom:0; width:min(680px, 100vw); z-index:40; background:var(--panel);
+            border-left:1px solid var(--grid); padding:16px 18px 28px; overflow:auto; display:grid; gap:12px; align-content:start; }
+  #shade { position:fixed; inset:0; background:rgba(10,14,20,.38); z-index:39; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:4px 14px; font-size:13px; }
+  .kv span { color:var(--dim); }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .port.flash { animation:flash 900ms ease-out; }
+    @keyframes flash { from { box-shadow:0 0 0 3px color-mix(in oklab, var(--on) 45%, transparent); } to { box-shadow:none; } }
   }
 </style>
 </head>
 <body>
 
-<header id="rail">
-  <div class="brand">RemoteCmd <i>relay</i></div>
-  <div id="chips"></div>
-  <div class="grow"></div>
-  <div id="beat">
-    <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">
-      <circle cx="7" cy="7" r="6" fill="none" stroke="var(--grid)" stroke-width="1.6"></circle>
-      <circle id="ring" cx="7" cy="7" r="6" fill="none" stroke-width="1.6" stroke-linecap="round"
-              stroke-dasharray="37.7" transform="rotate(-90 7 7)"></circle>
-    </svg>
-    <span id="beatText"></span>
-  </div>
-  <input id="q" type="search" aria-label="search history" placeholder="search command, client, message…" autocomplete="off" spellcheck="false">
-  <select id="fClient" aria-label="filter by client"><option value="">all clients</option></select>
-  <select id="fKind" aria-label="filter by event kind"><option value="">all events</option></select>
-  <label><input type="checkbox" id="live" checked> live</label>
-  <a class="btn" href="/manage">Pair &amp; manage</a>
+<header>
+  <span id="beat" title="refresh"></span>
+  <span class="brand">RemoteCmd</span>
+  <span id="relayLine"></span>
+  <span class="grow"></span>
+  <a class="btn go" href="/manage">Pair a machine</a>
+  <a class="btn" href="/manage#access">Manage access</a>
 </header>
-
 <a id="agentBar" href="/manage#agents" hidden></a>
 
-<form id="gate" hidden>
-  <input id="token" type="password" placeholder="relay token" autocomplete="off" spellcheck="false">
-  <button type="submit">Connect</button>
-  <span class="err" id="gateErr"></span>
-</form>
-
-<section id="deckWrap"><div id="deck"></div></section>
-
-<section id="activity">
-  <svg id="histo" viewBox="0 0 240 100" preserveAspectRatio="none" aria-hidden="true"></svg>
-  <div id="histNote"></div>
-</section>
-
-<div class="main" id="main">
-  <section id="stream">
-    <h2>Activity <span class="n" id="count"></span><span class="burst" id="burst"></span></h2>
-    <div id="streamBox"><table id="hist">
-      <colgroup><col style="width:3px"><col style="width:84px"><col style="width:54px"><col style="width:132px"><col></colgroup>
-      <thead><tr><th class="gut"></th><th>Time</th><th>Event</th><th>Machine</th><th>Detail</th></tr></thead>
-      <tbody></tbody>
-    </table></div>
-    <div class="empty" id="noevents" hidden>nothing yet</div>
+<main>
+  <section>
+    <div class="secHead">
+      <h2>Machines</h2>
+      <span class="dim" id="machCount"></span>
+      <span class="grow"></span>
+      <div class="seg" role="group" aria-label="show machines">
+        <button type="button" data-show="all" aria-pressed="true">All</button>
+        <button type="button" data-show="online" aria-pressed="false">Online</button>
+        <button type="button" data-show="update" aria-pressed="false">Need update</button>
+      </div>
+    </div>
+    <div id="ports"></div>
+    <div class="empty" id="noMachines" hidden>No machine has connected yet. <a href="/manage">Pair the first one</a> — it takes one command on that machine.</div>
   </section>
 
-  <aside id="clients">
-    <h2>Machines <span class="n" id="ccount"></span></h2>
-    <div id="clientBox"><table id="tbl">
-      <colgroup><col style="width:3px"><col><col style="width:62px"><col style="width:74px"><col style="width:46px"><col style="width:42px"></colgroup>
-      <thead><tr><th class="gut"></th><th>Machine</th><th>Version</th><th>State</th><th>Last</th><th title="running / queued">r/q</th></tr></thead>
-      <tbody></tbody>
-    </table></div>
-    <div class="empty" id="noclients" hidden>no clients registered</div>
-  </aside>
+  <section id="run">
+    <div class="secHead" style="margin:0"><h2>Run a command</h2><span class="dim">PowerShell on Windows, bash elsewhere</span></div>
+    <form id="runForm">
+      <select id="target" aria-label="machine"></select>
+      <input id="cmd" placeholder="e.g. Get-Volume  ·  df -h  ·  uptime" autocomplete="off" spellcheck="false" aria-label="command">
+      <select id="tmo" aria-label="time limit">
+        <option value="30">30 s</option><option value="60" selected>1 min</option><option value="300">5 min</option><option value="1800">30 min</option>
+      </select>
+      <button class="btn go" type="submit" id="runBtn">Run</button>
+    </form>
+    <div id="runMeta" hidden></div>
+    <pre id="runOut" hidden></pre>
+  </section>
 
-  <aside id="detail" role="dialog" aria-modal="true" aria-labelledby="dtitle" tabindex="-1" hidden>
-    <div class="dhead"><b id="dtitle">command</b><button id="dclose" type="button">close</button></div>
-    <div id="detailBody" aria-live="polite"></div>
-  </aside>
-</div>
+  <div class="lower">
+    <section>
+      <div class="secHead">
+        <h2>Activity</h2>
+        <span id="pickedChip"></span>
+        <span class="grow"></span>
+        <div id="filters">
+          <input id="q" type="search" placeholder="Search commands, paths, messages" aria-label="search activity">
+          <select id="kind" aria-label="event type">
+            <option value="">Everything</option><option value="exec">Commands</option><option value="xfer">Transfers</option>
+            <option value="conn">Connections</option><option value="bad">Problems</option><option value="admin">Pairing and access</option>
+          </select>
+        </div>
+      </div>
+      <div id="log"><table><tbody id="rows"></tbody></table><button id="more" type="button" hidden>Show older</button></div>
+      <div class="empty" id="noEvents" hidden>Nothing matches.</div>
+    </section>
 
-<div id="backdrop" hidden></div>
+    <aside id="numbers" aria-label="relay numbers"></aside>
+  </div>
+</main>
+
+<div id="shade" hidden></div>
+<aside id="detail" role="dialog" aria-modal="true" aria-labelledby="dTitle" hidden>
+  <div class="secHead" style="margin:0"><h2 id="dTitle">Command</h2><span class="grow"></span><button class="btn" id="dClose" type="button">Close</button></div>
+  <div class="kv" id="dKv"></div>
+  <div id="dBody"></div>
+</aside>
 
 <script>
 const $ = (id) => document.getElementById(id);
-const txt = (v) => document.createTextNode(String(v));
-const gate = $('gate');
-const gateErr = $('gateErr');
-const sections = ['deckWrap', 'activity', 'main'].map($);
-let token = sessionStorage.getItem('rcmd-token');
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = String(text); return e; };
+const flat = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch { /* private window */ } },
+};
 
-// Everything the page renders comes from the relay, so it is written with text nodes only —
-// never innerHTML — and a command's output is escaped by the DOM rather than by us.
-const state = { q: '', client: '', kind: '', selected: null };
-let latest = null;
-let lastDrawn = null;
-let lastClients = null;
-// Set while the page is deliberately asking for a token, so the next refresh does not close the
-// prompt out from under the person typing into it.
-let gateWanted = false;
+const state = { show: 'all', picked: null, q: '', kind: '', limit: 60, clients: [], events: [], info: null };
 
-// The system setting can be flipped while the page sits open all day, and WAAPI ignores the CSS
-// override, so the flag is re-read rather than captured once.
-const mq = matchMedia('(prefers-reduced-motion: reduce)');
-let REDUCE = mq.matches;
-mq.addEventListener('change', (e) => { REDUCE = e.matches; });
-
-// A token in the query string still works (older bookmarks), but it is moved into the session and
-// wiped from the address bar so it stops leaking through history and the referrer.
-const fromUrl = new URLSearchParams(location.search).get('token');
-if (fromUrl) {
-  token = fromUrl;
-  sessionStorage.setItem('rcmd-token', token);
-  history.replaceState(null, '', location.pathname);
-}
-
-function showGate(message, hideBody) {
-  // Only steal the caret the first time the prompt appears: stealing it on every repeat would pull
-  // the operator out of the search box a few seconds after they clicked into it.
-  const opening = gate.hidden;
-  gateWanted = true;
-  if (message !== null) gateErr.textContent = message || '';
-  gate.hidden = false;
-  if (hideBody) {
-    token = null;
-    sessionStorage.removeItem('rcmd-token');
-    sections.forEach((el) => { el.hidden = true; });
-    closeDetail();
-    setBeat('dead', 'needs a token');
-  }
-  if (opening) $('token').focus();
-}
-
-gate.addEventListener('submit', (e) => {
-  e.preventDefault();
-  const value = $('token').value.trim();
-  if (!value) return;
-  token = value;
-  sessionStorage.setItem('rcmd-token', token);
-  $('token').value = '';
-  gateWanted = false;
-  gate.hidden = true;
-  gateErr.textContent = '';
-  sections.forEach((el) => { el.hidden = false; });
-  tick();
-  if (state.selected) loadDetail(state.selected);
-});
-
-// An agent waiting for approval is the one thing on this page that needs a person right now.
-async function checkAgents() {
-  try {
-    const res = await fetch('/api/admin/oauth/pending', { signal: AbortSignal.timeout(5000) });
-    if (!res.ok) return;
-    const { pending } = await res.json();
-    const bar = $('agentBar');
-    bar.hidden = pending.length === 0;
-    bar.textContent = pending.length === 1
-      ? `${pending[0].client} is waiting for approval (code ${pending[0].userCode}) — review`
-      : `${pending.length} AI agents are waiting for approval — review`;
-  } catch { /* the main refresh reports connection problems */ }
-}
-setInterval(checkAgents, 3000);
-checkAgents();
-
-async function api(path) {
-  // A relay behind a dropped VPN accepts the connection and then says nothing, so without a deadline
-  // the request never settles, the page never notices, and the pending fetches pile up.
-  const res = await fetch(path, {
-    headers: token ? { 'X-Token': token } : {},
-    signal: AbortSignal.timeout(8000),
-  });
-  // The dashboard signs in with a cookie; once that session ends, the login page takes over.
-  if (res.status === 401 && !token) {
-    location.href = '/login';
-    throw new Error('auth');
-  }
-  if (res.status === 401 || res.status === 429) {
-    const err = new Error('auth');
-    err.auth = res.status;
-    throw err;
-  }
-  // A 500 or a proxy's HTML error page would otherwise die inside res.json() and be reported as
-  // "no reply", sending whoever reads it off to check a network that is working fine.
-  if (!res.ok) {
-    const err = new Error('http');
-    err.status = res.status;
-    throw err;
-  }
+async function api(path, init) {
+  const res = await fetch(path, { ...init, signal: AbortSignal.timeout(init?.timeout ?? 8000) });
+  if (res.status === 401) { location.href = '/login'; throw new Error('signed out'); }
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
 
+function ago(s) {
+  if (s < 0) return 'never';
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
+  return `${Math.floor(s / 86400)} d ago`;
+}
 function dur(s) {
-  if (s < 0) return '-';
-  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60);
-  return h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s}s`;
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m`;
+  return `${Math.floor(s / 86400)}d ${Math.floor(s % 86400 / 3600)}h`;
 }
-
-function ms(v) {
-  return v >= 1000 ? `${(v / 1000).toFixed(v >= 10000 ? 0 : 1)}s` : `${v}ms`;
-}
-
-// Matches FormatBytes on the relay: whole bytes stay whole, so a few hundred of them never round
-// away to "0 MB".
 function bytes(v) {
   if (v < 1024) return `${v} B`;
-  const units = ['kB', 'MB', 'GB', 'TB'];
-  let n = v / 1024, i = 0;
-  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
-  return `${n < 10 ? n.toFixed(1) : Math.round(n)} ${units[i]}`;
+  if (v < 1048576) return `${(v / 1024).toFixed(1)} kB`;
+  if (v < 1073741824) return `${(v / 1048576).toFixed(1)} MB`;
+  return `${(v / 1073741824).toFixed(2)} GB`;
 }
 
-const pad = (n) => String(n).padStart(2, '0');
-// The relay stamps events in UTC; the columns show them in the viewer's own zone, in fixed-width
-// form so the two columns stay aligned whatever the browser locale would have done.
-const localDate = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-const localTime = (d) => `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-
-function cell(value, className) {
-  const td = document.createElement('td');
-  if (className) td.className = className;
-  td.append(txt(value));
-  return td;
-}
-
-function el(tag, className, text) {
-  const n = document.createElement(tag);
-  if (className) n.className = className;
-  if (text !== undefined) n.append(txt(text));
-  return n;
-}
-
-// Keeps a <select>'s options in step with the values actually present, without losing the choice
-// the user made (or dropping a value that has scrolled out of the current history window).
-function syncOptions(select, values, allLabel) {
-  const chosen = select.value;
-  const wanted = [...new Set(values)].filter(Boolean).sort();
-  if (chosen && !wanted.includes(chosen)) wanted.push(chosen);
-  const current = [...select.options].slice(1).map((o) => o.value);
-  if (current.length === wanted.length && current.every((v, i) => v === wanted[i])) return;
-  select.replaceChildren();
-  const all = document.createElement('option');
-  all.value = '';
-  all.append(txt(allLabel));
-  select.append(all);
-  for (const v of wanted) {
-    const o = document.createElement('option');
-    o.value = v;
-    o.append(txt(v));
-    select.append(o);
+/** The system in words people use: the client reports the runtime's own description. */
+function system(os) {
+  if (!os) return '';
+  const s = flat(os);
+  const arch = /arm64/i.test(s) ? ' (ARM)' : '';
+  let m;
+  if ((m = s.match(/Windows\s+([\d.]+)/i))) {
+    const build = Number(m[1].split('.')[2] || 0);
+    return (build >= 22000 ? 'Windows 11' : 'Windows 10') + ` build ${build}` + arch;
   }
-  select.value = chosen;
+  if ((m = s.match(/Darwin\s+(\d+)/i))) return `macOS ${Number(m[1]) - 9}` + arch;
+  if (/android/i.test(s)) return 'Android' + arch;
+  if (/linux|ubuntu|debian|fedora|alpine/i.test(s)) return s.split('#')[0].slice(0, 48);
+  return s.slice(0, 48);
 }
 
-// ---------------------------------------------------------------- heartbeat
-// The only thing that moves while nothing is happening. A failed refresh does not restart it, so
-// the ring freezes where it stood — absence of motion is the alarm, and it cannot be missed the way
-// a toast can.
-const ring = $('ring');
-let beat = null;
-let beatCountdown = null;
+function machineState(c) {
+  if (!c.connected) return { cls: 'lost', text: c.secondsAgo < 0 ? 'never seen' : `lost ${ago(c.secondsAgo)}` };
+  if (c.state === 'upload' || c.state === 'download') return { cls: 'busy', text: c.state === 'upload' ? 'receiving file' : 'sending file' };
+  if (c.running > 0) return { cls: 'busy', text: `running ${c.running}` };
+  return { cls: 'on', text: 'online' };
+}
 
-function setBeat(mode, text) {
-  ring.setAttribute('class', mode === 'live' ? '' : mode);
-  $('beatText').textContent = text || '';
-  clearInterval(beatCountdown);
-  beatCountdown = null;
-  if (mode !== 'live') { if (beat) { beat.cancel(); beat = null; } return; }
-  if (REDUCE) {
-    // Dropping the handle without cancelling would leave visibilitychange replaying a three second
-    // sweep on a tab whose owner just asked for no motion at all.
-    if (beat) { beat.cancel(); beat = null; }
-    // No sweep to watch, so the same information arrives as a plain countdown.
-    let left = 3;
-    $('beatText').textContent = left + 's';
-    beatCountdown = setInterval(() => { left = left > 1 ? left - 1 : 3; $('beatText').textContent = left + 's'; }, 1000);
-    return;
+// ---------- machines ----------
+let lastPortsSig = '';
+function renderPorts() {
+  const all = state.clients;
+  const shown = all.filter((c) => state.show === 'all' || (state.show === 'online' ? c.connected : c.outdated));
+  const online = all.filter((c) => c.connected).length;
+  const outdated = all.filter((c) => c.outdated).length;
+  $('machCount').textContent = all.length ? `${online} of ${all.length} online${outdated ? `, ${outdated} need an update` : ''}` : '';
+  $('noMachines').hidden = all.length > 0;
+
+  const sig = JSON.stringify([state.show, state.picked, shown.map((c) => [c.id, c.name, c.host, c.user, c.os, c.version, c.outdated, c.connected, c.state, c.running, c.queued])]);
+  if (sig === lastPortsSig) { refreshSeen(); return; }
+  lastPortsSig = sig;
+
+  $('ports').replaceChildren(...shown.map((c) => {
+    const st = machineState(c);
+    const port = el('button', `port ${st.cls}${state.picked === c.name ? ' picked' : ''}`);
+    port.type = 'button';
+    port.dataset.name = c.name;
+    port.append(el('span', 'state', st.text), el('span', 'alias', c.name));
+    const who = [c.host, c.user].filter(Boolean).join(' \\ ');
+    port.append(el('span', 'host', who || c.ip || '—'));
+    port.append(el('span', 'sys', system(c.os) || 'client too old to report its system'));
+    const foot = el('span', 'foot');
+    foot.append(el('span', c.outdated ? 'ver old' : 'ver', c.version ? `v${c.version}${c.outdated ? ' — update' : ''}` : 'version ?'));
+    const seen = el('span', 'seen', c.connected ? `seen ${ago(c.secondsAgo)}` : '');
+    seen.dataset.id = c.id;
+    foot.append(seen);
+    if (c.queued) foot.append(el('span', '', `${c.queued} queued`));
+    foot.append(el('span', '', `${c.served} done`));
+    port.append(foot);
+    port.title = `${flat(c.name)}\nhost ${flat(c.host || '?')}\naccount ${flat(c.user || '?')}\nsystem ${flat(c.os || '?')}\naddress ${c.ip || '?'}\ncredential ${flat(c.token)}\nconnected for ${dur(c.connectedForSeconds)}\n\nClick to show only its activity`;
+    port.addEventListener('click', () => pick(state.picked === c.name ? null : c.name));
+    return port;
+  }));
+  syncTargets();
+}
+
+function refreshSeen() {
+  for (const node of document.querySelectorAll('.port .seen')) {
+    const c = state.clients.find((x) => x.id === node.dataset.id);
+    if (c && c.connected) node.textContent = `seen ${ago(c.secondsAgo)}`;
   }
-  if (beat) beat.cancel();
-  beat = ring.animate([{ strokeDashoffset: 37.7 }, { strokeDashoffset: 0 }],
-    { duration: 3000, easing: 'linear', fill: 'forwards' });
-  if (document.hidden) beat.pause();
 }
 
-// A throttled background tab must not look like a dead relay.
-document.addEventListener('visibilitychange', () => {
-  if (!beat) return;
-  if (document.hidden) beat.pause(); else beat.play();
+function pick(name) {
+  state.picked = name;
+  const chip = $('pickedChip');
+  chip.replaceChildren();
+  if (name) {
+    const c = el('span', 'chip', name);
+    const x = el('button', '', '×');
+    x.type = 'button';
+    x.setAttribute('aria-label', 'show all machines');
+    x.addEventListener('click', () => pick(null));
+    c.append(x);
+    chip.append(c);
+    $('target').value = name;
+  }
+  lastPortsSig = '';
+  renderPorts();
+  renderLog();
+}
+
+for (const b of document.querySelectorAll('.seg button')) {
+  b.addEventListener('click', () => {
+    state.show = b.dataset.show;
+    for (const o of document.querySelectorAll('.seg button')) o.setAttribute('aria-pressed', String(o === b));
+    renderPorts();
+  });
+}
+
+// ---------- run a command ----------
+function syncTargets() {
+  const sel = $('target');
+  const current = sel.value || store.get('rcmd-target') || '';
+  const names = state.clients.filter((c) => c.connected).map((c) => c.name);
+  const sig = names.join('\n');
+  if (sel.dataset.sig === sig) return;
+  sel.dataset.sig = sig;
+  sel.replaceChildren(...(names.length ? names : ['no machine online']).map((n) => { const o = el('option', '', n); o.value = names.length ? n : ''; return o; }));
+  if (names.includes(current)) sel.value = current;
+  $('runBtn').disabled = names.length === 0;
+}
+
+$('runForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const target = $('target').value;
+  const command = $('cmd').value.trim();
+  if (!target || !command) return;
+  store.set('rcmd-target', target);
+  const timeoutSeconds = Number($('tmo').value);
+  const meta = $('runMeta'), out = $('runOut'), btn = $('runBtn');
+  btn.disabled = true;
+  btn.textContent = 'Running…';
+  meta.hidden = false;
+  meta.replaceChildren(el('span', '', `${target}: running…`));
+  out.hidden = true;
+  const started = performance.now();
+  try {
+    const r = await api(`/api/exec?client=${encodeURIComponent(target)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-RemoteCmd': '1' },
+      body: JSON.stringify({ command, timeoutSeconds }),
+      timeout: (timeoutSeconds + 15) * 1000,
+    });
+    const secs = ((performance.now() - started) / 1000).toFixed(1);
+    meta.replaceChildren(el('span', r.exitCode === 0 ? '' : 'bad', `exit ${r.exitCode}`), el('span', '', `${target}, ${secs} s`));
+    const copy = el('button', 'btn', 'Copy output');
+    copy.type = 'button';
+    copy.addEventListener('click', () => navigator.clipboard.writeText(r.output));
+    meta.append(copy);
+    out.textContent = r.output || '(no output)';
+    out.hidden = false;
+  } catch (err) {
+    meta.replaceChildren(el('span', 'bad', `Not run: ${err.message}`));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Run';
+    tick();
+  }
 });
 
-// ---------------------------------------------------------------- activity buckets
-// The relay's history is a ring, so old entries fall out of it. Binning the current snapshot would
-// therefore *shrink* the bars in the past — a chart that rewrites history is worse than no chart.
-// Events are accumulated client-side into per-minute buckets instead, deduped by their content.
-// The dedup keys are kept per minute alongside the counts, so pruning an old minute drops its keys
-// with it. A flat Set that got cleared wholesale would let the next snapshot's overlap be counted a
-// second time and visibly inflate the bars that are still on screen.
-const seenByMinute = new Map();
-const buckets = new Map();
-const CH = { exec: 'exec', upload: 'xfer', download: 'xfer', connect: 'conn', timeout: 'fault', auth: 'fault', gc: 'gc' };
-const CHANNELS = ['fault', 'exec', 'xfer', 'conn', 'gc'];
-const BINS = 40;
-const KEEP_MINUTES = 240;
-let ringSaturated = false;
-
-function absorb(events) {
-  const nowMin = Math.floor(Date.now() / 60000);
-  for (const e of events) {
-    const t = Date.parse(e.at);
-    if (!t) continue;
-    // A client clock running ahead of the relay would park events in bins that never scroll into
-    // view and never get pruned, so anything from the future is treated as "now".
-    const idx = Math.min(Math.floor(t / 60000), nowMin);
-    const key = `${e.at}|${e.kind}|${e.client}|${e.message}|${e.id || ''}`;
-    let keys = seenByMinute.get(idx);
-    if (!keys) { keys = new Set(); seenByMinute.set(idx, keys); }
-    if (keys.has(key)) continue;
-    keys.add(key);
-    const b = buckets.get(idx) || { fault: 0, exec: 0, xfer: 0, conn: 0, gc: 0, n: 0 };
-    b[CH[e.kind] || 'gc']++;
-    b.n++;
-    buckets.set(idx, b);
-  }
-  const floor = nowMin - KEEP_MINUTES;
-  for (const k of [...buckets.keys()]) if (k < floor) buckets.delete(k);
-  for (const k of [...seenByMinute.keys()]) if (k < floor) seenByMinute.delete(k);
-}
-
-// A relay that restarted is a different relay: its counters are back at zero, its history is gone
-// and its saturation no longer says anything. Carrying any of that across would show a silenced
-// auth alarm, a hatched blind spot for events that never existed, and a nonsense throughput delta.
-function resetForNewRelay() {
-  prev = null;
-  seenByMinute.clear();
-  buckets.clear();
-  ringSaturated = false;
-  nowHistory = [];
-  lastDrawn = null;
-  lastClients = null;
-  drawnKeys = new Set();
-  clientAges = [];
-  authBase = 0;
-  authBaseAt = '';
-  sessionStorage.removeItem('rcmd-auth-base');
-  sessionStorage.removeItem('rcmd-auth-at');
-}
-
-const histSvg = $('histo');
-const bars = [];
-let blindRect = null, blindEdge = null;
-
-function buildHistogram() {
-  const W = 240, H = 100, slot = W / BINS;
-  blindRect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-  blindRect.setAttribute('class', 'blind');
-  blindRect.setAttribute('y', '0');
-  blindRect.setAttribute('height', String(H));
-  blindRect.setAttribute('x', '0');
-  blindRect.setAttribute('width', '0');
-  histSvg.append(blindRect);
-  blindEdge = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-  blindEdge.setAttribute('class', 'edge');
-  blindEdge.setAttribute('y1', '0');
-  blindEdge.setAttribute('y2', String(H));
-  blindEdge.setAttribute('x1', '0');
-  blindEdge.setAttribute('x2', '0');
-  blindEdge.setAttribute('opacity', '0');
-  histSvg.append(blindEdge);
-  for (let i = 0; i < BINS; i++) {
-    const col = [];
-    for (const ch of CHANNELS) {
-      const r = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-      r.setAttribute('class', 'bar ch-' + ch);
-      r.setAttribute('x', String(i * slot + slot * 0.12));
-      r.setAttribute('width', String(slot * 0.76));
-      r.setAttribute('y', String(H));
-      r.setAttribute('height', '0');
-      histSvg.append(r);
-      col.push(r);
-    }
-    bars.push(col);
-  }
-}
-
-function renderHistogram(eventCount) {
-  const H = 100;
-  const nowMin = Math.floor(Date.now() / 60000);
-  const keys = [...buckets.keys()];
-  const oldest = keys.length ? Math.min(...keys) : nowMin;
-  const spanMin = Math.max(1, nowMin - oldest + 1);
-  // Adaptive bin: never finer than a minute, never so coarse that the window lies about its size.
-  const group = Math.min(6, Math.max(1, Math.ceil(spanMin / BINS)));
-  const windowMin = BINS * group;
-  const startMin = nowMin - windowMin + 1;
-
-  const cols = [];
-  let peak = 0, total = 0;
-  for (let i = 0; i < BINS; i++) {
-    const agg = { fault: 0, exec: 0, xfer: 0, conn: 0, gc: 0, n: 0 };
-    for (let g = 0; g < group; g++) {
-      const b = buckets.get(startMin + i * group + g);
-      if (!b) continue;
-      for (const ch of CHANNELS) agg[ch] += b[ch];
-      agg.n += b.n;
-    }
-    cols.push(agg);
-    total += agg.n;
-    if (agg.n > peak) peak = agg.n;
-  }
-  const scale = Math.max(1, peak);
-
-  for (let i = 0; i < BINS; i++) {
-    let bottom = H;
-    CHANNELS.forEach((ch, ci) => {
-      const v = cols[i][ch];
-      const h = v ? Math.max(2, (v / scale) * (H - 4)) : 0;
-      const r = bars[i][ci];
-      bottom -= h;
-      r.setAttribute('y', String(bottom));
-      r.setAttribute('height', String(h));
-    });
-    // The rightmost bin is still filling up, so it says so rather than pretending to be complete.
-    bars[i].forEach((r) => r.setAttribute('opacity', i === BINS - 1 ? '.55' : '1'));
-  }
-
-  // Only claim a blind spot when the ring is actually saturated. Deriving it from timestamps would
-  // hatch the whole chart on a quiet relay and claim "cannot see here" where there was just silence.
-  if (ringSaturated && keys.length) {
-    const firstCol = Math.max(0, Math.floor((oldest - startMin) / group));
-    const x = (firstCol / BINS) * 240;
-    blindRect.setAttribute('width', String(Math.max(0, x)));
-    blindEdge.setAttribute('x1', String(x));
-    blindEdge.setAttribute('x2', String(x));
-    blindEdge.setAttribute('opacity', x > 1 ? '1' : '0');
-  } else {
-    blindRect.setAttribute('width', '0');
-    blindEdge.setAttribute('opacity', '0');
-  }
-
-  const note = $('histNote');
-  note.replaceChildren();
-  const span = group === 1 ? `${windowMin}m` : `${windowMin}m (${group}m bins)`;
-  note.append(
-    el('i', '', `${eventCount} events held · ${span} window · peak ${peak}/bin · ${total} in window`),
-    el('i', 'key fault', 'fault'), el('i', 'key exec', 'exec'), el('i', 'key xfer', 'transfer'),
-  );
-  if (ringSaturated) note.append(el('i', '', 'shaded: older than the relay remembers'));
-}
-
-// ---------------------------------------------------------------- KPI deck
-const KPIS = [
-  { k: 'link', label: 'Online', hero: true },
-  { k: 'now', label: 'Running now', hero: true, spark: true },
-  { k: 'exec', label: 'Commands', delta: true },
-  { k: 'tmo', label: 'Timeout rate', delta: true },
-  { k: 'xfer', label: 'Transfers' },
-  { k: 'vol', label: 'Volume' },
-  { k: 'auth', label: 'Refused', delta: true },
-  { k: 'relay', label: 'Relay' },
-];
-const tiles = {};
-let prev = null;
-let nowHistory = [];
-let authBase = Number(sessionStorage.getItem('rcmd-auth-base') || '0');
-let authBaseAt = sessionStorage.getItem('rcmd-auth-at') || '';
-
-function buildDeck() {
-  const deck = $('deck');
-  deck.replaceChildren();
-  for (const spec of KPIS) {
-    const box = el('div', 'kpi' + (spec.hero ? ' hero' : ''));
-    const lbl = el('div', 'lbl');
-    lbl.append(el('span', '', spec.label));
-    const chip = el('span', 'chip');
-    lbl.append(chip);
-    const val = el('b', 'val', '—');
-    const sub = el('span', 'sub');
-    box.append(lbl, val, sub);
-    let spark = null;
-    if (spec.spark) {
-      spark = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-      spark.setAttribute('id', 'spark');
-      spark.setAttribute('viewBox', '0 0 60 14');
-      spark.setAttribute('preserveAspectRatio', 'none');
-      const line = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
-      spark.append(line);
-      box.append(spark);
-      spark = line;
-    }
-    deck.append(box);
-    tiles[spec.k] = { box, val, sub, chip, spark };
-  }
-}
-
-function setTile(k, value, sub, opts) {
-  const t = tiles[k];
-  const o = opts || {};
-  const changed = t.val.textContent !== String(value);
-  t.val.textContent = value;
-  // null means "this tile owns its own sub-line" — the auth tile keeps a live button down there.
-  if (sub !== null) t.sub.replaceChildren(txt(sub));
-  t.box.classList.toggle('alarm', !!o.alarm);
-  t.box.classList.toggle('quiet', !!o.quiet);
-  t.box.classList.toggle('warn', !!o.warn);
-  // Flashing four numbers every three seconds is exactly what people stop looking at, so only the
-  // three tiles that mean something get it, and only when the value really moved.
-  if (changed && o.flash && !REDUCE) {
-    t.val.classList.remove('flash');
-    void t.val.offsetWidth;
-    t.val.classList.add('flash');
-  }
-}
-
-function setChip(k, text) {
-  const t = tiles[k];
-  clearTimeout(t.chipTimer);
-  if (!text) { t.chip.textContent = ''; return; }
-  t.chip.textContent = text;
-  if (!REDUCE) {
-    t.chip.classList.remove('rise');
-    void t.chip.offsetWidth;
-    t.chip.classList.add('rise');
-  }
-  t.chipTimer = setTimeout(() => { t.chip.textContent = ''; }, REDUCE ? 4000 : 2400);
-}
-
-// The worst poll age among connected clients. Guards both ways an empty list bites: Math.max of
-// nothing is -Infinity, and a client that has never polled reports -1.
-function worstPoll(cs) {
-  const on = cs.filter((x) => x.connected && x.secondsAgo >= 0);
-  if (!on.length) return null;
-  return on.reduce((a, b) => (b.secondsAgo > a.secondsAgo ? b : a));
-}
-
-function renderDeck(clients, info) {
-  const now = Date.now();
-  const s = info.stats;
-  // Deltas are only honest across a fresh, uninterrupted interval: a paused "live" checkbox or a
-  // throttled tab makes dt meaningless, and a restarted relay resets every counter to zero.
-  const dt = prev ? now - prev.at : 0;
-  const fresh = !!prev && dt < 6000 && info.uptimeSeconds >= prev.uptime;
-
-  const running = clients.clients.reduce((a, c) => a + c.running, 0);
-  const queued = clients.clients.reduce((a, c) => a + c.queued, 0);
-  const worst = worstPoll(clients.clients);
-  const linkBad = clients.connected < clients.count || (worst && worst.secondsAgo > 15);
-
-  setTile('link', `${clients.connected}/${clients.count}`,
-    worst ? `${worst.name} ${worst.secondsAgo}s` : 'no clients polling', { alarm: !!linkBad });
-
-  nowHistory.push(running);
-  if (nowHistory.length > 60) nowHistory.shift();
-  setTile('now', running, `${queued} queued`, { quiet: running === 0 && queued === 0 });
-  drawSpark(nowHistory);
-
-  setTile('exec', s.execs, fresh ? recentLabel() : `${clients.count} client(s)`, { flash: true });
-  if (fresh && s.execs > prev.execs) setChip('exec', `+${s.execs - prev.execs}`);
-
-  const rate = s.execs === 0 ? '—' : `${(s.timeouts / s.execs * 100).toFixed(1)}%`;
-  const rateBad = s.execs > 0 && s.timeouts / s.execs > 0.05;
-  setTile('tmo', rate, `${s.timeouts} tmo of ${s.execs}`,
-    { alarm: rateBad, quiet: s.timeouts === 0, flash: true });
-  if (fresh && s.timeouts > prev.timeouts) setChip('tmo', `+${s.timeouts - prev.timeouts}`);
-
-  setTile('xfer', s.uploads + s.downloads, `↑ ${s.uploads}   ↓ ${s.downloads}`,
-    { quiet: s.uploads + s.downloads === 0 });
-
-  const vol = s.bytesUploaded + s.bytesDownloaded;
-  const dBytes = fresh ? vol - (prev.bytesUp + prev.bytesDown) : 0;
-  setTile('vol', bytes(vol), dBytes > 0 ? `${bytes(Math.round(dBytes / (dt / 1000)))}/s` : '—',
-    { quiet: vol === 0 });
-
-  const sinceBase = Math.max(0, s.authFailures - authBase);
-  setTile('auth', s.authFailures, null, { alarm: sinceBase > 0, quiet: s.authFailures === 0, flash: true });
-  renderAuthSub(sinceBase);
-  if (fresh && s.authFailures > prev.authFailures) setChip('auth', `+${s.authFailures - prev.authFailures}`);
-
-  // The tile is one tenth of the deck, so the token count lives in the rail and the tooltip; only
-  // the transport, which is the part that can be wrong, gets the line.
-  setTile('relay', `v${info.version}`,
-    info.outdated ? `update to v${info.latest}`
-      : !info.latest ? 'release unknown (offline?)'
-      : info.latest === info.version ? 'latest release' : `release is v${info.latest}`,
-    { quiet: false, warn: !!info.outdated });
-  tiles.relay.sub.classList.toggle('bad', !info.tls);
-  tiles.relay.box.title = `${info.tokens} token(s) accepted · up ${dur(info.uptimeSeconds)}`;
-
-  prev = {
-    at: now, execs: s.execs, timeouts: s.timeouts, uploads: s.uploads, downloads: s.downloads,
-    bytesUp: s.bytesUploaded, bytesDown: s.bytesDownloaded, authFailures: s.authFailures,
-    uptime: info.uptimeSeconds,
-  };
-}
-
-// authFailures only ever climbs, so a delta-based alarm misses a brute force that started before
-// the page was opened. The tile latches until it is explicitly dismissed.
-// The label and the button are built once and only their text changes: rebuilding them every three
-// seconds destroyed the node mid-click, so the button could not reliably be pressed at all.
-function buildAuthSub() {
-  const sub = tiles.auth.sub;
-  const label = document.createElement('span');
-  const b = document.createElement('button');
-  b.id = 'dismiss';
-  b.type = 'button';
-  b.hidden = true;
-  b.append(txt('clear'));
-  b.addEventListener('click', () => {
-    authBase = latest ? latest.stats.authFailures : authBase;
-    authBaseAt = localTime(new Date());
-    sessionStorage.setItem('rcmd-auth-base', String(authBase));
-    sessionStorage.setItem('rcmd-auth-at', authBaseAt);
-    renderAuthSub(0);
-    tiles.auth.box.classList.remove('alarm');
-  });
-  sub.replaceChildren(label, b);
-  tiles.auth.label = label;
-  tiles.auth.button = b;
-}
-
-function renderAuthSub(sinceBase) {
-  const { label, button } = tiles.auth;
-  if (sinceBase <= 0) {
-    label.textContent = 'none';
-    button.hidden = true;
-    return;
-  }
-  label.textContent = `${sinceBase}× rejected${authBaseAt ? ' since ' + authBaseAt : ''} `;
-  button.hidden = false;
-}
-
-function recentLabel() {
-  const from = Math.floor(Date.now() / 60000) - 5;
-  let n = 0;
-  for (const [k, b] of buckets) if (k >= from) n += b.exec;
-  return `+${n} last 5m`;
-}
-
-function drawSpark(values) {
-  const line = tiles.now.spark;
-  if (!line) return;
-  const max = Math.max(1, ...values);
-  const step = values.length > 1 ? 60 / (values.length - 1) : 60;
-  line.setAttribute('points', values.map((v, i) => `${(i * step).toFixed(1)},${(13 - (v / max) * 12).toFixed(1)}`).join(' '));
-}
-
-// ---------------------------------------------------------------- clients
-let clientAges = [];
-
-function renderSessions(clients) {
-  const tbody = document.querySelector('#tbl tbody');
-  // secondsAgo is deliberately NOT in the signature: it changes every second and would rebuild the
-  // rows out from under a click. The baseline it feeds is refreshed separately, below.
-  const signature = JSON.stringify(clients.clients.map((c) => [c.id, c.name, c.state, c.running, c.queued, c.served, c.token, c.ip, c.host, c.user, c.version, c.outdated]));
-  $('ccount').textContent = clients.count ? `${clients.connected} online` : '';
-  $('noclients').hidden = clients.count > 0;
-  $('clientBox').hidden = clients.count === 0;
-
-  const prevStates = lastClients ? lastClients.states : null;
-  if (signature === (lastClients && lastClients.sig)) { refreshAges(clients); stampAges(); return; }
-
-  tbody.replaceChildren();
-  clientAges = [];
-  for (const c of clients.clients) {
-    const tr = document.createElement('tr');
-    tr.className = c.state === 'stale' ? 'stale' : c.state === 'idle' ? 'idle' : 'busy';
-    if (prevStates && prevStates.get(c.id) && prevStates.get(c.id) !== c.state) tr.classList.add('changed');
-    const arrow = c.state === 'upload' ? '↑ upload' : c.state === 'download' ? '↓ download' : c.state;
-    const last = cell('—', 'lp');
-    // The alias on top, the real host and account beneath: two machines both called "build" are
-    // still told apart at a glance.
-    const who = el('td', 'who');
-    who.append(el('b', '', c.name));
-    const host = [c.host, c.user].filter(Boolean).join(' \\ ');
-    if (host && flat(host) !== flat(c.name)) who.append(el('small', '', host));
-    const ver = cell(c.version ? `v${c.version}` : '—', c.outdated ? 'ver old' : 'ver');
-    if (c.outdated) ver.title = 'A newer release is available';
-    tr.append(cell('', 'gut'), who, ver, cell(arrow, 'st'), last, cell(`${c.running}/${c.queued}`));
-    // The rail is narrow; the fields that are read once a day rather than once a minute live here.
-    // Everything here comes from the client machine, so newlines are flattened rather than allowed
-    // to forge extra lines in the tooltip.
-    tr.title = `${flat(c.name)}\nhost ${flat(c.host || 'unknown')}\nuser ${flat(c.user || 'unknown')}\nsystem ${flat(c.os || 'unknown')}` +
-      `\nversion ${flat(c.version || 'unknown')}\nid ${c.id}\naddress ${c.ip || 'unknown'}\ncredential ${c.token}` +
-      `\ncommands served ${c.served}\nconnected ${dur(c.connectedForSeconds)}`;
-    tbody.append(tr);
-    clientAges.push({ id: c.id, td: last, base: c.secondsAgo, at: Date.now() });
-  }
-  // A plain object would let a client calling itself "__proto__" or "constructor" collide with
-  // Object.prototype and mis-report every state change.
-  const states = new Map(clients.clients.map((c) => [c.id, c.state]));
-  lastClients = { sig: signature, states };
-  refreshAges(clients);
-  stampAges();
-}
-
-const flat = (s) => String(s).replace(/\s+/g, ' ').trim();
-
-// The rows survive a tick untouched when nothing structural changed, so their poll baseline has to
-// be re-stamped here. Without it a perfectly healthy client that simply sits idle drifts past the
-// "late" and "dead" thresholds on screen while the relay keeps reporting secondsAgo: 0 — and the
-// LINK tile, built from the same payload, cheerfully says everything is online.
-function refreshAges(clients) {
-  const byId = new Map(clients.clients.map((c) => [c.id, c]));
-  const now = Date.now();
-  for (const a of clientAges) {
-    const c = byId.get(a.id);
-    if (!c) continue;
-    a.base = c.secondsAgo;
-    a.at = now;
-  }
-}
-
-// The relay's secondsAgo is a snapshot; without this the page would show a frozen client as "3s"
-// forever, which is a lie that costs real debugging time.
-function stampAges() {
-  for (const a of clientAges) {
-    if (a.base < 0) { a.td.textContent = 'never'; a.td.className = 'lp dead'; continue; }
-    const age = a.base + Math.round((Date.now() - a.at) / 1000);
-    a.td.textContent = age + 's';
-    a.td.className = 'lp' + (age > 30 ? ' dead' : age > 9 ? ' late' : '');
-  }
-}
-
-// ---------------------------------------------------------------- stream
-const HEAT = {
-  exec: 'var(--sig)', upload: 'var(--xfer)', download: 'var(--xfer)', connect: 'var(--dim)',
-  timeout: 'var(--bad)', auth: 'var(--bad)', gc: 'var(--faint)',
+// ---------- activity ----------
+const KIND = {
+  exec: ['exec', 'Command'], timeout: ['bad', 'Timed out'], upload: ['xfer', 'Upload'], download: ['xfer', 'Download'],
+  connect: ['conn', 'Connected'], gc: ['conn', 'Cleanup'], auth: ['bad', 'Refused'], pair: ['admin', 'Pairing'],
+  admin: ['admin', 'Access'], oauth: ['admin', 'AI agent'],
 };
-const TAG = {
-  exec: 'EXEC', upload: 'UPLD', download: 'DNLD', connect: 'CONN',
-  timeout: 'TMOU', auth: 'AUTH', gc: 'GC',
-};
-let drawnKeys = new Set();
-let filterChanged = false;
 
-const evKey = (e) => `${e.at}|${e.kind}|${e.client}|${e.message}|${e.id || ''}`;
-
-function ageBucket(seconds) {
-  return seconds < 15 ? '0' : seconds < 120 ? '1' : seconds < 900 ? '2' : '3';
-}
-
-function renderStream(info) {
-  // The relay hands history back oldest-first; sort by the timestamp and fall back on arrival order
-  // so entries that share a second still come out newest-first instead of in an arbitrary order.
-  const all = info.events
-    .map((e, i) => ({ ...e, i, when: new Date(e.at) }))
-    .sort((a, b) => (b.when - a.when) || (b.i - a.i));
-
-  syncOptions($('fClient'), all.map((e) => e.client), 'all clients');
-  syncOptions($('fKind'), all.map((e) => e.kind), 'all events');
-
-  const needle = state.q.toLowerCase();
-  const rows = all.filter((e) =>
-    (!state.client || e.client === state.client) &&
-    (!state.kind || e.kind === state.kind) &&
-    (!needle || `${e.kind} ${e.client} ${e.message}`.toLowerCase().includes(needle)));
-
-  $('count').textContent = rows.length === all.length
-    ? `${all.length} event(s)`
-    : `${rows.length} of ${all.length}`;
-  $('noevents').hidden = rows.length > 0;
-  $('streamBox').hidden = rows.length === 0;
-
-  // Rebuilding the rows on every poll would yank them out from under a click and reset the text
-  // selection, so redraw only when what would be drawn has actually changed. Age buckets are part
-  // of the signature so a row does cool down on its own.
-  const now = Date.now();
-  const shaped = rows.map((e) => ({ e, key: evKey(e), age: ageBucket((now - e.when) / 1000) }));
-  const signature = JSON.stringify([state.selected, shaped.map((r) => [r.key, r.age])]);
-  if (signature === lastDrawn) return;
-  lastDrawn = signature;
-
-  const incoming = shaped.filter((r) => !drawnKeys.has(r.key));
-  // Twenty rows arriving at once during an exec loop would turn the page into a strobe, so past a
-  // handful the arrival is reported as a count instead of animated.
-  const animate = !REDUCE && !filterChanged && incoming.length > 0 && incoming.length <= 8;
-  if (!filterChanged && incoming.length > 8) {
-    $('burst').textContent = `+${incoming.length}`;
-    clearTimeout(renderStream.burstTimer);
-    renderStream.burstTimer = setTimeout(() => { $('burst').textContent = ''; }, 2400);
-  }
-  filterChanged = false;
-
-  const tbody = document.querySelector('#hist tbody');
-  // Rebuilding throws away the focused row, so j/k navigation would snap back to the top every time
-  // a row aged into the next bucket. Remember where the caret was and put it back.
-  const focused = document.activeElement;
-  const focusedId = focused && tbody.contains(focused) ? focused.dataset.id : null;
-  tbody.replaceChildren();
-  let staggered = 0;
-  for (const r of shaped) {
-    const e = r.e;
-    const tr = document.createElement('tr');
-    tr.style.setProperty('--heat', HEAT[e.kind] || 'var(--faint)');
-    tr.dataset.age = r.age;
-    if (e.id) {
+function renderLog() {
+  const q = state.q.toLowerCase();
+  const list = state.events
+    .filter((e) => !state.picked || e.client === state.picked)
+    .filter((e) => !state.kind || (KIND[e.kind]?.[0] ?? 'conn') === state.kind || (state.kind === 'bad' && /failed|timeout/.test(e.message)))
+    .filter((e) => !q || `${e.client} ${e.message}`.toLowerCase().includes(q))
+    .slice().reverse();
+  const shown = list.slice(0, state.limit);
+  $('noEvents').hidden = list.length > 0;
+  $('log').hidden = list.length === 0;
+  $('more').hidden = list.length <= state.limit;
+  $('rows').replaceChildren(...shown.map((e) => {
+    const [cls, label] = KIND[e.kind] ?? ['conn', e.kind];
+    const tr = el('tr', /failed|timeout/.test(e.message) ? 'bad' : cls);
+    tr.append(el('td', 't', new Date(e.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })),
+              el('td', 'k', label), el('td', 'm', e.client), el('td', 'd', e.message));
+    if (e.id && e.kind === 'exec') {
       tr.dataset.id = e.id;
       tr.tabIndex = 0;
-      tr.title = 'show output';
-      // A screen reader would otherwise announce "table row" and give no hint that Enter does
-      // anything at all.
-      tr.setAttribute('role', 'button');
-      tr.setAttribute('aria-label', `show output of ${e.kind} on ${flat(e.client)} at ${localTime(e.when)}`);
-      if (e.id === state.selected) tr.className = 'sel';
+      tr.title = 'Show output';
+      tr.addEventListener('click', () => openDetail(e));
+      tr.addEventListener('keydown', (k) => { if (k.key === 'Enter') openDetail(e); });
     }
-    if (animate && !drawnKeys.has(r.key) && staggered < 6) {
-      tr.classList.add('in');
-      tr.style.animationDelay = (staggered * 24) + 'ms';
-      staggered++;
-    }
-    tr.append(
-      cell('', 'gut'),
-      cell(localTime(e.when), 'ts'),
-      cell(TAG[e.kind] || 'EVT', 'tag'),
-      cell(e.client),
-      msgCell(e.message),
-    );
-    tr.dataset.date = localDate(e.when);
-    tbody.append(tr);
+    return tr;
+  }));
+}
+
+$('q').addEventListener('input', () => { state.q = $('q').value; renderLog(); });
+$('kind').addEventListener('change', () => { state.kind = $('kind').value; renderLog(); });
+$('more').addEventListener('click', () => { state.limit += 100; renderLog(); });
+
+// ---------- numbers ----------
+function renderNumbers(info) {
+  const s = info.stats;
+  const rows = [
+    ['Commands', s.execs, ''],
+    ['Timed out', s.execs ? `${(s.timeouts / s.execs * 100).toFixed(1)} %` : '0 %', `${s.timeouts} of ${s.execs}`, s.execs > 0 && s.timeouts / s.execs > .05],
+    ['Files moved', s.uploads + s.downloads, bytes(s.bytesUploaded + s.bytesDownloaded)],
+    ['Refused requests', s.authFailures, 'wrong or missing key', s.authFailures > 0],
+  ];
+  const box = $('numbers');
+  box.replaceChildren(el('h2', '', 'Since start'), ...rows.map(([label, value, sub, alarm]) => {
+    const d = el('div', `num${alarm ? ' alarm' : ''}`);
+    const left = el('div');
+    left.append(el('div', '', label), el('span', '', sub));
+    d.append(left, el('b', '', value));
+    return d;
+  }));
+  // Events per minute over the last half hour, from the history the relay keeps.
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.id = 'spark';
+  svg.setAttribute('viewBox', '0 0 30 10');
+  svg.setAttribute('preserveAspectRatio', 'none');
+  const now = Date.now();
+  const bins = Array.from({ length: 30 }, () => ({ n: 0, bad: 0 }));
+  for (const e of state.events) {
+    const age = Math.floor((now - new Date(e.at)) / 60000);
+    if (age >= 0 && age < 30) { bins[29 - age].n++; if ((KIND[e.kind]?.[0]) === 'bad') bins[29 - age].bad++; }
   }
-  drawnKeys = new Set(shaped.map((r) => r.key));
-  if (focusedId) {
-    const back = tbody.querySelector(`tr[data-id="${CSS.escape(focusedId)}"]`);
-    if (back) back.focus({ preventScroll: true });
-  }
-}
-
-function msgCell(message) {
-  const td = document.createElement('td');
-  td.className = 'msg';
-  // Whatever the clamp hides is still one hover away. A property, not markup, so relay text stays
-  // text no matter what it contains.
-  td.title = message;
-  const div = document.createElement('div');
-  div.append(txt(message));
-  td.append(div);
-  return td;
-}
-
-document.querySelector('#hist tbody').addEventListener('click', (e) => {
-  const tr = e.target.closest('tr[data-id]');
-  if (!tr) return;
-  select(tr.dataset.id);
-});
-
-function select(id) {
-  state.selected = id;
-  if (latest) renderStream(latest);
-  openDetail();
-  loadDetail(id);
-}
-
-// Where the caret was before the panel took over, so closing it can hand the caret back instead of
-// dropping it on <body> with no way to return to the row by keyboard.
-let returnFocusTo = null;
-
-function openDetail() {
-  if ($('detail').hidden) returnFocusTo = state.selected;
-  $('main').classList.add('detail-open');
-  $('backdrop').hidden = false;
-  $('detail').hidden = false;
-  $('dclose').focus({ preventScroll: true });
-}
-
-function closeDetail() {
-  if ($('detail').hidden) return;
-  const back = returnFocusTo;
-  $('main').classList.remove('detail-open');
-  $('backdrop').hidden = true;
-  $('detail').hidden = true;
-  state.selected = null;
-  returnFocusTo = null;
-  if (latest) renderStream(latest);
-  if (back) {
-    const row = document.querySelector(`#hist tbody tr[data-id="${CSS.escape(back)}"]`);
-    if (row) row.focus({ preventScroll: true });
-  }
-}
-
-$('dclose').addEventListener('click', closeDetail);
-$('backdrop').addEventListener('click', closeDetail);
-
-function detailNote(message) {
-  const p = el('div', 'note', message);
-  $('detailBody').replaceChildren(p);
-}
-
-function field(label, value, className) {
-  const k = el('span', '', label);
-  const v = el('div', className, value);
-  return [k, v];
-}
-
-function block(label, value) {
-  const h = el('div', 'dlabel', label);
-  const pre = document.createElement('pre');
-  pre.append(txt(value.length ? value : '(empty)'));
-  return [h, pre];
-}
-
-async function loadDetail(id) {
-  $('dtitle').textContent = 'command output';
-  detailNote('loading…');
-  let d;
-  try {
-    d = await api('/api/command?id=' + encodeURIComponent(id));
-  } catch (err) {
-    // Two quick clicks race, and the slower answer must not repaint a panel that has moved on.
-    if (state.selected !== id) return;
-    // Without --open-status the whole API needs a token; ask for one without hiding the page.
-    if (err.auth === 401) { detailNote('this relay needs a token'); showGate('', false); }
-    else if (err.auth === 429) detailNote('too many attempts — wait a few minutes');
-    else if (err.status) detailNote(`relay answered ${err.status}`);
-    else detailNote('relay unreachable');
-    return;
-  }
-  if (state.selected !== id) return;
-  if (!d || d.error) {
-    detailNote(d && d.error ? d.error : 'no stored output — the command may still be running');
-    return;
-  }
-
-  const started = new Date(d.startedUtc);
-  const kv = el('div', 'kv');
-  kv.append(
-    ...field('client', d.client),
-    ...field('started', `${localDate(started)} ${localTime(started)}`),
-    ...field('duration', ms(d.durationMs)),
-    ...field('exit code', d.exitCode, d.exitCode === 0 ? 'ok' : 'bad'),
-  );
-
-  const parts = [kv];
-  if (d.truncated) parts.push(el('div', 'note', 'output was truncated by the relay — only the first part is kept'));
-  parts.push(...block('command', d.command), ...block('stdout', d.stdout), ...block('stderr', d.stderr));
-  $('detailBody').replaceChildren(...parts);
-}
-
-// ---------------------------------------------------------------- input
-for (const [id, key] of [['q', 'q'], ['fClient', 'client'], ['fKind', 'kind']]) {
-  $(id).addEventListener('input', () => {
-    state[key] = $(id).value;
-    // A new view of old rows is not an arrival, so nothing animates on a filter change.
-    filterChanged = true;
-    if (latest) renderStream(latest);
+  const peak = Math.max(1, ...bins.map((b) => b.n));
+  bins.forEach((b, i) => {
+    if (!b.n) return;
+    const r = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    const h = Math.max(.6, b.n / peak * 10);
+    r.setAttribute('x', i + .1); r.setAttribute('width', .8); r.setAttribute('y', 10 - h); r.setAttribute('height', h);
+    if (b.bad) r.setAttribute('class', 'bad');
+    svg.append(r);
   });
+  const cap = el('div', 'dim', 'Activity, last 30 minutes');
+  cap.style.fontSize = '12.5px';
+  box.append(svg, cap);
 }
 
-$('live').addEventListener('change', () => {
-  if ($('live').checked) tick();
-  else setBeat('paused', 'paused');
-});
-
-// Terminal muscle memory: the page sits next to one all day.
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && !$('detail').hidden) { closeDetail(); return; }
-  // Ctrl+L, Cmd+L, Ctrl+J and friends belong to the browser. Without this the address-bar shortcut
-  // also switched off polling, and the operator came back to a frozen dashboard with no clue why.
-  if (e.ctrlKey || e.metaKey || e.altKey) return;
-  const typing = /^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName)
-    || document.activeElement.isContentEditable;
-  if (typing) return;
-  // While the output panel is up it owns the keyboard; otherwise j/k would scroll a table the
-  // operator cannot even see behind the backdrop.
-  if (!$('detail').hidden) return;
-  const rows = [...document.querySelectorAll('#hist tbody tr[data-id]')];
-  if (e.key === '/') { e.preventDefault(); $('q').focus(); }
-  else if (e.key === 'l') { $('live').checked = !$('live').checked; $('live').dispatchEvent(new Event('change')); }
-  else if (e.key === 'j' || e.key === 'k') {
-    if (!rows.length) return;
-    e.preventDefault();
-    const at = rows.findIndex((r) => r === document.activeElement);
-    const next = e.key === 'j' ? Math.min(rows.length - 1, at + 1) : Math.max(0, at < 0 ? 0 : at - 1);
-    rows[next].focus();
-  } else if (e.key === 'Enter' && document.activeElement.dataset && document.activeElement.dataset.id) {
-    select(document.activeElement.dataset.id);
-  }
-});
-
-// ---------------------------------------------------------------- tick
-function renderChips(info) {
-  const c = $('chips');
-  c.replaceChildren(
-    el('span', '', `up ${dur(info.uptimeSeconds)}`),
-    el('span', 'sep'),
+function renderRelayLine(info) {
+  const line = $('relayLine');
+  const ver = info.outdated
+    ? el('span', 'warn', `relay v${info.version} — v${info.latest} is out`)
+    : el('span', '', info.latest === info.version ? `relay v${info.version}, up to date` : `relay v${info.version}`);
+  line.replaceChildren(ver, el('span', '', `up ${dur(info.uptimeSeconds)}`),
     el('span', info.tls ? '' : 'bad', info.tls ? 'TLS' : 'plain HTTP'),
-    el('span', 'sep'),
-    el('span', '', `${info.tokens} credential(s)`),
-    el('span', 'sep'),
-    info.outdated
-      ? el('span', 'warn', `v${info.version}, v${info.latest} available`)
-      : el('span', '', info.latest === info.version ? `v${info.version}, up to date` : `v${info.version}`),
-  );
+    el('span', '', `${info.tokens} keys`));
 }
 
-let inFlight = false;
+// ---------- detail ----------
+async function openDetail(e) {
+  $('dTitle').textContent = `Command on ${e.client}`;
+  $('dKv').replaceChildren();
+  $('dBody').replaceChildren(el('div', 'dim', 'Loading output…'));
+  $('detail').hidden = false;
+  $('shade').hidden = false;
+  $('dClose').focus();
+  try {
+    const r = await api(`/api/command?id=${encodeURIComponent(e.id)}`);
+    const kv = $('dKv');
+    for (const [k, v] of [['Machine', r.client], ['Started', new Date(r.startedUtc).toLocaleString()], ['Took', `${(r.durationMs / 1000).toFixed(1)} s`], ['Exit code', r.exitCode]])
+      kv.append(el('span', '', k), el('div', 'mono', v));
+    const body = [el('h2', '', 'Command'), el('pre', '', r.command), el('h2', '', 'Output'), el('pre', '', r.stdout || '(none)')];
+    if (r.stderr) body.push(el('h2', '', 'Errors'), el('pre', '', r.stderr));
+    if (r.truncated) body.push(el('div', 'dim', 'Shortened: the relay keeps the first 64 kB.'));
+    $('dBody').replaceChildren(...body);
+  } catch {
+    $('dBody').replaceChildren(el('div', 'dim', 'The relay no longer holds this output (it keeps the last 200 commands).'));
+  }
+}
+function closeDetail() { $('detail').hidden = true; $('shade').hidden = true; }
+$('dClose').addEventListener('click', closeDetail);
+$('shade').addEventListener('click', closeDetail);
+document.addEventListener('keydown', (k) => { if (k.key === 'Escape') closeDetail(); });
 
+// ---------- refresh ----------
+let busy = false;
 async function tick() {
-  // With the prompt up and no token in hand, every refresh is two more failed attempts. The relay's
-  // own brute-force throttle then locks the operator's address out within fifteen seconds, and the
-  // 401s flood the 500-entry history until nothing else is left in it. Wait for the submit instead.
-  if (gateWanted && !token) return;
-  // A stalled relay must not let requests pile up behind each other; the pile also makes the byte
-  // rate nonsense, because dt collapses when they all resolve at once.
-  if (inFlight) return;
-  inFlight = true;
-  let clients, info;
+  if (busy) return;
+  busy = true;
   try {
-    [clients, info] = await Promise.all([api('/api/clients'), api('/api/events?limit=500')]);
-  } catch (e) {
-    // A relay started with --open-status serves these without a token, so the form only appears
-    // when the relay actually demands one. The heartbeat is deliberately not restarted here.
-    if (e.auth === 401) showGate(token ? 'wrong token' : null, true);
-    else if (e.auth === 429) showGate('too many attempts — wait a few minutes', true);
-    else if (e.status) setBeat('dead', `relay error ${e.status}`);
-    else setBeat('dead', 'no reply');
-    return;
+    const [clients, info] = await Promise.all([api('/api/clients'), api('/api/events?limit=500')]);
+    state.clients = clients.clients;
+    state.events = info.events;
+    state.info = info;
+    renderPorts();
+    renderLog();
+    renderNumbers(info);
+    renderRelayLine(info);
+    $('beat').className = 'live';
+    $('beat').title = `updated ${new Date().toLocaleTimeString()}`;
+  } catch (err) {
+    $('beat').className = 'dead';
+    $('beat').title = `no answer from the relay (${err.message})`;
   } finally {
-    inFlight = false;
+    busy = false;
   }
-
-  try {
-    // Counters that went backwards mean a different process is answering now.
-    if (prev && info.uptimeSeconds < prev.uptime) resetForNewRelay();
-
-    if (!gateWanted) gate.hidden = true;
-    sections.forEach((el2) => { el2.hidden = false; });
-    latest = info;
-    if (info.events.length >= 500) ringSaturated = true;
-
-    renderChips(info);
-    absorb(info.events);
-    renderDeck(clients, info);
-    renderHistogram(info.events.length);
-    renderSessions(clients);
-    renderStream(info);
-
-    // The tab is 100px wide and hidden behind a terminal most of the day; make it say something.
-    const running = clients.clients.reduce((a, c) => a + c.running, 0);
-    const stale = clients.count > clients.connected;
-    document.title = running ? `(${running} run) RemoteCmd` : stale ? '[!] RemoteCmd' : 'RemoteCmd relay';
-  } catch (e) {
-    // A payload that parsed but did not have the shape the page expects would otherwise leave the
-    // last good numbers frozen on screen under a heartbeat still claiming to be live — for a
-    // monitoring page that is a worse failure than saying nothing at all.
-    setBeat('dead', 'bad reply');
-    return;
-  }
-
-  // Restarted only once everything actually repainted, so the sweep means what it looks like.
-  setBeat('live', '');
 }
 
-buildDeck();
-buildAuthSub();
-buildHistogram();
-setBeat('paused', '');
+async function checkAgents() {
+  try {
+    const { pending } = await api('/api/admin/oauth/pending', { timeout: 5000 });
+    const bar = $('agentBar');
+    bar.hidden = pending.length === 0;
+    bar.textContent = pending.length === 1
+      ? `${pending[0].client} asks for access — code ${pending[0].userCode}. Review it`
+      : `${pending.length} AI agents ask for access. Review them`;
+  } catch { /* the main refresh reports connection problems */ }
+}
+
 tick();
-setInterval(() => { if ($('live').checked) tick(); }, 3000);
-setInterval(stampAges, 1000);
+checkAgents();
+setInterval(tick, 3000);
+setInterval(checkAgents, 3000);
 </script>
 </body>
 </html>

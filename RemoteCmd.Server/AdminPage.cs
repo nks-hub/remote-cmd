@@ -136,7 +136,7 @@ document.getElementById('f').addEventListener('submit', async (e) => {
     <p class="muted" id="tlsNote"></p>
   </section>
 
-  <section>
+  <section id="access">
     <h2>Access</h2>
     <p>Every paired machine has its own key and can only take commands, never send them. Controllers
        (scripts, curl, AI agents) send commands. Revoking cuts a machine or controller off at once.</p>
@@ -348,7 +348,7 @@ $('logout').addEventListener('click', async () => {
 loadInfo(); loadPending(); loadCreds(); loadOAuth();
 setInterval(() => { loadCreds(); loadPending(); }, 5000);
 setInterval(loadOAuth, 2000);
-if (location.hash === '#agents') $('agents').scrollIntoView();
+if (location.hash) document.querySelector(location.hash)?.scrollIntoView();
 </script>
 </body>
 </html>
