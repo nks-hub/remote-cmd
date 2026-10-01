@@ -1,0 +1,122 @@
+name: Installers
+
+# Runs the one-line installers exactly as the README and the dashboard print them, on clean
+# machines: install a relay as a service, create a pairing code, install and pair a client as a
+# service, run a command through it, then upgrade the client without a code and run one again.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release to install (default latest)
+        required: false
+        default: latest
+
+jobs:
+  unix:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel]
+    env:
+      SCRIPT: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/install.sh
+      VERSION: ${{ github.event.release.tag_name || inputs.version || 'latest' }}
+    steps:
+      - name: Install the relay
+        run: curl -fsSL "$SCRIPT" | sudo sh -s -- server --version "$VERSION"
+
+      - name: Wait for the dashboard
+        run: |
+          for i in $(seq 60); do curl -sf http://localhost:7891/api/admin/info && exit 0; sleep 1; done
+          exit 1
+
+      - name: Install and pair a client
+        run: |
+          CODE=$(/opt/remotecmd/server/RemoteCmd.Server pair --name ci-client | awk '/Pairing code/ {print $3}')
+          test -n "$CODE"
+          curl -fsSL "$SCRIPT" | sudo sh -s -- client --server https://localhost:7890 --code "$CODE" --version "$VERSION"
+
+      - name: Run a command on the client
+        run: |
+          TOKEN=$(/opt/remotecmd/server/RemoteCmd.Server token add --name ci | tail -1)
+          echo "TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          for i in $(seq 30); do
+            OUT=$(curl -sk -H "X-Token: $TOKEN" -H 'Content-Type: application/json' \
+              'https://localhost:7890/api/exec?client=ci-client' -d '{"command":"echo installer-ok; uname -sm"}' || true)
+            echo "$OUT"
+            echo "$OUT" | grep -q installer-ok && exit 0
+            sleep 2
+          done
+          exit 1
+
+      - name: Upgrade the client without a code
+        run: |
+          curl -fsSL "$SCRIPT" | sudo sh -s -- client --version "$VERSION"
+          for i in $(seq 30); do
+            OUT=$(curl -sk -H "X-Token: $TOKEN" -H 'Content-Type: application/json' \
+              'https://localhost:7890/api/exec?client=ci-client' -d '{"command":"echo upgraded-ok"}' || true)
+            echo "$OUT" | grep -q upgraded-ok && exit 0
+            sleep 2
+          done
+          exit 1
+
+      - name: Settings files are private
+        run: |
+          sudo ls -l /etc/remotecmd/
+          test "$(sudo stat -c %a /etc/remotecmd/client.json 2>/dev/null || sudo stat -f %Lp /etc/remotecmd/client.json)" = 600
+          test "$(sudo stat -c %a /etc/remotecmd/server.json 2>/dev/null || sudo stat -f %Lp /etc/remotecmd/server.json)" = 600
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          sudo journalctl -u RemoteCmdServer -u RemoteCmdClient --no-pager -n 80 2>/dev/null || true
+          sudo tail -n 80 /var/log/RemoteCmdServer.log /var/log/RemoteCmdClient.log 2>/dev/null || true
+
+  windows:
+    name: windows-latest
+    runs-on: windows-latest
+    env:
+      SCRIPT: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/install.ps1
+      VERSION: ${{ github.event.release.tag_name || inputs.version || 'latest' }}
+    steps:
+      # Windows PowerShell 5.1, which is what an admin prompt on a stock machine gives you.
+      - name: Install the relay
+        shell: powershell
+        run: |
+          & ([scriptblock]::Create((irm $env:SCRIPT))) -Role server -Version $env:VERSION
+
+      - name: Install and pair a client
+        shell: powershell
+        run: |
+          $server = "$env:ProgramFiles\RemoteCmd\server\RemoteCmd.Server.exe"
+          for ($i = 0; $i -lt 60; $i++) { try { Invoke-RestMethod http://localhost:7891/api/admin/info | Out-Null; break } catch { Start-Sleep 1 } }
+          $code = ((& $server pair --name ci-client) | Select-String 'Pairing code: (\S+)').Matches[0].Groups[1].Value
+          if (-not $code) { throw 'no pairing code' }
+          & ([scriptblock]::Create((irm $env:SCRIPT))) -Server 'https://localhost:7890' -Code $code -Version $env:VERSION
+
+      - name: Run a command, upgrade, run again
+        shell: pwsh
+        run: |
+          $server = "$env:ProgramFiles\RemoteCmd\server\RemoteCmd.Server.exe"
+          $token = (& $server token add --name ci | Select-Object -Last 1).Trim()
+          function Run($cmd) {
+            for ($i = 0; $i -lt 30; $i++) {
+              try {
+                $r = Invoke-RestMethod -SkipCertificateCheck -Method Post -Uri 'https://localhost:7890/api/exec?client=ci-client' `
+                  -Headers @{ 'X-Token' = $token } -ContentType 'application/json' -Body (@{ command = $cmd } | ConvertTo-Json)
+                $r.output
+                if ($r.exitCode -eq 0) { return }
+              } catch { $_.Exception.Message }
+              Start-Sleep 2
+            }
+            throw "command never ran: $cmd"
+          }
+          Run 'echo installer-ok; $PSVersionTable.PSVersion.ToString()'
+          powershell -NoProfile -Command "& ([scriptblock]::Create((irm '$env:SCRIPT'))) -Version '$env:VERSION'"
+          if ($LASTEXITCODE -ne 0) { throw 'upgrade failed' }
+          Run 'echo upgraded-ok'
+          Get-Service RemoteCmdServer, RemoteCmdClient | Format-Table Name, Status, StartType
+          (Get-Acl "$env:ProgramData\RemoteCmd\client.json").Access | Format-Table IdentityReference, FileSystemRights
