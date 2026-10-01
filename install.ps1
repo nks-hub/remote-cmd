@@ -21,6 +21,7 @@ param(
     [string] $Name,
     [string] $Version = 'latest',
     [string] $InstallDir,
+    [string] $ServiceName,
     [switch] $NoService
 )
 
@@ -35,11 +36,13 @@ if (-not $NoService -and -not $principal.IsInRole([Security.Principal.WindowsBui
 
 $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
 $project = if ($Role -eq 'server') { 'RemoteCmd.Server' } else { 'RemoteCmd.Client' }
-$service = if ($Role -eq 'server') { 'RemoteCmdServer' } else { 'RemoteCmdClient' }
+$service = if ($ServiceName) { $ServiceName } elseif ($Role -eq 'server') { 'RemoteCmdServer' } else { 'RemoteCmdClient' }
+# A second client on one machine needs its own service, settings and folder.
+$extra = if ($ServiceName) { @('--service-name', $ServiceName) } else { @() }
 $asset = "$project-win-$arch.zip"
 $releases = 'https://github.com/nks-hub/remote-cmd/releases'
 $url = if ($Version -eq 'latest') { "$releases/latest/download/$asset" } else { "$releases/download/v$($Version.TrimStart('v'))/$asset" }
-if (-not $InstallDir) { $InstallDir = Join-Path $env:ProgramFiles "RemoteCmd\$Role" }
+if (-not $InstallDir) { $InstallDir = Join-Path $env:ProgramFiles ("RemoteCmd\$Role" + $(if ($ServiceName) { "-$ServiceName" } else { '' })) }
 
 $tmp = Join-Path $env:TEMP ("remotecmd-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmp | Out-Null
@@ -65,7 +68,7 @@ Write-Host "Installed $(& $exe --version) to $InstallDir"
 if ($Role -eq 'client') {
     if ($Code) {
         if (-not $Server) { throw '-Code needs -Server too.' }
-        $pairArgs = @('pair', $Server, $Code)
+        $pairArgs = @('pair', $Server, $Code) + $extra
         if ($Name) { $pairArgs += @('--name', $Name) }
         if (-not $NoService) { $pairArgs += '--install-service' }
         & $exe @pairArgs
@@ -73,13 +76,13 @@ if ($Role -eq 'client') {
     }
     elseif (-not $NoService) {
         # No code: an upgrade of a machine that is already paired.
-        & $exe install-service
+        & $exe install-service @extra
         if ($LASTEXITCODE -ne 0) { throw 'No saved settings to start from. Pass -Server and -Code from the relay dashboard.' }
     }
 }
 else {
     if (-not $NoService) {
-        & $exe install-service
+        & $exe install-service @extra
         if ($LASTEXITCODE -ne 0) { throw "Service install failed (exit $LASTEXITCODE)." }
     }
     Write-Host 'Open the dashboard on this machine: http://localhost:7891  (Pair & manage -> Create code)'

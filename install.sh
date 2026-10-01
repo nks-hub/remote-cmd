@@ -14,6 +14,7 @@ name=""
 version=latest
 dir=""
 no_service=0
+service_name=""
 
 case "${1:-}" in
   client|server) role=$1; shift ;;
@@ -25,6 +26,7 @@ while [ $# -gt 0 ]; do
     --name) name=$2; shift 2 ;;
     --version) version=$2; shift 2 ;;
     --dir) dir=$2; shift 2 ;;
+    --service-name) service_name=$2; shift 2 ;;
     --no-service) no_service=1; shift ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
@@ -45,7 +47,9 @@ if [ "$role" = server ]; then project=RemoteCmd.Server; service=RemoteCmdServer;
 asset="$project-$os-$arch.tar.gz"
 releases=https://github.com/nks-hub/remote-cmd/releases
 if [ "$version" = latest ]; then url="$releases/latest/download/$asset"; else url="$releases/download/v${version#v}/$asset"; fi
-[ -n "$dir" ] || dir="/opt/remotecmd/$role"
+# A second client on one machine needs its own service, settings and folder.
+if [ -n "$service_name" ]; then service=$service_name; fi
+[ -n "$dir" ] || dir="/opt/remotecmd/$role${service_name:+-$service_name}"
 
 if [ "$no_service" = 0 ] && [ "$(id -u)" != 0 ]; then
   echo "Installing a service needs root: pipe into 'sudo sh', or add --no-service." >&2
@@ -75,14 +79,15 @@ if [ "$role" = client ]; then
   if [ -n "$code" ]; then
     [ -n "$server" ] || { echo "--code needs --server too." >&2; exit 2; }
     set -- pair "$server" "$code"
+    [ -z "$service_name" ] || set -- "$@" --service-name "$service_name"
     [ -z "$name" ] || set -- "$@" --name "$name"
     [ "$no_service" = 1 ] || set -- "$@" --install-service
     "$dir/$project" "$@"
   elif [ "$no_service" = 0 ]; then
     # No code: an upgrade of a machine that is already paired.
-    "$dir/$project" install-service || { echo "No saved settings. Pass --server and --code from the relay dashboard." >&2; exit 1; }
+    "$dir/$project" install-service ${service_name:+--service-name "$service_name"} || { echo "No saved settings. Pass --server and --code from the relay dashboard." >&2; exit 1; }
   fi
 else
-  [ "$no_service" = 1 ] || "$dir/$project" install-service
+  [ "$no_service" = 1 ] || "$dir/$project" install-service ${service_name:+--service-name "$service_name"}
   echo "Open the dashboard on this machine: http://localhost:7891  (Pair & manage -> Create code)"
 fi
