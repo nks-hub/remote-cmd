@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using Microsoft.AspNetCore.Http.Features;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
@@ -244,12 +245,11 @@ app.MapPost("/api/result", async (HttpRequest req) =>
 {
     var session = TouchSession(req, clients, events);
     var requestId = req.Query["requestId"].FirstOrDefault();
-    using var ms = new MemoryStream();
-    await req.Body.CopyToAsync(ms);
+    var body = await ReadBodyAsync(req);
     CommandResult result;
     try
     {
-        var decryptedBytes = KeyFor(req).Decrypt(ms.ToArray());
+        var decryptedBytes = KeyFor(req).Decrypt(body);
         result = JsonSerializer.Deserialize<CommandResult>(decryptedBytes, new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
                  ?? new CommandResult { Output = "[EMPTY RESULT]", ExitCode = -1 };
     }
@@ -298,7 +298,7 @@ app.MapGet("/api/file-data", (HttpRequest req) =>
     // A stale id means the client is asking for a transfer that has already been settled; sending
     // it the current one instead is how the wrong bytes reached the wrong path.
     if (job?.Data == null || (!string.IsNullOrEmpty(wanted) && job.Id != wanted)) return Results.NotFound();
-    return Results.File(KeyFor(req).Encrypt(job.Data), "application/octet-stream");
+    return SendBytes(KeyFor(req).Encrypt(job.Data));
 });
 
 // The client reports here once it has finished writing the file. It calls this whether the write
@@ -326,11 +326,10 @@ app.MapPost("/api/file-upload", async (HttpRequest req) =>
         return Results.Ok();
     }
 
-    using var ms = new MemoryStream();
-    await req.Body.CopyToAsync(ms);
+    var body = await ReadBodyAsync(req);
     try
     {
-        var decrypted = KeyFor(req).Decrypt(ms.ToArray());
+        var decrypted = KeyFor(req).Decrypt(body);
         job.Result.TrySetResult(new FileTransfer { Data = decrypted });
     }
     catch (Exception ex)
@@ -405,9 +404,7 @@ app.MapPost("/api/upload", async (HttpRequest req) =>
 
     var session = target.Session!;
 
-    using var ms = new MemoryStream();
-    await req.Body.CopyToAsync(ms);
-    var data = ms.ToArray();
+    var data = await ReadBodyAsync(req);
 
     Console.WriteLine($"[UPLOAD] {session.Name}: {FormatBytes(data.Length)} -> {remotePath}");
     Interlocked.Increment(ref stats.Uploads);
@@ -470,7 +467,7 @@ app.MapGet("/api/download", async (HttpRequest req) =>
         }
         Interlocked.Add(ref stats.BytesDownloaded, result.Data.Length);
         events.Add("download", session.Name, $"{FormatBytes(result.Data.Length)} <- {Excerpt(remotePath)}");
-        return Results.File(result.Data, "application/octet-stream", Path.GetFileName(remotePath));
+        return SendBytes(result.Data, Path.GetFileName(remotePath));
     }
     catch (OperationCanceledException)
     {
@@ -695,6 +692,32 @@ static ClientSession TouchSession(HttpRequest req, ConcurrentDictionary<string, 
     }
     session.LastPoll = DateTime.UtcNow;
     return session;
+}
+
+// Results.File(byte[]) hands the whole array to Kestrel in one write, which copies all of it into
+// the pinned buffer pool before backpressure applies. That pool never shrinks on .NET 9, so every
+// large transfer left its full size behind for good. Streaming copies in small chunks that wait
+// for the socket, keeping the pool at a few buffers per connection.
+static IResult SendBytes(byte[] data, string? fileName = null)
+    => Results.Stream(new MemoryStream(data, writable: false), "application/octet-stream", fileName);
+
+// A growing MemoryStream doubles its buffer on the way up and ToArray copies it once more, so a
+// 150 MB upload used to churn through several large-object-heap arrays for one file. With a known
+// length the body lands in a single array of exactly that size. Kestrel only enforces
+// MaxRequestBodySize once the body is read, so the declared length is checked against it first —
+// otherwise a header alone could make the relay allocate whatever it claims.
+static async Task<byte[]> ReadBodyAsync(HttpRequest req)
+{
+    var max = req.HttpContext.Features.Get<IHttpMaxRequestBodySizeFeature>()?.MaxRequestBodySize;
+    if (req.ContentLength is long length && (max == null || length <= max))
+    {
+        var buffer = new byte[length];
+        await req.Body.ReadExactlyAsync(buffer);
+        return buffer;
+    }
+    using var ms = new MemoryStream();
+    await req.Body.CopyToAsync(ms);
+    return ms.ToArray();
 }
 
 static ClientSession? FindByNameOrId(ConcurrentDictionary<string, ClientSession> clients, string nameOrId)
