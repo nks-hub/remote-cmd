@@ -5,8 +5,8 @@ using Xunit;
 namespace RemoteCmd.Tests;
 
 /// <summary>
-/// The status page must be usable without ever putting the token in a URL: the page itself loads
-/// unauthenticated (it carries no data) and the API behind it accepts the X-Token header.
+/// The status page lives on the loopback dashboard listener only; on the relay port the API behind
+/// it accepts the X-Token header and nothing else.
 /// </summary>
 [Collection("CryptoSerial")]
 public class StatusPageTests : IClassFixture<RemoteCmdFactory>
@@ -16,15 +16,10 @@ public class StatusPageTests : IClassFixture<RemoteCmdFactory>
     public StatusPageTests(RemoteCmdFactory factory) => _http = factory.CreateClient();
 
     [Fact]
-    public async Task PageLoadsWithoutAToken()
+    public async Task ThePageIsNotServedOnTheRelayPort()
     {
-        var res = await _http.GetAsync("/ui");
-
-        Assert.Equal(HttpStatusCode.OK, res.StatusCode);
-        var html = await res.Content.ReadAsStringAsync();
-        Assert.Contains("relay token", html);          // asks for it in the browser
-        Assert.Contains("sessionStorage", html);        // keeps it out of the URL
-        Assert.DoesNotContain(RemoteCmdFactory.Token, html);
+        Assert.Equal(HttpStatusCode.NotFound, (await _http.GetAsync("/ui")).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, (await _http.GetAsync("/manage")).StatusCode);
     }
 
     /// <summary>

@@ -58,7 +58,7 @@ public sealed class PollWorker : BackgroundService
 
         var handler = new SocketsHttpHandler
         {
-            SslOptions = { RemoteCertificateValidationCallback = (_, _, _, _) => true },
+            SslOptions = { RemoteCertificateValidationCallback = (_, cert, _, _) => CertificateMatches(cert) },
             PooledConnectionLifetime = TimeSpan.FromSeconds(30),
             PooledConnectionIdleTimeout = TimeSpan.FromSeconds(15),
             ConnectTimeout = TimeSpan.FromSeconds(10),
@@ -132,6 +132,21 @@ public sealed class PollWorker : BackgroundService
         }
 
         _log.LogInformation("Remote CMD Client stopped.");
+    }
+
+    /// <summary>
+    /// The relay's certificate is self-signed, so the usual chain check would always fail. A client
+    /// that paired knows the exact certificate and accepts only that one; one configured by hand with
+    /// a bare token has nothing to compare against and accepts any, as clients always did.
+    /// </summary>
+    private bool CertificateMatches(System.Security.Cryptography.X509Certificates.X509Certificate? cert)
+    {
+        if (_config.CertSha256 is null) return true;
+        var seen = cert?.GetCertHashString(System.Security.Cryptography.HashAlgorithmName.SHA256);
+        if (string.Equals(seen, _config.CertSha256, StringComparison.OrdinalIgnoreCase)) return true;
+        _log.LogError("[TLS] relay certificate {Seen} is not the paired one {Pinned} — refusing to connect",
+            seen ?? "(none)", _config.CertSha256);
+        return false;
     }
 
     private async Task RunFileTransferAsync(Task<long> transfer)

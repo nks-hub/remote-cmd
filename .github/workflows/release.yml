@@ -46,6 +46,31 @@ jobs:
             rid: osx-arm64
             project: RemoteCmd.Server
             archive: tar.gz
+          # Cross-compiled: a self-contained .NET publish needs no native toolchain of the target.
+          - os: windows-latest
+            rid: win-arm64
+            project: RemoteCmd.Client
+            archive: zip
+          - os: windows-latest
+            rid: win-arm64
+            project: RemoteCmd.Server
+            archive: zip
+          - os: ubuntu-latest
+            rid: linux-arm64
+            project: RemoteCmd.Client
+            archive: tar.gz
+          - os: ubuntu-latest
+            rid: linux-arm64
+            project: RemoteCmd.Server
+            archive: tar.gz
+          - os: macos-latest
+            rid: osx-x64
+            project: RemoteCmd.Client
+            archive: tar.gz
+          - os: macos-latest
+            rid: osx-x64
+            project: RemoteCmd.Server
+            archive: tar.gz
     steps:
       - uses: actions/checkout@v4
 

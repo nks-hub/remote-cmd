@@ -2,12 +2,34 @@ using System.Text.Json.Serialization;
 
 namespace RemoteCmd.Client;
 
-/// <summary>Connection settings shared by console and service hosting.</summary>
-public sealed record ClientConfig(string ServerArg, string Token, string Name, bool KeepAwake = false)
+/// <summary>
+/// Connection settings shared by console and service hosting, and the shape of the client's config
+/// file. <see cref="CertSha256"/> pins the relay's TLS certificate; without it any certificate is
+/// accepted, as clients did before pairing existed.
+/// </summary>
+public sealed record ClientConfig(
+    [property: JsonPropertyName("server")] string ServerArg,
+    [property: JsonPropertyName("token")] string Token,
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("keepAwake")] bool KeepAwake = false,
+    [property: JsonPropertyName("certSha256")] string? CertSha256 = null)
 {
-    public string BaseUrl => ServerArg.StartsWith("http")
-        ? ServerArg.TrimEnd('/')
-        : $"https://{ServerArg}";
+    [JsonIgnore]
+    public string BaseUrl => NormalizeServer(ServerArg);
+
+    /// <summary>
+    /// Accepts what people actually type: a bare host, host:port or a full URL. Without a scheme it is
+    /// https on the relay's port 7890; a URL with a scheme keeps that scheme's own default port, so a
+    /// relay behind a reverse proxy on 443 still works.
+    /// </summary>
+    public static string NormalizeServer(string server)
+    {
+        var s = server.Trim().TrimEnd('/');
+        if (s.Contains("://")) return new Uri(s).GetLeftPart(UriPartial.Authority);
+        var host = s.Split('/')[0];
+        var hasPort = host.LastIndexOf(':') > host.LastIndexOf(']');
+        return hasPort ? $"https://{host}" : $"https://{host}:7890";
+    }
 }
 
 public sealed class PollResponse

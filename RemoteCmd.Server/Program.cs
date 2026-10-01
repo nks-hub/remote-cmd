@@ -12,18 +12,29 @@ if (args.Length > 0 && args[0] is "--version" or "-v" or "version")
     return 0;
 }
 
-// Key under which the auth middleware stashes the token that matched, for the handlers to pick up.
-const string TokenItemKey = "remotecmd.token";
+// install-service, pair, token, set-password: management verbs, handled before any server starts.
+var cli = ServerArgs.Parse(args);
+if (cli.Verb != null) return await ServerCli.RunAsync(cli);
+
+// Key under which the auth middleware stashes the credential that matched, for the handlers to pick up.
+const string CredentialItemKey = "remotecmd.credential";
 
 var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 200_000_000);
+// No-ops unless the service manager started the process, so console runs are unaffected.
+builder.Services.AddWindowsService(o => o.ServiceName = "RemoteCmdServer");
+builder.Services.AddSystemd();
 
-// Every positional argument is a token: the relay accepts them all at once, so clients can be
-// migrated to a new token without a window where either the old or the new one is refused.
-// Position must not matter — none of the switches take a value, and stopping at the first one meant
-// "RemoteCmd.Server.exe --dashboard mytoken" silently threw the token away and invented a random
-// one, leaving every client locked out with no error to explain it.
-var tokens = args.Where(a => !a.StartsWith('-')).Distinct(StringComparer.Ordinal).ToList();
+var storePath = cli.ConfigPath ?? ServerStore.DefaultPath();
+var store = ServerStore.Open(storePath);
+var pairings = new PairingCodes();
+var adminGate = new AdminGate();
+
+// Tokens on the command line or in the environment still work, so a relay started the old way keeps
+// its clients — but they are accepted for this run only and never written anywhere. Stored
+// credentials (pairing, `token add`, `token import`) are the way forward: they carry a role and
+// stay off the process list.
+var tokens = cli.Tokens.ToList();
 if (tokens.Count == 0)
 {
     var fromEnv = Environment.GetEnvironmentVariable("REMOTECMD_TOKENS")
@@ -32,17 +43,11 @@ if (tokens.Count == 0)
         tokens = fromEnv.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                         .Distinct(StringComparer.Ordinal).ToList();
 }
-if (tokens.Count == 0) tokens.Add(Guid.NewGuid().ToString("N")[..16]);
-var token = tokens[0];
-var noTls = args.Contains("--no-tls")
+var noTls = cli.NoTls
     || string.Equals(Environment.GetEnvironmentVariable("REMOTECMD_NO_TLS"), "1", StringComparison.Ordinal)
     || string.Equals(Environment.GetEnvironmentVariable("REMOTECMD_NO_TLS"), "true", StringComparison.OrdinalIgnoreCase);
-var dashboard = args.Contains("--dashboard")
+var dashboard = cli.Dashboard
     || string.Equals(Environment.GetEnvironmentVariable("REMOTECMD_DASHBOARD"), "1", StringComparison.Ordinal);
-// Read-only status without a token: the web dashboard then just opens. Everything that touches a
-// machine — exec, file transfer, the client protocol — still needs one.
-var openStatus = args.Contains("--open-status")
-    || string.Equals(Environment.GetEnvironmentVariable("REMOTECMD_OPEN_STATUS"), "1", StringComparison.Ordinal);
 
 const int MinTokenLength = 12;
 var allowShortToken = string.Equals(Environment.GetEnvironmentVariable("REMOTECMD_ALLOW_SHORT_TOKEN"), "1", StringComparison.Ordinal);
@@ -51,28 +56,30 @@ foreach (var t in tokens.Where(t => t.Length < MinTokenLength && !allowShortToke
     Console.Error.WriteLine($"[FATAL] Token too short ({t.Length} chars). Minimum is {MinTokenLength}. Set REMOTECMD_ALLOW_SHORT_TOKEN=1 to bypass (NOT RECOMMENDED).");
     return 2;
 }
+foreach (var t in tokens) store.AddEphemeral(t);
 
 // Session GC: remove clients that have not polled for longer than this threshold.
 var staleAfter = TimeSpan.FromHours(1);
 
-// Listen port: default 7890, overridable via REMOTECMD_PORT (CI / multi-instance).
-var port = int.TryParse(Environment.GetEnvironmentVariable("REMOTECMD_PORT"), out var p) && p is > 0 and < 65536
-    ? p
-    : 7890;
+var port = cli.Port ?? EnvPort("REMOTECMD_PORT") ?? 7890;
+var adminPort = cli.AdminPort ?? EnvPort("REMOTECMD_ADMIN_PORT") ?? port + 1;
 
-// Always every interface: clients poll the relay from other machines. The open, tokenless view is
-// narrowed in the auth middleware instead — restricting the listener would take the clients down
-// with it, because the bind covers the whole server and not just /ui.
+// Two listeners. The relay port faces the network: clients poll it and controllers send commands
+// to it, always with a token. The dashboard port is bound to loopback only, so it can be open
+// without a password — whoever reaches it is already on this machine.
+string? certSha256 = null;
+var adminUrl = $"http://localhost:{adminPort}";
 if (noTls)
 {
-    builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
+    builder.WebHost.UseUrls($"http://0.0.0.0:{port}", adminUrl);
 }
 else
 {
     var certificate = RelayCertificate.LoadOrCreate(
-        Path.Combine(AppContext.BaseDirectory, "remotecmd.pfx"), Console.Out);
+        Path.Combine(Path.GetDirectoryName(Path.GetFullPath(storePath))!, "remotecmd.pfx"), Console.Out);
+    certSha256 = certificate.GetCertHashString(HashAlgorithmName.SHA256);
 
-    builder.WebHost.UseUrls($"https://0.0.0.0:{port}");
+    builder.WebHost.UseUrls($"https://0.0.0.0:{port}", adminUrl);
     builder.WebHost.ConfigureKestrel(o =>
     {
         o.Limits.MaxRequestBodySize = 200_000_000;
@@ -87,10 +94,6 @@ if (dashboard)
 
 var app = builder.Build();
 
-// Each token has its own AES key; the client-facing handlers pick the key of the token the
-// polling client authenticated with (KeyFor). The default here only serves legacy call sites.
-Crypto.Init(token);
-
 var startedUtc = DateTime.UtcNow;
 var clients = new ConcurrentDictionary<string, ClientSession>();
 var events = new EventLog();
@@ -100,21 +103,15 @@ var authThrottle = new AuthThrottle();
 
 var protocol = noTls ? "http" : "https";
 Console.WriteLine($"=== Remote CMD Relay Server {RemoteCmd.Shared.VersionInfo.Version} ===");
-Console.WriteLine($"Listening on: {protocol}://0.0.0.0:{port}");
-Console.WriteLine($"Tokens ({tokens.Count}): {string.Join(", ", tokens)}");
-Console.WriteLine($"TLS: {(noTls ? "disabled" : "enabled (self-signed)")}");
-Console.WriteLine($"Encryption: AES-256-GCM (always on)");
-Console.WriteLine($"Multi-client: enabled");
-Console.WriteLine($"Session GC threshold: {staleAfter.TotalMinutes:N0} minutes");
-Console.WriteLine($"Live dashboard: {(dashboard ? "on (--dashboard)" : "off (add --dashboard)")}");
-Console.WriteLine(openStatus
-    ? $"Status page: {protocol}://<this-host>:{port}/ui  (no token needed from this machine; a token from anywhere else)"
-    : $"Status page: {protocol}://<this-host>:{port}/ui");
+Console.WriteLine($"Relay:      {protocol}://0.0.0.0:{port}  (clients and controllers, token required)");
+Console.WriteLine($"Dashboard:  {adminUrl}  (this machine only{(store.HasPassword ? ", password protected" : "")})");
+Console.WriteLine($"Settings:   {storePath}");
+Console.WriteLine($"TLS:        {(noTls ? "disabled — tokens travel in clear text" : $"self-signed, SHA-256 {certSha256}")}");
+Console.WriteLine($"Accepted:   {store.All().Count(c => !c.Ephemeral)} stored credential(s), {tokens.Count} command-line token(s)");
 Console.WriteLine();
-Console.WriteLine("Client setup (run on target machine):");
-Console.WriteLine($"  RemoteCmd.Client.exe <THIS_SERVER_IP> {token}");
+Console.WriteLine("Add a machine: open the dashboard and press \"Pair a machine\", or run");
+Console.WriteLine("  RemoteCmd.Server pair --name <machine>");
 Console.WriteLine();
-
 // Session GC loop (every 5 minutes)
 var gcCts = app.Lifetime.ApplicationStopping;
 _ = Task.Run(async () =>
@@ -168,54 +165,102 @@ if (dashboard)
     });
 }
 
-// Auth middleware. Any configured token is accepted; the one that matched is stashed on the
-// request so the client-facing handlers encrypt with that token's key.
-// Routing matches these routes without regard to case, so the gate in front of them must do the
-// same: a case-sensitive check let "/API/exec" miss the gate entirely and run commands untokened.
-var openPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+// Endpoints a client machine uses. Everything else on /api is for controllers.
+// Routing matches routes without regard to case, so every gate in front of them must do the same:
+// a case-sensitive check once let "/API/exec" miss the gate entirely and run commands untokened.
+var clientPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
 {
-    "/api/status", "/api/clients", "/api/events", "/api/command",
+    "/api/poll", "/api/result", "/api/file-poll", "/api/file-data", "/api/file-done", "/api/file-upload",
+};
+// Only on the dashboard listener: the pages and the management API.
+var dashboardOnly = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+{
+    "/ui", "/manage", "/login",
+};
+// The dashboard acts with controller rights; it never stands in for a client.
+var dashboardCredential = new Credential
+{
+    Id = "dashboard", Label = "dashboard", Display = "dashboard", Role = CredentialRole.Controller,
 };
 
 app.Use(async (context, next) =>
 {
-    var path = context.Request.Path.Value ?? "";
-    // /ui itself is a static shell with no data in it; it asks for the token in the browser and
-    // sends it as a header on its own API calls, so it never has to travel in a URL.
-    var readOnly = openPaths.Contains(path.TrimEnd('/'));
-    if (context.Request.Path.StartsWithSegments("/api", StringComparison.OrdinalIgnoreCase))
-    {
-        var reqToken = context.Request.Query["token"].FirstOrDefault()
-                       ?? context.Request.Headers["X-Token"].FirstOrDefault()
-                       ?? ExtractBearer(context.Request.Headers["Authorization"].FirstOrDefault());
-        // A valid token is always served — the throttle only slows down the guessing, so an
-        // attacker sharing a NAT address with a real client can never lock that client out.
-        var matched = tokens.FirstOrDefault(t => TokensEqual(reqToken, t));
-        if (matched is not null)
-        {
-            // Recorded even on the open endpoints, so a caller that did authenticate gets the full
-            // history rather than the redacted one an anonymous viewer sees.
-            context.Items[TokenItemKey] = matched;
-        }
-        // An open relay hands the overview to whoever asks from this machine with no token at all —
-        // the point of the switch is that the dashboard just opens locally. From anywhere else a
-        // token is still required, because the history carries command lines and the stored output
-        // carries whatever those commands printed. Offering a WRONG token is a failed attempt
-        // everywhere, so guessing can never dodge the throttle by aiming at the open endpoints.
-        else if (!OpenStatus.AllowsAnonymous(openStatus, readOnly, reqToken, context.Connection.RemoteIpAddress))
-        {
-            var peer = context.Connection.RemoteIpAddress?.ToString() ?? "?";
-            var now = DateTime.UtcNow;
-            Interlocked.Increment(ref stats.AuthFailures);
-            var justLocked = authThrottle.RecordFailure(peer, now);
-            var throttled = justLocked || authThrottle.IsLockedOut(peer, now);
-            events.Add("auth", peer, throttled ? $"blocked on {path}" : $"401 on {path}");
+    var path = (context.Request.Path.Value ?? "").TrimEnd('/');
+    var now = DateTime.UtcNow;
 
-            context.Response.StatusCode = throttled ? 429 : 401;
-            if (throttled) context.Response.Headers.RetryAfter = (AuthThrottle.LockoutMinutes * 60).ToString();
-            await context.Response.WriteAsync(throttled ? "Too many failed attempts" : "Invalid token");
+    if (IsDashboardRequest(context, adminPort))
+    {
+        if (!AdminGate.IsLoopbackHost(context.Request.Host.Value))
+        {
+            // DNS rebinding: an outside page whose name now resolves to 127.0.0.1.
+            context.Response.StatusCode = 400;
+            await context.Response.WriteAsync("Unexpected Host header");
             return;
         }
+        if (clientPaths.Contains(path) || path.Equals("/api/pair", StringComparison.OrdinalIgnoreCase))
+        {
+            context.Response.StatusCode = 404;
+            return;
+        }
+
+        var signedIn = !store.HasPassword || adminGate.IsValid(context.Request.Cookies[AdminGate.CookieName], now);
+        var signInPath = path.Equals("/login", StringComparison.OrdinalIgnoreCase)
+                         || path.Equals("/api/admin/login", StringComparison.OrdinalIgnoreCase)
+                         || path.Equals("/api/admin/session", StringComparison.OrdinalIgnoreCase);
+        if (!signedIn && !signInPath)
+        {
+            if (HttpMethods.IsGet(context.Request.Method) && !path.StartsWith("/api", StringComparison.OrdinalIgnoreCase))
+                context.Response.Redirect("/login");
+            else
+                context.Response.StatusCode = 401;
+            return;
+        }
+        if (AdminGate.IsStateChanging(context.Request.Method) && context.Request.Headers[AdminGate.CsrfHeader] != "1")
+        {
+            context.Response.StatusCode = 403;
+            await context.Response.WriteAsync($"Missing {AdminGate.CsrfHeader} header");
+            return;
+        }
+        context.Items[CredentialItemKey] = dashboardCredential;
+        await next();
+        return;
+    }
+
+    // --- The relay listener, reachable from the network ---
+
+    if (dashboardOnly.Contains(path) || path.StartsWith("/api/admin", StringComparison.OrdinalIgnoreCase))
+    {
+        context.Response.StatusCode = 404;
+        return;
+    }
+
+    if (context.Request.Path.StartsWithSegments("/api", StringComparison.OrdinalIgnoreCase)
+        && !path.Equals("/api/pair", StringComparison.OrdinalIgnoreCase))
+    {
+        var reqToken = context.Request.Headers["X-Token"].FirstOrDefault()
+                       ?? ExtractBearer(context.Request.Headers["Authorization"].FirstOrDefault())
+                       ?? context.Request.Query["token"].FirstOrDefault();
+        // A valid token is always served — the throttle only slows down the guessing, so an
+        // attacker sharing a NAT address with a real client can never lock that client out.
+        var credential = store.Authenticate(reqToken);
+        if (credential is null)
+        {
+            await RejectAsync(context, authThrottle, stats, events, $"401 on {path}", 401, "Invalid token");
+            return;
+        }
+
+        // A client's token is only good for being a client. Before roles, any machine that ran the
+        // client could also send commands to every other machine on the relay.
+        var isClientPath = clientPaths.Contains(path);
+        if ((credential.Role == CredentialRole.Client && !isClientPath)
+            || (credential.Role == CredentialRole.Controller && isClientPath))
+        {
+            events.Add("auth", credential.Display, $"403 on {path} ({credential.Role.ToString().ToLowerInvariant()} token)");
+            context.Response.StatusCode = 403;
+            await context.Response.WriteAsync($"A {credential.Role.ToString().ToLowerInvariant()} token may not use {path}");
+            return;
+        }
+        context.Items[CredentialItemKey] = credential;
     }
     await next();
 });
@@ -525,15 +570,13 @@ app.MapGet("/api/events", (HttpRequest req) =>
     {
         uptimeSeconds = (int)(DateTime.UtcNow - startedUtc).TotalSeconds,
         tls = !noTls,
-        tokens = tokens.Count,
+        tokens = store.Count,
         stats = stats.Snapshot(),
         events = recent,
     });
 });
 
-// Output of one command, for the status page's detail view. Open together with the rest of the
-// dashboard under --open-status: the detail is the whole point of the page, and that mode binds to
-// loopback, so it hides nothing that is not already readable on the machine itself.
+// Output of one command, for the status page's detail view.
 app.MapGet("/api/command", (HttpRequest req) =>
 {
     var id = req.Query["id"].FirstOrDefault();
@@ -543,8 +586,8 @@ app.MapGet("/api/command", (HttpRequest req) =>
         : Results.Ok(record);
 });
 
-// Browser status page. Everything it needs comes from the two JSON endpoints above, and it reuses
-// the caller's own query string, so the token is never baked into the markup.
+// Browser status page, on the dashboard listener only (see the middleware). Everything it shows
+// comes from the JSON endpoints above.
 app.MapGet("/ui", () => Results.Content(StatusPage.Html, "text/html; charset=utf-8"));
 
 app.MapGet("/api/status", (HttpRequest req) =>
@@ -578,35 +621,67 @@ app.MapGet("/api/status", (HttpRequest req) =>
     });
 });
 
-// Unauthenticated: says what this is and nothing about who is connected.
-app.MapGet("/", () => Results.Text(
-    $"Remote CMD Relay Server {RemoteCmd.Shared.VersionInfo.Version} (multi-client)\n" +
-    $"Encryption: AES-256-GCM | TLS: {(noTls ? "off" : "self-signed")}\n\n" +
-    "GET  /ui                                   - Status page (sessions, history, stats)\n" +
-    "GET  /api/status[?client=X]                - Check client(s)\n" +
-    "GET  /api/clients                          - List all clients\n" +
-    "GET  /api/events[?limit=N]                 - Recent relay events + counters\n" +
-    "GET  /api/command?id=X                     - Output of one command\n" +
-    "POST /api/exec[?client=X]                  - Run command {\"command\":\"...\"}\n" +
-    "POST /api/upload?path=...[&client=X]       - Upload file (binary body)\n" +
-    "GET  /api/download?path=...[&client=X]     - Download file\n" +
-    (openStatus
-        ? "Token (query/header/Bearer) needed for everything except the read-only status endpoints,\n" +
-          "which --open-status serves to anyone who reaches this port."
-        : "All endpoints need token (query/header/Bearer)."), "text/plain"));
+var relay = new RelayContext(store, storePath, pairings, adminGate, authThrottle, stats, clients, events,
+    port, adminPort, noTls, certSha256);
+AdminEndpoints.Map(app, relay);
+app.MapGet("/manage", () => Results.Content(AdminPage.Manage, "text/html; charset=utf-8"));
+app.MapGet("/login", () => Results.Content(AdminPage.Login, "text/html; charset=utf-8"));
+
+// The dashboard on its own listener; on the relay port, a plain note of what this is and nothing
+// about who is connected.
+app.MapGet("/", (HttpContext context) => IsDashboardRequest(context, adminPort)
+    ? Results.Content(StatusPage.Html, "text/html; charset=utf-8")
+    : Results.Text(
+        $"Remote CMD Relay Server {RemoteCmd.Shared.VersionInfo.Version}\n" +
+        $"Encryption: AES-256-GCM | TLS: {(noTls ? "off" : "self-signed")}\n" +
+        "\n" +
+        "GET  /api/status[?client=X]                - Check client(s)\n" +
+        "GET  /api/clients                          - List all clients\n" +
+        "GET  /api/events[?limit=N]                 - Recent relay events + counters\n" +
+        "GET  /api/command?id=X                     - Output of one command\n" +
+        "POST /api/exec[?client=X]                  - Run command {\"command\":\"...\"}\n" +
+        "POST /api/upload?path=...[&client=X]       - Upload file (binary body)\n" +
+        "GET  /api/download?path=...[&client=X]     - Download file\n" +
+        "POST /mcp                                  - MCP (Streamable HTTP, OAuth)\n" +
+        "All /api endpoints need a controller token (X-Token header or Bearer).\n" +
+        "The dashboard listens on this machine only.", "text/plain"));
 
 app.Run();
 return 0;
 
 // === Helpers ===
 
-/// <summary>AES key of the token this request authenticated with.</summary>
-static CryptoKey KeyFor(HttpRequest req)
-    => Crypto.For((string)req.HttpContext.Items[TokenItemKey]!);
+/// <summary>The credential this request authenticated with.</summary>
+static Credential CredentialOf(HttpRequest req)
+    => (Credential)req.HttpContext.Items["remotecmd.credential"]!;
 
-/// <summary>Short, non-secret label of a token for dashboards and logs.</summary>
-static string MaskToken(string t)
-    => t.Length <= 4 ? new string('*', t.Length) : $"{t[..2]}…{t[^2..]}";
+/// <summary>AES key of the credential this request authenticated with.</summary>
+static CryptoKey KeyFor(HttpRequest req) => CredentialOf(req).Crypto;
+
+/// <summary>
+/// True for requests that arrived on the loopback dashboard listener. The test host reports no
+/// local port, so tests mark dashboard requests by setting it themselves.
+/// </summary>
+static bool IsDashboardRequest(HttpContext context, int adminPort)
+    => context.Connection.LocalPort == adminPort;
+
+/// <summary>Refuses a request, counting it towards the sender's lockout.</summary>
+static async Task RejectAsync(HttpContext context, AuthThrottle throttle, RelayStats stats, EventLog events,
+    string what, int status, string message)
+{
+    var peer = context.Connection.RemoteIpAddress?.ToString() ?? "?";
+    var now = DateTime.UtcNow;
+    Interlocked.Increment(ref stats.AuthFailures);
+    var justLocked = throttle.RecordFailure(peer, now);
+    var throttled = justLocked || throttle.IsLockedOut(peer, now);
+    events.Add("auth", peer, throttled ? $"blocked: {what}" : what);
+    context.Response.StatusCode = throttled ? 429 : status;
+    if (throttled) context.Response.Headers.RetryAfter = (AuthThrottle.LockoutMinutes * 60).ToString();
+    await context.Response.WriteAsync(throttled ? "Too many failed attempts" : message);
+}
+
+static int? EnvPort(string name)
+    => int.TryParse(Environment.GetEnvironmentVariable(name), out var v) && v is > 0 and < 65536 ? v : null;
 
 /// <summary>
 /// Byte count in the largest unit that still reads honestly, so a 691-byte file shows as "691 B"
@@ -650,20 +725,20 @@ static string? ExtractBearer(string? authHeader)
         : null;
 }
 
-static bool TokensEqual(string? a, string b)
-{
-    if (a == null || a.Length != b.Length) return false;
-    var aBytes = System.Text.Encoding.UTF8.GetBytes(a);
-    var bBytes = System.Text.Encoding.UTF8.GetBytes(b);
-    return CryptographicOperations.FixedTimeEquals(aBytes, bBytes);
-}
-
 static ClientSession TouchSession(HttpRequest req, ConcurrentDictionary<string, ClientSession> clients, EventLog events)
 {
+    var credential = CredentialOf(req);
     var clientId = req.Query["clientId"].FirstOrDefault();
     var name = req.Query["name"].FirstOrDefault();
 
-    if (string.IsNullOrEmpty(clientId))
+    // A paired machine is who its credential says it is. With a shared token, anyone holding it could
+    // poll under another machine's id and be handed the commands meant for that machine.
+    if (credential.Role == CredentialRole.Client)
+    {
+        clientId = "c-" + credential.Id;
+        name = credential.Label;
+    }
+    else if (string.IsNullOrEmpty(clientId))
     {
         // Legacy client without clientId: synthesize stable id from remote IP
         var ip = req.HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
@@ -676,7 +751,8 @@ static ClientSession TouchSession(HttpRequest req, ConcurrentDictionary<string, 
     var session = clients.GetOrAdd(clientId, id => new ClientSession { Id = id, Name = name });
     var wasOffline = !isNew && !session.IsConnected();
 
-    session.TokenLabel = MaskToken((string)req.HttpContext.Items[TokenItemKey]!);
+    session.TokenLabel = credential.Display;
+    session.CredentialId = credential.Id;
     session.RemoteIp = req.HttpContext.Connection.RemoteIpAddress?.ToString() ?? "";
     if (isNew) events.Add("connect", name, $"new session {clientId[..Math.Min(8, clientId.Length)]} (token {session.TokenLabel})");
     else if (wasOffline) events.Add("connect", name, $"back after {(int)(DateTime.UtcNow - session.LastPoll).TotalSeconds}s");
@@ -819,6 +895,7 @@ public class ClientSession
     public DateTime LastNameFlapWarning { get; set; } = DateTime.MinValue;
     public DateTime ConnectedSince { get; set; } = DateTime.UtcNow;
     public string TokenLabel { get; set; } = "";  // masked token this client authenticates with
+    public string CredentialId { get; set; } = "";
     public string RemoteIp { get; set; } = "";    // address the client last polled from
     public long CommandsServed;   // total results delivered; mutable field for Interlocked
 

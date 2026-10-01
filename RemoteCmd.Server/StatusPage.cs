@@ -1,7 +1,7 @@
 /// <summary>
-/// Single-file status page served at /ui. The page itself carries no data and needs no token to
-/// load; it asks for one in the browser, keeps it in sessionStorage and sends it as an X-Token
-/// header, so the token never appears in a URL, in browser history or in the relay's access log.
+/// Single-file status page, served by the loopback dashboard listener at / and /ui. It carries no
+/// data itself and reads everything from the JSON endpoints; the dashboard's own session (or no
+/// session at all, without a password) is what lets those answer.
 /// Everything on it is built from text nodes — no markup is ever assembled from relay data.
 /// </summary>
 public static class StatusPage
@@ -63,6 +63,7 @@ public static class StatusPage
   #ring.dead { stroke:var(--bad); }
   #ring.paused { stroke:var(--faint); }
   #rail input, #rail select, #gate input, #gate button, #dclose, .btn {
+    text-decoration:none;
     font:inherit; font-family:var(--face); font-size:12px; padding:5px 8px;
     background:var(--panel); color:var(--fg); border:1px solid var(--grid); border-radius:4px; }
   #rail label { color:var(--dim); display:flex; align-items:center; gap:5px; font-size:12px; }
@@ -230,6 +231,7 @@ public static class StatusPage
   <select id="fClient" aria-label="filter by client"><option value="">all clients</option></select>
   <select id="fKind" aria-label="filter by event kind"><option value="">all events</option></select>
   <label><input type="checkbox" id="live" checked> live</label>
+  <a class="btn" href="/manage">Pair &amp; manage</a>
 </header>
 
 <form id="gate" hidden>
@@ -346,6 +348,11 @@ async function api(path) {
     headers: token ? { 'X-Token': token } : {},
     signal: AbortSignal.timeout(8000),
   });
+  // The dashboard signs in with a cookie; once that session ends, the login page takes over.
+  if (res.status === 401 && !token) {
+    location.href = '/login';
+    throw new Error('auth');
+  }
   if (res.status === 401 || res.status === 429) {
     const err = new Error('auth');
     err.auth = res.status;

@@ -5,41 +5,81 @@ using Microsoft.Extensions.Hosting.Systemd;
 using Microsoft.Extensions.Hosting.WindowsServices;
 using Microsoft.Extensions.Logging;
 using RemoteCmd.Client;
+using RemoteCmd.Shared;
 
-const string defaultServiceName = "RemoteCmdClient";
-
-if (args.Length == 0 || args[0] is "-h" or "--help" or "/?")
+if (args.Length > 0 && args[0] is "-h" or "--help" or "/?")
 {
     PrintUsage();
-    return args.Length == 0 ? 1 : 0;
+    return 0;
 }
 
-if (args[0] is "--version" or "-v" or "version")
+if (args.Length > 0 && args[0] is "--version" or "-v" or "version")
 {
     Console.WriteLine($"RemoteCmd.Client {ClientStats.Version}");
     return 0;
 }
 
-switch (args[0])
+var opts = ClientArgs.Parse(args);
+var configPath = opts.ConfigPath ?? ClientConfigFile.DefaultPath(opts.ServiceName);
+
+switch (opts.Verb)
 {
+    case "pair":
+    {
+        if (opts.Positional.Count < 2)
+        {
+            Console.Error.WriteLine("Usage: RemoteCmd.Client pair <server> <code> [--name <alias>] [--install-service]");
+            return 1;
+        }
+        var paired = await PairCommand.RunAsync(opts.Positional[0], opts.Positional[1],
+            opts.Name ?? Environment.MachineName, opts.KeepAwake);
+        if (paired is null) return 1;
+        ClientConfigFile.Save(configPath, paired);
+        Console.WriteLine($"Paired as '{paired.Name}' with {paired.BaseUrl}. Settings saved to {configPath}");
+        if (paired.CertSha256 is null)
+            Console.WriteLine("Note: the relay runs without TLS — traffic is encrypted, but the relay is not authenticated.");
+        return opts.InstallService ? InstallService(opts.ServiceName, configPath, paired) : 0;
+    }
     case "install-service":
     {
-        var (config, serviceName, _) = ParseServiceArgs(args, requireConnection: true);
-        if (config is null) return 1;
-        return ServiceInstaller.Install(serviceName, config);
+        // The old form still works — install-service <server> <token> — but the token now goes into
+        // the config file instead of the service definition, which every user can read.
+        var config = opts.Positional.Count >= 2 ? opts.ToConfig() : ClientConfigFile.Load(configPath);
+        if (config is null)
+        {
+            Console.Error.WriteLine($"No settings at {configPath}. Pair first: RemoteCmd.Client pair <server> <code>");
+            return 1;
+        }
+        if (opts.Positional.Count >= 2) ClientConfigFile.Save(configPath, config);
+        return InstallService(opts.ServiceName, configPath, config);
     }
     case "uninstall-service":
-    {
-        var (_, serviceName, _) = ParseServiceArgs(args, requireConnection: false);
-        return ServiceInstaller.Uninstall(serviceName);
-    }
+        return ServiceInstaller.Uninstall(opts.ServiceName);
     default:
     {
-        var (config, _, dashboard) = ParseServiceArgs(args, requireConnection: true);
-        if (config is null) { PrintUsage(); return 1; }
-        await RunHost(config, dashboard);
+        var config = opts.Positional.Count >= 2 ? opts.ToConfig() : ClientConfigFile.Load(configPath);
+        if (config is null)
+        {
+            if (args.Length == 0) PrintUsage();
+            else Console.Error.WriteLine($"No settings at {configPath} and no <server> <token> given.");
+            return 1;
+        }
+        if (opts.KeepAwake && !config.KeepAwake) config = config with { KeepAwake = true };
+        await RunHost(config, opts.Dashboard);
         return 0;
     }
+}
+
+static int InstallService(string serviceName, string configPath, ClientConfig config)
+{
+    if (!ServiceInstaller.IsPrivileged())
+    {
+        Console.Error.WriteLine("Installing a service needs an elevated prompt (Windows) or sudo.");
+        return 13;
+    }
+    var exe = Environment.ProcessPath ?? throw new InvalidOperationException("Cannot resolve executable path");
+    return ServiceInstaller.Install(new ServiceSpec(
+        serviceName, $"RemoteCmd Client ({config.Name})", exe, ["--service", "--config", configPath]));
 }
 
 static async Task RunHost(ClientConfig config, bool dashboard)
@@ -114,67 +154,27 @@ static int SafeHeight() { try { return Console.WindowHeight > 0 ? Console.Window
 static string Mask(string token)
     => token.Length <= 4 ? new string('*', token.Length) : token[..2] + new string('*', token.Length - 4) + token[^2..];
 
-// Parse: [command] <server> <token> [--name X] [--service-name N] [--dashboard] [--keep-awake]
-// Returns null config when a connection is required but server/token are missing.
-static (ClientConfig? config, string serviceName, bool dashboard) ParseServiceArgs(string[] args, bool requireConnection)
-{
-    var serviceName = "RemoteCmdClient";
-    string? server = null, token = null, name = null;
-    var dashboard = false;
-    var keepAwake = false;
-    var positional = new List<string>();
-
-    // Skip a leading verb (install-service / uninstall-service).
-    var start = args[0] is "install-service" or "uninstall-service" ? 1 : 0;
-
-    for (var i = start; i < args.Length; i++)
-    {
-        switch (args[i])
-        {
-            case "--service": break; // host-mode marker, no value
-            case "--dashboard": dashboard = true; break;
-            case "--keep-awake": keepAwake = true; break;
-            case "--name" when i + 1 < args.Length: name = args[++i]; break;
-            case "--service-name" when i + 1 < args.Length: serviceName = args[++i]; break;
-            default: positional.Add(args[i]); break;
-        }
-    }
-
-    if (positional.Count >= 1) server = positional[0];
-    if (positional.Count >= 2) token = positional[1];
-
-    if (requireConnection && (server is null || token is null))
-    {
-        Console.Error.WriteLine("Error: <server> and <token> are required.");
-        return (null, serviceName, dashboard);
-    }
-
-    var config = server is not null && token is not null
-        ? new ClientConfig(server, token, name ?? Environment.MachineName, keepAwake)
-        : null;
-    return (config, serviceName, dashboard);
-}
-
 static void PrintUsage()
 {
     Console.WriteLine($"RemoteCmd Client {ClientStats.Version}");
     Console.WriteLine();
-    Console.WriteLine("Run (console/foreground):");
+    Console.WriteLine("Pair this machine with a relay (the code comes from the relay's dashboard):");
+    Console.WriteLine("  RemoteCmd.Client pair <server> <code> [--name <alias>] [--install-service]");
+    Console.WriteLine();
+    Console.WriteLine("Run in the foreground with the saved settings, or with a token directly:");
+    Console.WriteLine("  RemoteCmd.Client [--dashboard] [--keep-awake]");
     Console.WriteLine("  RemoteCmd.Client <server> <token> [--name <alias>] [--dashboard] [--keep-awake]");
     Console.WriteLine();
-    Console.WriteLine("  --dashboard   live status header (version, connection, polls, running) + scrolling log");
-    Console.WriteLine("  --keep-awake  keep the machine from sleeping while the client runs");
-    Console.WriteLine("  --version     print version and exit");
+    Console.WriteLine("Run as a system service (Windows Service / systemd / launchd; needs admin or sudo):");
+    Console.WriteLine("  RemoteCmd.Client install-service            uses the saved settings");
+    Console.WriteLine("  RemoteCmd.Client uninstall-service");
     Console.WriteLine();
-    Console.WriteLine("Run as a service host (used internally by SCM/systemd):");
-    Console.WriteLine("  RemoteCmd.Client --service <server> <token> [--name <alias>]");
-    Console.WriteLine();
-    Console.WriteLine("Register as a system service (Windows Service / systemd; needs admin/root):");
-    Console.WriteLine("  RemoteCmd.Client install-service <server> <token> [--name <alias>] [--service-name <name>] [--keep-awake]");
-    Console.WriteLine("  RemoteCmd.Client uninstall-service [--service-name <name>]");
-    Console.WriteLine();
-    Console.WriteLine($"Default service name: {defaultServiceName}");
-    Console.WriteLine("Examples:");
-    Console.WriteLine("  RemoteCmd.Client http://192.168.3.41:7890 mySecretToken --name comos-1 --dashboard");
-    Console.WriteLine("  RemoteCmd.Client install-service http://192.168.3.41:7890 mySecretToken --name comos-1");
+    Console.WriteLine("Options:");
+    Console.WriteLine("  <server>             host, host:port or URL; a bare host means https on port 7890");
+    Console.WriteLine("  --name <alias>       how the machine shows up on the relay (default: machine name)");
+    Console.WriteLine("  --config <file>      settings file (default: " + ClientConfigFile.DefaultPath() + ")");
+    Console.WriteLine($"  --service-name <n>   service name, for several clients on one machine (default: {ClientConfigFile.DefaultServiceName})");
+    Console.WriteLine("  --dashboard          live status header + scrolling log");
+    Console.WriteLine("  --keep-awake         keep the machine from sleeping while the client runs");
+    Console.WriteLine("  --version            print version and exit");
 }

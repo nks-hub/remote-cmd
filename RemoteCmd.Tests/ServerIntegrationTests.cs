@@ -576,6 +576,7 @@ public class RemoteCmdFactory : WebApplicationFactory<Program>
     {
         Environment.SetEnvironmentVariable("REMOTECMD_TOKEN", Token);
         Environment.SetEnvironmentVariable("REMOTECMD_NO_TLS", "1");
+        TestConfig.Fresh();
     }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -586,6 +587,8 @@ public class RemoteCmdFactory : WebApplicationFactory<Program>
 
 public class IsolatedFactory : WebApplicationFactory<Program>
 {
+    public IsolatedFactory() => TestConfig.Fresh();
+
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         TestPeer.At(builder.UseEnvironment("Testing"), System.Net.IPAddress.Loopback);

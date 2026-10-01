@@ -120,7 +120,7 @@ public class MultiTokenFactory : WebApplicationFactory<Program>
     public MultiTokenFactory()
     {
         Environment.SetEnvironmentVariable("REMOTECMD_TOKENS", $"{First},{Second}");
-        Environment.SetEnvironmentVariable("REMOTECMD_NO_TLS", "1");
+        Environment.SetEnvironmentVariable("REMOTECMD_NO_TLS", "1");        TestConfig.Fresh();
     }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)

@@ -14,8 +14,17 @@ public sealed class CryptoKey
 {
     private readonly byte[] _key;
 
-    public CryptoKey(string token)
-        => _key = SHA256.HashData(Encoding.UTF8.GetBytes("RemoteCmd:v1:" + token));
+    public CryptoKey(string token) : this(DeriveKey(token)) { }
+
+    private CryptoKey(byte[] key) => _key = key;
+
+    /// <summary>A key used as is — for the relay, which keeps derived keys rather than tokens.</summary>
+    public static CryptoKey FromKey(byte[] key)
+        => key.Length == 32 ? new CryptoKey(key) : throw new ArgumentException("AES-256 key must be 32 bytes", nameof(key));
+
+    /// <summary>The AES key a token stands for. Clients and relay must agree on it byte for byte.</summary>
+    public static byte[] DeriveKey(string token)
+        => SHA256.HashData(Encoding.UTF8.GetBytes("RemoteCmd:v1:" + token));
 
     public byte[] Encrypt(byte[] data)
     {
