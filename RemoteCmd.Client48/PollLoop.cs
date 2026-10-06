@@ -97,7 +97,8 @@ namespace RemoteCmd.Client48
                         retryDelay = 1;
                         WaitOrCancel(800, ct);
                     }
-                    catch (OperationCanceledException) { break; }
+                    // A timed-out request is a cancellation too; only a stopping service ends the loop.
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
                     catch (Exception ex)
                     {
                         log("[ERROR] " + ex.Message + " - retry in " + retryDelay + "s");

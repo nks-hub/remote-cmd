@@ -32,6 +32,12 @@ public sealed class PollWorker : BackgroundService
     // Single-flight guard so a large file transfer runs off the poll loop without being re-dispatched.
     private volatile bool _fileBusy;
 
+    /// <summary>
+    /// How long one poll may take. Polls answer at once, so a slow one is a dead connection - after
+    /// the host slept, say - and is retried instead of holding the loop for the transfer timeout.
+    /// </summary>
+    public TimeSpan PollTimeout { get; init; } = TimeSpan.FromSeconds(30);
+
     public PollWorker(ClientConfig config, ILogger<PollWorker> log, ClientStats? stats = null)
     {
         _config = config;
@@ -76,11 +82,13 @@ public sealed class PollWorker : BackgroundService
             try
             {
                 var gotWork = false;
+                using var poll = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+                poll.CancelAfter(PollTimeout);
 
                 // 1. Poll for a command. Never block the loop on execution: run it on its own task
                 //    and post the result (with its requestId) when it finishes, so the heartbeat
                 //    keeps ticking and further commands are picked up concurrently.
-                var response = await http.GetFromJsonAsync<PollResponse>(pollUrl, stoppingToken);
+                var response = await http.GetFromJsonAsync<PollResponse>(pollUrl, poll.Token);
                 _stats?.MarkPoll();
                 if (response?.Command != null)
                 {
@@ -98,7 +106,7 @@ public sealed class PollWorker : BackgroundService
                 //    transfer never stalls command polling or the heartbeat.
                 if (!_fileBusy)
                 {
-                    var filePoll = await http.GetFromJsonAsync<EncryptedFilePoll>(filePollUrl, stoppingToken);
+                    var filePoll = await http.GetFromJsonAsync<EncryptedFilePoll>(filePollUrl, poll.Token);
                     if (filePoll?.E != null)
                     {
                         var meta = JsonSerializer.Deserialize<FilePollMeta>(Crypto.DecryptString(filePoll.E));
@@ -121,7 +129,9 @@ public sealed class PollWorker : BackgroundService
                 // Drain a burst of queued commands quickly; otherwise settle to the idle cadence.
                 await Task.Delay(gotWork ? 50 : 800, stoppingToken);
             }
-            catch (OperationCanceledException) { break; }
+            // Only a stopping service ends the loop. A timed-out request is a cancellation too, and
+            // ending on it left the process running but never polling again.
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
             catch (Exception ex)
             {
                 _log.LogWarning("[ERROR] {Message} - retry in {Delay}s", ex.Message, retryDelay);
