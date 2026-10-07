@@ -178,34 +178,9 @@ jobs:
           path: RemoteCmd-android-debug.apk
           retention-days: 14
 
-  package-mcp:
-    name: Package MCP server
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node 20
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Install deps + pack
-        working-directory: mcp-server
-        run: |
-          npm install --no-audit --no-fund
-          npm pack
-          mv *.tgz ../remote-cmd-mcp.tgz
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: remote-cmd-mcp
-          path: remote-cmd-mcp.tgz
-          retention-days: 14
-
   release:
     name: Create GitHub Release
-    needs: [build, client48, android, package-mcp]
+    needs: [build, client48, android]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
