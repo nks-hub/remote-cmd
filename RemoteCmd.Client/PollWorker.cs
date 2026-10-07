@@ -169,12 +169,26 @@ public sealed class PollWorker : BackgroundService
         MemoryTrim.AfterTransfer(bytes);
     }
 
+    private static async Task<(string Output, int ExitCode)> RunScreenshotAsync(string command, CancellationToken ct)
+    {
+        var destination = command[ScreenshotProtocol.CommandPrefix.Length..].Trim();
+        var result = await ScreenCapture.CaptureAsync(
+            string.IsNullOrWhiteSpace(destination) ? null : destination, ct);
+
+        // First line is the path so the caller can parse it without guessing.
+        return result.Ok
+            ? ($"{result.Path}\n{result.Message}", 0)
+            : ($"screenshot failed: {result.Message}", 1);
+    }
+
     private async Task HandleCommandAsync(HttpClient http, string resultUrl, string command, string? requestId, int timeoutSeconds, CancellationToken ct)
     {
         _stats?.ExecStarted();
         try
         {
-            var (output, exitCode) = await ExecuteCommand(command, timeoutSeconds, ct);
+            var (output, exitCode) = command.StartsWith(ScreenshotProtocol.CommandPrefix, StringComparison.Ordinal)
+                ? await RunScreenshotAsync(command, ct)
+                : await ExecuteCommand(command, timeoutSeconds, ct);
             if (exitCode != 0) _log.LogWarning("[EXIT {Code}]", exitCode);
 
             var resultJson = JsonSerializer.Serialize(new CommandResult { Output = output, ExitCode = exitCode });

@@ -287,6 +287,25 @@ public static class McpEndpoints
                     ["required"] = new JsonArray("remotePath"),
                 },
             },
+            new JsonObject
+            {
+                ["name"] = "remote_screenshot",
+                ["description"] =
+                    "Photograph a machine's screen and return the image. Use it to see what is actually on the display - "
+                    + "a GUI application's state, an installer or error dialog, anything a command cannot describe. "
+                    + "The client must run in the interactive desktop session: a Windows service runs in session 0, which has "
+                    + "no desktop, and the capture comes back blank (the reply says so). Linux clients need grim, scrot or ImageMagick.",
+                ["inputSchema"] = new JsonObject
+                {
+                    ["type"] = "object",
+                    ["properties"] = new JsonObject
+                    {
+                        ["remotePath"] = Prop("string", "Optional path on the machine to keep the PNG at; without it a temporary file is used and old captures are pruned"),
+                        ["client"] = client.DeepClone(),
+                    },
+                    ["required"] = new JsonArray(),
+                },
+            },
         ];
     }
 
@@ -299,7 +318,7 @@ public static class McpEndpoints
         if (name == "remote_list_clients")
             return Text(JsonSerializer.Serialize(ops.ListClients(), new JsonSerializerOptions { WriteIndented = true }));
 
-        if (name is not ("remote_exec" or "remote_write_file" or "remote_read_file"))
+        if (name is not ("remote_exec" or "remote_write_file" or "remote_read_file" or "remote_screenshot"))
             throw new RpcException(-32602, $"Unknown tool: {name}");
 
         var target = ops.Resolve(Str("client"));
@@ -315,6 +334,25 @@ public static class McpEndpoints
                 var timeout = args["timeoutSeconds"] is JsonValue v && v.TryGetValue<double>(out var t) ? (int)t : 0;
                 var result = await ops.Exec(session, command, timeout);
                 return Text($"exit code {result.ExitCode}\n{result.Output}", isError: result.ExitCode != 0);
+            }
+            case "remote_screenshot":
+            {
+                var keepAt = Str("remotePath") ?? "";
+                var shot = await ops.Exec(session, $"{ScreenshotProtocol.CommandPrefix} {keepAt}".TrimEnd(), 60);
+                if (shot.ExitCode != 0) return Text(shot.Output, isError: true);
+
+                // The client answers with the path on the first line and a size/warning note after it.
+                var lines = shot.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                if (lines.Length == 0) return Text("Client returned no screenshot path", isError: true);
+                var shotPath = lines[0].Trim();
+                var shotNote = lines.Length > 1 ? lines[1].Trim() : "";
+
+                var image = await ops.Pull(session, shotPath);
+                if (image.Data is null) return Text(image.Error ?? "Could not fetch the capture", isError: true);
+                if (image.Data.Length > MaxInlineBytes)
+                    return Text($"Capture is {image.Data.Length / 1024 / 1024} MB, too large for MCP; fetch {shotPath} with the REST download", isError: true);
+
+                return Image(image.Data, "image/png", $"Screenshot of {session.Name} ({shotPath}) - {shotNote}");
             }
             case "remote_write_file":
             {
@@ -356,6 +394,24 @@ public static class McpEndpoints
     {
         ["content"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = text }),
         ["isError"] = isError,
+    };
+
+    /// <summary>
+    /// An image result, with a line of text beside it. The note matters as much as the picture:
+    /// a capture taken from a Windows service is blank, and without the explanation the agent sees
+    /// only a black rectangle and has no way to know why.
+    /// </summary>
+    private static JsonObject Image(byte[] data, string mimeType, string note) => new()
+    {
+        ["content"] = new JsonArray(
+            new JsonObject { ["type"] = "text", ["text"] = note },
+            new JsonObject
+            {
+                ["type"] = "image",
+                ["data"] = Convert.ToBase64String(data),
+                ["mimeType"] = mimeType,
+            }),
+        ["isError"] = false,
     };
 
     private static IResult ResourceMetadata(HttpRequest req) => Results.Ok(new Dictionary<string, object>

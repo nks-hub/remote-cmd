@@ -598,6 +598,40 @@ app.MapGet("/api/download", async (HttpRequest req) =>
     return SendBytes(result.Data, Path.GetFileName(remotePath));
 });
 
+// Photographs the client's screen and returns the PNG in one call: the capture rides the command
+// channel, the image comes back over the normal file download, and the temporary file is removed
+// afterwards so repeated screenshots do not fill the client's disk.
+app.MapPost("/api/screenshot", async (HttpRequest req) =>
+{
+    var target = ResolveTarget(req, clients);
+    if (target.Error != null)
+        return Results.BadRequest(new { error = target.Error });
+
+    var session = target.Session!;
+    var destination = req.Query["path"].FirstOrDefault() ?? "";
+
+    var shot = await RunCommand(session, $"{ScreenshotProtocol.CommandPrefix} {destination}".TrimEnd(), 60);
+    if (shot.ExitCode != 0)
+        return Results.BadRequest(new { error = shot.Output });
+
+    // The client answers with the path on the first line and a size/warning note on the second.
+    var lines = shot.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+    var remotePath = lines.Length > 0 ? lines[0].Trim() : "";
+    var note = lines.Length > 1 ? lines[1].Trim() : "";
+    if (remotePath.Length == 0)
+        return Results.BadRequest(new { error = "client returned no screenshot path" });
+
+    // The client prunes its own old captures, so nothing has to be deleted from here.
+    var pulled = await PullFile(session, remotePath);
+
+    if (pulled.Data == null)
+        return Results.StatusCode(pulled.Error == "Download timeout" ? 504 : 404);
+
+    TrimWhenDone(req, pulled.Data.Length);
+    if (note.Length > 0) req.HttpContext.Response.Headers[ScreenshotProtocol.NoteHeader] = note;
+    return SendBytes(pulled.Data, Path.GetFileName(remotePath));
+});
+
 // === Info endpoints ===
 
 app.MapGet("/api/clients", () => Results.Ok(ClientList()));

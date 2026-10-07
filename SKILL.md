@@ -19,7 +19,6 @@ description: Remote command execution relay for AI agents. Execute PowerShell co
 |-----------|---------|------|
 | **RemoteCmd.Server** | .NET 9.0 (Kestrel) | HTTP relay on port 7890. Manages a dictionary of client sessions. |
 | **RemoteCmd.Client** | .NET 9.0 (self-contained exe) | Runs on each target machine. Polls the relay every 800 ms. Executes via `powershell.exe`. |
-| **mcp-server** | Node.js (MCP SDK) | STDIO-based MCP bridge. Translates tool calls into HTTP requests against the relay. |
 
 ## 2. Architecture
 
@@ -97,30 +96,17 @@ Each client persists its GUID to `%LOCALAPPDATA%\RemoteCmd\client.id` so the id 
 
 ### MCP Server Configuration
 
-```json
-{
-  "mcpServers": {
-    "remote-cmd": {
-      "type": "stdio",
-      "command": "node",
-      "args": ["C:/work/sources/remote-cmd/mcp-server/index.mjs"],
-      "env": {
-        "REMOTECMD_URL": "https://localhost:7890",
-        "REMOTECMD_TOKEN": "<TOKEN>",
-        "REMOTECMD_DEFAULT_CLIENT": "comos-1"
-      }
-    }
-  }
-}
+The relay speaks MCP itself over HTTP — there is no separate bridge process to install or keep in
+step with the server.
+
+```bash
+claude mcp add --transport http remote-cmd http://localhost:7891/mcp   # agent on the relay's machine
+claude mcp add --transport http remote-cmd https://relay:7890/mcp      # agent elsewhere
 ```
 
-**Environment variables:**
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `REMOTECMD_URL` | No | `https://localhost:7890` | Full URL of the relay server |
-| `REMOTECMD_TOKEN` | Yes | — | Shared authentication token |
-| `REMOTECMD_DEFAULT_CLIENT` | No | — | Default client name/id when `client` tool argument is omitted |
+The dashboard port (7891) is bound to localhost and needs no token. From anywhere else the relay
+port (7890) is used, and the agent authorises once through OAuth: it shows a six-digit code, the
+same request appears on the relay's dashboard, and approving it issues the agent its own token.
 
 ## 4. Complete MCP Tool Reference
 
@@ -205,6 +191,29 @@ Download a file from a target client to the local machine (max 200MB).
 | `remotePath` | string | Yes | Absolute path on the remote machine |
 | `localPath` | string | Yes | Absolute path on the local machine |
 | `client` | string | No | Target client name or id |
+
+### remote_screenshot
+
+Photograph a machine's screen and return the image. Use it when the answer is on the display rather
+than in a command's output: the state of a GUI application, an installer or error dialog, whether a
+desktop session is even logged in.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `remotePath` | string | No | Keep the PNG at this path on the machine; without it a temp file is used and old captures are pruned |
+| `client` | string | No | Target client name or id |
+
+**A screenshot needs a desktop to photograph.** A client installed as a Windows service runs in
+session 0, which has no desktop, so the capture is blank. That is not a failure the tool can prevent,
+so the reply says it outright rather than returning an unexplained black rectangle. To photograph a
+real Windows desktop, run the client in the interactive session instead of as a service.
+
+macOS captures the logged-in desktop even from a launchd daemon. Linux clients need one of `grim`,
+`scrot`, `gnome-screenshot`, `spectacle` or ImageMagick's `import`; the reply names what it tried
+when none is present.
+
+The image comes back inline, up to 20 MB. A larger capture is refused with the path it was left at,
+so it can be fetched with the REST download instead.
 
 ## 5. Workflow Recipes
 

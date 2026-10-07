@@ -68,7 +68,14 @@ dashboard, where you approve it after checking that the codes match. Approval is
 own credential; revoking it on the dashboard cuts the agent off.
 
 Tools: `remote_list_clients`, `remote_exec`, `remote_write_file`, `remote_read_file` (file contents
-travel inline, up to 20 MB; use the REST API for larger files).
+travel inline, up to 20 MB; use the REST API for larger files) and `remote_screenshot`, which returns
+a picture of the machine's screen.
+
+A screenshot needs a desktop to photograph. A client installed as a Windows service runs in session 0
+and captures a blank image; the reply says so rather than leaving the agent with an unexplained black
+rectangle. Run the client in the interactive session when screenshots matter. Linux clients need one
+of `grim`, `scrot`, `gnome-screenshot`, `spectacle` or ImageMagick's `import`; macOS and Windows need
+nothing extra.
 
 ### 4. Scripts and curl
 
@@ -153,12 +160,6 @@ share a machine with different `--service-name` values.
 `android/` is a Kotlin app with a foreground service that runs commands as root via `su`. Configure
 server, token and name in the app. Build with `cd android && ./gradlew assembleDebug`.
 
-### Node MCP bridge (deprecated)
-
-`mcp-server/` is the stdio bridge used before the relay spoke MCP itself. It still works with a
-controller token (`REMOTECMD_URL`, `REMOTECMD_TOKEN`), and unlike the built-in endpoint it can
-upload and download files by local path.
-
 ## API
 
 Controller endpoints take a token in the `X-Token` header or as `Authorization: Bearer`.
@@ -170,6 +171,7 @@ Controller endpoints take a token in the `X-Token` header or as `Authorization: 
 | `POST` | `/api/exec[?client=X]` | Run `{"command":"...","timeoutSeconds":30}` |
 | `POST` | `/api/upload?path=<remote>[&client=X]` | Upload a file (binary body, max 200 MB) |
 | `GET`  | `/api/download?path=<remote>[&client=X]` | Download a file |
+| `POST` | `/api/screenshot[?client=X][&path=<remote>]` | Photograph the screen, returns PNG |
 | `GET`  | `/api/events[?limit=N]` | Recent relay activity and counters |
 | `POST` | `/mcp` | MCP, Streamable HTTP, OAuth bearer token |
 
