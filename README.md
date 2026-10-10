@@ -4,7 +4,7 @@
 [![GitHub Release](https://img.shields.io/github/v/release/nks-hub/remote-cmd)](https://github.com/nks-hub/remote-cmd/releases)
 [![.NET](https://img.shields.io/badge/.NET-9.0-512BD4.svg)](https://dotnet.microsoft.com/)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20macOS-0078D4.svg)](#requirements)
-[![License](https://img.shields.io/badge/license-proprietary-6B7280.svg)](#license)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 > Run commands and move files on remote machines through NAT and firewalls, from scripts or from AI agents. A relay sits in the middle; machines poll it over outbound HTTP, so they need no open ports. The relay speaks MCP itself, so an agent such as Claude Code connects with one URL.
 
@@ -241,7 +241,7 @@ Contributions are welcome! For major changes, please open an issue first.
 
 ## License
 
-Proprietary — NKS Development. The repository has no LICENSE file; publishing the source does not grant a license to use, copy, modify or distribute it.
+MIT License — see [LICENSE](LICENSE) for details.
 
 ---
 
