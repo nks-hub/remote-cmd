@@ -132,7 +132,7 @@ on the page or with `RemoteCmd.Server set-password`.
 
 | What | How |
 |------|-----|
-| Machines | Each paired machine gets its own 256-bit key. It may only poll for work and answer it — never send commands, never list other machines, and never pose as another machine: its identity comes from its key, not from what it claims. |
+| Machines | Each paired machine gets its own 256-bit key. It may only poll for work and answer it. It cannot send commands, list other machines or pose as another machine, because its identity comes from its key, not from what it claims. |
 | Controllers | Separate tokens for scripts and agents. Agents get theirs only through OAuth (PKCE, dynamic client registration) approved on the dashboard. |
 | Storage | The relay keeps hashes of tokens and the derived encryption keys, never the tokens. Settings files are readable only by the owner (0600, or SYSTEM + Administrators + owner on Windows). Tokens stay off command lines and out of service definitions. |
 | Pairing | The one-time code (50 bits, 15 min, burnt after 5 wrong proofs) authenticates an ECDH exchange, so the issued key never crosses the network in a usable form, even over plain HTTP. |
