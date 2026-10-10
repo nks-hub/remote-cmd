@@ -1,13 +1,12 @@
-[![CI](https://github.com/nks-hub/remote-cmd/actions/workflows/ci.yml/badge.svg)](https://github.com/nks-hub/remote-cmd/actions/workflows/ci.yml)
-[![Release](https://github.com/nks-hub/remote-cmd/actions/workflows/release.yml/badge.svg)](https://github.com/nks-hub/remote-cmd/actions/workflows/release.yml)
-[![GitHub Stars](https://img.shields.io/github/stars/nks-hub/remote-cmd?style=flat)](https://github.com/nks-hub/remote-cmd)
-[![.NET](https://img.shields.io/badge/.NET-9.0-512BD4)](https://dotnet.microsoft.com/)
-
 # RemoteCmd
 
-Run commands and move files on remote machines through NAT and firewalls, from scripts or from AI
-agents. A relay sits in the middle; machines poll it over outbound HTTP, so they need no open ports.
-The relay speaks MCP itself, so an agent such as Claude Code connects with one URL.
+[![CI](https://github.com/nks-hub/remote-cmd/actions/workflows/ci.yml/badge.svg)](https://github.com/nks-hub/remote-cmd/actions/workflows/ci.yml)
+[![GitHub Release](https://img.shields.io/github/v/release/nks-hub/remote-cmd)](https://github.com/nks-hub/remote-cmd/releases)
+[![.NET](https://img.shields.io/badge/.NET-9.0-512BD4.svg)](https://dotnet.microsoft.com/)
+[![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20macOS-0078D4.svg)](#requirements)
+[![License](https://img.shields.io/badge/license-proprietary-6B7280.svg)](#license)
+
+> Run commands and move files on remote machines through NAT and firewalls, from scripts or from AI agents. A relay sits in the middle; machines poll it over outbound HTTP, so they need no open ports. The relay speaks MCP itself, so an agent such as Claude Code connects with one URL.
 
 ```
  AI agent / curl / script                Relay (RemoteCmd.Server)                Machines (RemoteCmd.Client)
@@ -16,9 +15,31 @@ The relay speaks MCP itself, so an agent such as Claude Code connects with one U
  REST /api/exec, /api/upload ───┴──────► :7891  dashboard, this machine only       run PowerShell / bash, move files
 ```
 
-## Quick start
+## Features
 
-### 1. Install the relay
+- 🌐 **No inbound ports** - Machines poll the relay over outbound HTTP every 800 ms and work behind NAT and firewalls
+- 🤖 **Built-in MCP server** - AI agents connect with one URL (Streamable HTTP, OAuth with PKCE) after approval on the dashboard
+- 💻 **Remote commands** - Run PowerShell or bash on any paired machine and get the output back
+- 📁 **File transfer** - Upload and download files (REST up to 200 MB, MCP inline up to 20 MB)
+- 📸 **Screenshots** - Capture the remote machine's screen as PNG
+- 🔑 **Pairing codes** - One-time codes with ready-made install commands; each machine gets its own 256-bit key
+- 🔒 **Layered security** - TLS with certificate pinning plus AES-256-GCM payload encryption, hashed tokens, brute-force lockout
+- 📊 **Local dashboard** - Machines, live activity, command output, pairing, agent approvals and credential revocation
+- 🖥️ **Cross-platform** - Relay and client for Windows, Linux and macOS (x64 and arm64), installed as a service
+- 🧩 **Legacy and Android clients** - .NET Framework 4.8 client for Windows 7 and a Kotlin client for rooted Android devices
+
+## Requirements
+
+- Windows, Linux or macOS on x64 or arm64; release builds are self-contained and need no separate .NET runtime
+- Administrator / root rights for the installer, which registers a Windows Service, systemd unit or launchd job
+- .NET 9 SDK to build from source
+- Legacy client: .NET Framework 4.8 (Windows 7 and later)
+- Android client: rooted device (`su`), JDK 17 to build
+- Screenshots on Linux: one of `grim`, `scrot`, `gnome-screenshot`, `spectacle` or ImageMagick's `import`
+
+## Installation
+
+### Install the relay
 
 Windows (elevated PowerShell):
 
@@ -35,7 +56,9 @@ curl -fsSL https://raw.githubusercontent.com/nks-hub/remote-cmd/main/install.sh 
 This installs the relay as a service (Windows Service, systemd or launchd) and prints the dashboard
 address. Open **http://localhost:7891** on that machine.
 
-### 2. Add machines
+## Usage
+
+### Add machines
 
 On the dashboard press **Pair & manage → Create code**. You get a one-time code and ready-made
 commands with it filled in; run the one for the machine's system:
@@ -56,7 +79,7 @@ same script again without a code upgrades the client and keeps its settings.
 
 The code can also be created on the relay's command line: `RemoteCmd.Server pair --name build-01`.
 
-### 3. Connect an AI agent
+### Connect an AI agent
 
 ```bash
 claude mcp add --transport http remote-cmd http://localhost:7891/mcp      # agent on the relay's machine
@@ -77,7 +100,7 @@ rectangle. Run the client in the interactive session when screenshots matter. Li
 of `grim`, `scrot`, `gnome-screenshot`, `spectacle` or ImageMagick's `import`; macOS and Windows need
 nothing extra.
 
-### 4. Scripts and curl
+### Scripts and curl
 
 Create a controller token on the dashboard (**Access → New controller token**) or with
 `RemoteCmd.Server token add --name ci`, then:
@@ -178,7 +201,17 @@ Controller endpoints take a token in the `X-Token` header or as `Authorization: 
 Without `client`, a command goes to the only connected machine; with several connected, the error
 lists them.
 
-## Build
+## Environment variables
+
+| Variable | Where | Description |
+|----------|-------|-------------|
+| `REMOTECMD_PORT` / `REMOTECMD_ADMIN_PORT` | Relay | Ports (default 7890 / relay port + 1) |
+| `REMOTECMD_CONFIG` | Relay | Settings file |
+| `REMOTECMD_NO_TLS` | Relay | `1` serves plain HTTP (payloads stay encrypted) |
+| `REMOTECMD_TOKEN(S)` | Relay | Command-line style tokens, full rights, this run only |
+| `REMOTECMD_NO_UPDATE_CHECK` | Relay | `1` skips the GitHub release check |
+
+## Development
 
 ```bash
 dotnet build RemoteCmd.sln
@@ -191,27 +224,27 @@ dotnet publish RemoteCmd.Client -c Release -r win-x64 --self-contained \
 Releases ship the relay and client for win-x64, win-arm64, linux-x64, linux-arm64, osx-x64 and
 osx-arm64.
 
-## Environment variables
+## Contributing
 
-| Variable | Where | Description |
-|----------|-------|-------------|
-| `REMOTECMD_PORT` / `REMOTECMD_ADMIN_PORT` | Relay | Ports (default 7890 / relay port + 1) |
-| `REMOTECMD_CONFIG` | Relay | Settings file |
-| `REMOTECMD_NO_TLS` | Relay | `1` serves plain HTTP (payloads stay encrypted) |
-| `REMOTECMD_TOKEN(S)` | Relay | Command-line style tokens, full rights, this run only |
-| `REMOTECMD_NO_UPDATE_CHECK` | Relay | `1` skips the GitHub release check |
+Contributions are welcome! For major changes, please open an issue first.
+
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'feat: description'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
 
 ## Support
 
-- Email: dev@nks-hub.cz
-- Bug reports: [GitHub Issues](https://github.com/nks-hub/remote-cmd/issues)
+- 📧 **Email:** dev@nks-hub.cz
+- 🐛 **Bug reports:** [GitHub Issues](https://github.com/nks-hub/remote-cmd/issues)
 
 ## License
 
-Private — NKS Development
+Proprietary — NKS Development. The repository has no LICENSE file; publishing the source does not grant a license to use, copy, modify or distribute it.
 
 ---
 
 <p align="center">
-  Made by <a href="https://github.com/nks-hub">NKS Hub</a>
+  Made with ❤️ by <a href="https://github.com/nks-hub">NKS Hub</a>
 </p>
