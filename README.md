@@ -121,11 +121,11 @@ Add `-k` while the relay uses its self-signed certificate.
 
 Listens on `http://localhost:7891` and nowhere else.
 
-- **Machines**: alias, real host name, account, system and client version (flagged when a newer
-  release exists). A machine's panel has its recent activity, a command line, re-pairing, and
-  removal from the list once it is offline.
-- **Activity**: every command with its output, transfers, connections and refused requests, with
-  search and filters.
+- **Overview**: one page with the machines table (alias, real host name, account, system, client
+  version flagged when a newer release exists), a command line, and the activity log below it:
+  every command with its output, transfers, connections and refused requests, with search and
+  filters. Clicking a machine narrows the log to it; its details panel has re-pairing and removal
+  from the list once it is offline.
 - **Access**: every key with when it was last used and a revoke button, open pairing codes, and
   machines that keep polling with a key the relay does not know (usually an old client left running
   after a re-pairing), each with a button to pair it again.

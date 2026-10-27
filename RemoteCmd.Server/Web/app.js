@@ -102,7 +102,7 @@ async function api(path, { method = 'GET', body, timeout = 10000 } = {}) {
 
 // ---------------------------------------------------------------- state
 const state = {
-  view: 'machines',
+  view: 'overview',
   show: 'all',
   picked: null,
   q: '',
@@ -121,22 +121,24 @@ const state = {
 };
 
 // ---------------------------------------------------------------- views
-const VIEWS = ['machines', 'activity', 'access', 'agents', 'settings'];
+const VIEWS = ['overview', 'access', 'agents', 'settings'];
 
 function route() {
   // /manage and /ui are older addresses of this page; /manage was pairing and access.
   if (location.pathname === '/manage' || location.pathname === '/ui') {
-    history.replaceState(null, '', `/${location.hash || (location.pathname === '/manage' ? '#access' : '#machines')}`);
+    history.replaceState(null, '', `/${location.hash || (location.pathname === '/manage' ? '#access' : '#overview')}`);
   }
   const hash = location.hash.replace('#', '');
-  if (hash === 'pair') { openPair(); history.replaceState(null, '', '/#machines'); }
-  show(VIEWS.includes(hash) ? hash : 'machines');
+  if (hash === 'pair') { openPair(); history.replaceState(null, '', '/#overview'); }
+  // Machines and activity share the overview; the old section links still land on it.
+  show(VIEWS.includes(hash) ? hash : 'overview');
+  if (hash === 'activity') $('activity').scrollIntoView();
 }
 
 function show(view) {
   state.view = view;
   for (const section of document.querySelectorAll('main .view')) section.hidden = section.dataset.view !== view;
-  for (const a of document.querySelectorAll('.rail a')) {
+  for (const a of document.querySelectorAll('.tabs-top a')) {
     if (a.dataset.view === view) a.setAttribute('aria-current', 'page');
     else a.removeAttribute('aria-current');
   }
@@ -145,8 +147,7 @@ function show(view) {
 }
 
 function renderView() {
-  if (state.view === 'machines') renderMachines();
-  else if (state.view === 'activity') renderActivity();
+  if (state.view === 'overview') { renderMachines(); renderActivity(); }
   else if (state.view === 'access') renderAccess();
   else if (state.view === 'agents') renderAgents();
   else if (state.view === 'settings') renderSettings();
@@ -255,8 +256,6 @@ function machineState(c) {
   return { cls: 'on', text: 'online' };
 }
 
-/** Cards slide in on the first paint only; later repaints must not make the panel flicker. */
-let portsShown = false;
 function renderMachines() {
   const all = state.clients;
   const shown = all.filter((c) => state.show === 'all'
@@ -265,39 +264,55 @@ function renderMachines() {
     || (state.show === 'update' && c.outdated));
   const online = all.filter((c) => c.connected).length;
   const outdated = all.filter((c) => c.outdated).length;
-  $('machCount').textContent = all.length ? `${online} of ${all.length} online${outdated ? ` · ${outdated} need an update` : ''}` : '';
+  $('machCount').textContent = all.length ? `${online}/${all.length} online${outdated ? ` · ${outdated} outdated` : ''}` : '';
   $('noMachines').hidden = all.length > 0;
   $('machFilter').hidden = all.length === 0;
+  document.querySelector('table.machines').hidden = all.length === 0;
 
-  paint($('ports'), [state.show, shown.map((c) => [c.id, c.name, c.host, c.user, c.os, c.version, c.outdated, c.connected, c.state, c.running, c.queued, c.served])],
-    () => shown.map((c, i) => port(c, i)));
-  portsShown = true;
-  for (const node of document.querySelectorAll('.port .seen')) {
+  paint($('ports'), [state.show, state.picked, shown.map((c) => [c.id, c.name, c.host, c.user, c.os, c.version, c.outdated, c.connected, c.state, c.running, c.queued, c.served, c.ip])],
+    () => shown.map(machineRow));
+  for (const node of document.querySelectorAll('#ports .seen')) {
     const c = all.find((x) => x.id === node.dataset.id);
-    if (c) node.textContent = c.connected ? `seen ${ago(c.secondsAgo)}` : `last seen ${ago(c.secondsAgo)}`;
+    if (c) node.textContent = ago(c.secondsAgo).replace(' ago', '');
   }
   syncTargets();
 }
 
-function port(c, i) {
+/** One machine per row. Clicking its name narrows the activity below to it, as a second click undoes. */
+function machineRow(c) {
   const st = machineState(c);
-  const p = keyed(el('button', `port ${st.cls}${portsShown ? '' : ' enter'}`), `port-${c.id}`);
-  p.type = 'button';
-  p.style.setProperty('--i', String(i));
-  p.append(el('span', 'lamp'), el('span', 'state', st.text), el('span', 'alias', c.name));
-  p.append(el('span', 'host', [c.host, c.user].filter(Boolean).join(' \\ ') || c.ip || '—'));
-  p.append(el('span', 'sys', system(c.os) || 'client too old to report its system'));
-  const foot = el('span', 'foot');
-  foot.append(el('span', c.outdated ? 'tag old' : 'tag', c.version ? `v${c.version}${c.outdated ? ' · update' : ''}` : 'version ?'));
-  const seen = el('span', 'seen', c.connected ? `seen ${ago(c.secondsAgo)}` : `last seen ${ago(c.secondsAgo)}`);
+  const tr = el('tr', `${st.cls}${state.picked === c.name ? ' picked' : ''}`);
+  const status = el('td', 'st');
+  status.append(el('span', 'dot', ''));
+  status.title = st.text;
+  const name = keyed(el('button', 'link', c.name), `pick-${c.id}`);
+  name.type = 'button';
+  name.title = state.picked === c.name ? 'Show every machine\'s activity' : 'Show only its activity';
+  name.addEventListener('click', () => pickMachine(state.picked === c.name ? null : c.name));
+  const nameCell = el('td', 'name');
+  nameCell.append(name);
+  if (st.cls !== 'on') nameCell.append(el('span', `state ${st.cls}`, st.text));
+  const seen = el('td', 'num seen', ago(c.secondsAgo).replace(' ago', ''));
   seen.dataset.id = c.id;
-  foot.append(seen);
-  if (c.queued) foot.append(el('span', '', `${c.queued} queued`));
-  foot.append(el('span', '', `${c.served} done`));
-  p.append(foot);
-  p.setAttribute('aria-label', `${c.name}, ${st.text}. Open details.`);
-  p.addEventListener('click', () => openMachine(c.id));
-  return p;
+  const actions = el('td', 'act');
+  if (c.connected) {
+    actions.append(keyed(button('run', 'small', () => { $('target').value = c.name; $('cmd').focus(); }), `run-${c.id}`));
+  }
+  actions.append(keyed(button('details', 'small ghost', () => openMachine(c.id)), `detail-${c.id}`));
+  tr.append(status, nameCell,
+    el('td', 'dim', [c.host, c.user].filter(Boolean).join(' \\ ') || '—'),
+    el('td', '', system(c.os) || '—'),
+    el('td', '', c.version ? `${c.version}${c.outdated ? ' ↑' : ''}` : '?'),
+    el('td', 'dim', c.ip || '—'), seen,
+    el('td', 'num', c.queued ? `${c.served} +${c.queued}` : String(c.served)), actions);
+  if (c.outdated) tr.children[4].className = 'warn';
+  return tr;
+}
+
+function pickMachine(name) {
+  state.picked = name;
+  renderMachines();
+  renderActivity();
 }
 
 for (const b of document.querySelectorAll('#machFilter button')) {
@@ -340,11 +355,11 @@ function openMachine(id) {
   const actions = el('div', 'row');
   if (c.connected) {
     actions.append(button('Run a command here', 'primary', () => {
-      closeDrawer(); location.hash = '#machines';
+      closeDrawer(); location.hash = '#overview';
       $('target').value = c.name; $('cmd').focus();
     }));
   }
-  actions.append(button('Its activity', '', () => { closeDrawer(); state.picked = c.name; location.hash = '#activity'; renderActivity(); }));
+  actions.append(button('Its activity', '', () => { closeDrawer(); pickMachine(c.name); $('activity').scrollIntoView(); }));
   actions.append(button('Pair again', '', () => { closeDrawer(); openPair(c.name); }));
   if (!c.connected) {
     actions.append(button('Remove from list', 'danger', async () => {
@@ -405,9 +420,9 @@ $('runForm').addEventListener('submit', async (e) => {
 
 // ---------------------------------------------------------------- activity
 const KIND = {
-  exec: ['exec', 'Command'], timeout: ['bad', 'Timed out'], upload: ['xfer', 'Upload'], download: ['xfer', 'Download'],
-  screenshot: ['xfer', 'Screenshot'], connect: ['conn', 'Connected'], gc: ['conn', 'Cleanup'], auth: ['bad', 'Refused'],
-  pair: ['admin', 'Pairing'], admin: ['admin', 'Access'], oauth: ['admin', 'AI agent'],
+  exec: ['exec', 'exec'], timeout: ['bad', 'timeout'], upload: ['xfer', 'upload'], download: ['xfer', 'download'],
+  screenshot: ['xfer', 'screenshot'], connect: ['conn', 'connect'], gc: ['conn', 'cleanup'], auth: ['bad', 'refused'],
+  pair: ['admin', 'pairing'], admin: ['admin', 'access'], oauth: ['admin', 'ai agent'],
 };
 const isProblem = (e) => (KIND[e.kind]?.[0]) === 'bad' || /failed|timeout|refused/i.test(e.message);
 
@@ -444,7 +459,7 @@ function renderActivity() {
     const x = el('button', '', '×');
     x.type = 'button';
     x.setAttribute('aria-label', 'Show every machine');
-    x.addEventListener('click', () => { state.picked = null; renderActivity(); });
+    x.addEventListener('click', () => pickMachine(null));
     c.append(x);
     chip.append(c);
   }
@@ -471,10 +486,10 @@ function renderNumbers() {
   if (!r) return;
   const s = r.stats;
   const rows = [
-    ['Commands', s.execs, 'since the relay started'],
-    ['Timed out', s.execs ? `${(s.timeouts / s.execs * 100).toFixed(1)} %` : '0 %', `${s.timeouts} of ${s.execs}`, s.execs > 0 && s.timeouts / s.execs > 0.05],
-    ['Files moved', s.uploads + s.downloads, bytes(s.bytesUploaded + s.bytesDownloaded)],
-    ['Refused requests', s.authFailures, 'wrong or missing key', s.authFailures > 0],
+    ['commands', s.execs, 'since the relay started'],
+    ['timed out', s.execs ? `${(s.timeouts / s.execs * 100).toFixed(1)} %` : '0 %', `${s.timeouts} of ${s.execs}`, s.execs > 0 && s.timeouts / s.execs > 0.05],
+    ['files', `${s.uploads + s.downloads} · ${bytes(s.bytesUploaded + s.bytesDownloaded)}`, ''],
+    ['refused', s.authFailures, 'wrong or missing key', s.authFailures > 0],
   ];
   const box = $('numbers');
   box.replaceChildren(el('h2', '', 'Since start'), ...rows.map(([label, value, sub, alarm]) => {
@@ -523,7 +538,7 @@ async function openCommand(e) {
     if (r.truncated) body.push(el('p', 'hint', 'Shortened: the relay keeps the first 64 kB.'));
     const row = el('div', 'row');
     row.append(button('Copy output', '', () => copy(r.stdout || '', 'Output copied')),
-      button('Run again', '', () => { closeDrawer(); location.hash = '#machines'; $('target').value = r.client; $('cmd').value = r.command; $('cmd').focus(); }));
+      button('Run again', '', () => { closeDrawer(); location.hash = '#overview'; $('target').value = r.client; $('cmd').value = r.command; $('cmd').focus(); }));
     body.push(row);
     fillDrawer(body);
   } catch {
@@ -834,7 +849,7 @@ $('pairDlg').addEventListener('close', () => { pair.open = false; clearInterval(
 $('pairAnother').addEventListener('click', () => openPair());
 $('pairShow').addEventListener('click', async () => {
   $('pairDlg').close();
-  location.hash = '#machines';
+  location.hash = '#overview';
   const sessionId = pair.done?.sessionId;
   if (!sessionId) return;
   // The machine list may predate its first poll; read it fresh rather than waiting for the next tick.
@@ -925,10 +940,8 @@ async function tick() {
     state.relay = relay;
     $('beat').className = 'beat live';
     $('beat').title = `updated ${new Date().toLocaleTimeString()}`;
-    $('navActivity').textContent = '';
     renderChrome();
-    if (state.view === 'machines') renderMachines();
-    else if (state.view === 'activity') renderActivity();
+    if (state.view === 'overview') { renderMachines(); renderActivity(); }
   } catch (err) {
     $('beat').className = 'beat dead';
     $('beat').title = `no answer from the relay (${err.message})`;
