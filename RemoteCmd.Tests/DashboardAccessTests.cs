@@ -54,6 +54,21 @@ public sealed class DashboardRelay : WebApplicationFactory<Program>
         return ((int)res.StatusCode, await res.Content.ReadAsStringAsync(), setCookie);
     }
 
+    /// <summary>Like <see cref="Dashboard"/>, but with the whole response for its headers.</summary>
+    public async Task<HttpResponseMessage> DashboardResponse(string method, string path)
+    {
+        var handler = Server.CreateHandler(c =>
+        {
+            c.Connection.LocalPort = AdminPort;
+            c.Connection.RemoteIpAddress = IPAddress.Loopback;
+        });
+        var http = new HttpClient(handler) { BaseAddress = new Uri("http://localhost:7891") };
+        var req = new HttpRequestMessage(new HttpMethod(method), path);
+        req.Headers.Host = "localhost:7891";
+        req.Headers.Add("X-RemoteCmd", "1");
+        return await http.SendAsync(req);
+    }
+
     public async Task<string> IssueToken(string role, string name)
     {
         var (status, body, _) = await Dashboard("POST", "/api/admin/credentials", new { name, role });

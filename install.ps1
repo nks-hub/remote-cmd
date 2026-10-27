@@ -85,5 +85,5 @@ else {
         & $exe install-service @extra
         if ($LASTEXITCODE -ne 0) { throw "Service install failed (exit $LASTEXITCODE)." }
     }
-    Write-Host 'Open the dashboard on this machine: http://localhost:7891  (Pair & manage -> Create code)'
+    Write-Host 'Open the dashboard on this machine: http://localhost:7891  (press "Pair a machine")'
 }

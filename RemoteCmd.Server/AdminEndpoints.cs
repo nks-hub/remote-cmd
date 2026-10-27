@@ -1,6 +1,4 @@
 using System.Collections.Concurrent;
-using System.Net.NetworkInformation;
-using System.Net.Sockets;
 using System.Text.Json;
 using RemoteCmd.Shared;
 
@@ -14,6 +12,7 @@ public sealed record RelayContext(
     RelayStats Stats,
     ConcurrentDictionary<string, ClientSession> Clients,
     EventLog Events,
+    UnknownKeys UnknownKeys,
     int Port,
     int AdminPort,
     bool NoTls,
@@ -23,34 +22,45 @@ public sealed record RelayContext(
     public const string InstallBase = "https://raw.githubusercontent.com/nks-hub/remote-cmd/main";
 
     /// <summary>
-    /// The address clients should use: the one set in the dashboard, or a guess from this machine's
-    /// first private IPv4 address.
+    /// The address clients should use: the one set in the dashboard, or this machine's most likely
+    /// LAN address (see <see cref="RelayAddresses"/>).
     /// </summary>
-    public string PublicUrl => Store.PublicUrl ?? $"{(NoTls ? "http" : "https")}://{GuessAddress()}:{Port}";
+    public string PublicUrl
+        => (Store.PublicUrl is { } saved ? RelayUrl(saved) : null)
+           ?? UrlFor(RelayAddresses.Candidates().FirstOrDefault()?.Address ?? Environment.MachineName);
 
-    private static string GuessAddress()
-    {
-        var addresses = NetworkInterface.GetAllNetworkInterfaces()
-            .Where(n => n.OperationalStatus == OperationalStatus.Up && n.NetworkInterfaceType != NetworkInterfaceType.Loopback)
-            .SelectMany(n => n.GetIPProperties().UnicastAddresses)
-            .Select(a => a.Address)
-            .Where(a => a.AddressFamily == AddressFamily.InterNetwork)
-            .ToList();
-        var lan = addresses.FirstOrDefault(a => a.GetAddressBytes() is [192, 168, ..] or [10, ..] or [172, >= 16 and <= 31, ..]);
-        return (lan ?? addresses.FirstOrDefault())?.ToString() ?? Environment.MachineName;
-    }
+    /// <summary>
+    /// Reduces an address to scheme, host and port — all a client polls. The result is pasted into
+    /// install commands that run as administrator, so nothing else from the input (path, query,
+    /// quotes) may reach them. Null when it is not an http(s) address.
+    /// </summary>
+    public static string? RelayUrl(string url)
+        => Uri.TryCreate(url.Trim(), UriKind.Absolute, out var uri)
+           && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
+           && uri.UserInfo.Length == 0
+            ? uri.GetLeftPart(UriPartial.Authority)
+            : null;
+
+    public string UrlFor(string address) => $"{(NoTls ? "http" : "https")}://{address}:{Port}";
 
     /// <summary>Ready-to-paste commands that install a client and pair it with this code.</summary>
-    public Dictionary<string, string> InstallCommands(string code) => new()
+    public IReadOnlyList<InstallCommand> InstallCommands(string code, string? serverUrl = null)
     {
-        ["Windows (PowerShell as admin)"] =
-            $"& ([scriptblock]::Create((irm {InstallBase}/install.ps1))) -Server '{PublicUrl}' -Code '{code}'",
-        ["Linux / macOS"] =
-            $"curl -fsSL {InstallBase}/install.sh | sudo sh -s -- client --server '{PublicUrl}' --code '{code}'",
-        ["Client already installed"] =
-            $"RemoteCmd.Client pair {PublicUrl} {code} --install-service",
-    };
+        var url = serverUrl ?? PublicUrl;
+        return
+        [
+            new("windows", "Windows (PowerShell as admin)",
+                $"& ([scriptblock]::Create((irm {InstallBase}/install.ps1))) -Server '{url}' -Code '{code}'"),
+            new("unix", "Linux / macOS",
+                $"curl -fsSL {InstallBase}/install.sh | sudo sh -s -- client --server '{url}' --code '{code}'"),
+            new("installed", "Client already installed",
+                $"RemoteCmd.Client pair {url} {code} --install-service"),
+        ];
+    }
 }
+
+/// <summary>One way to install and pair a client, with a stable id for the dashboard's tabs.</summary>
+public sealed record InstallCommand(string Id, string Label, string Command);
 
 /// <summary>
 /// The management API behind the dashboard: pairing, credentials, password and settings. The
@@ -63,7 +73,7 @@ public static class AdminEndpoints
     private sealed record SettingsBody(string? PublicUrl);
     private sealed record CredentialBody(string? Name, string? Role);
     private sealed record ImportBody(string? Token, string? Name, string? Role);
-    private sealed record PairBody(string? Name, int? TtlMinutes);
+    private sealed record PairBody(string? Name, int? TtlMinutes, string? ServerUrl);
 
     public static void Map(WebApplication app, RelayContext r)
     {
@@ -111,10 +121,54 @@ public static class AdminEndpoints
 
         app.MapPost("/api/admin/settings", (SettingsBody body) =>
         {
-            if (body.PublicUrl is { Length: > 0 } url && !Uri.TryCreate(url, UriKind.Absolute, out _))
-                return Results.BadRequest(new { error = "Not a URL" });
-            r.Store.PublicUrl = body.PublicUrl;
+            string? publicUrl = null;
+            if (!string.IsNullOrWhiteSpace(body.PublicUrl) && (publicUrl = RelayContext.RelayUrl(body.PublicUrl)) is null)
+                return Results.BadRequest(new { error = "Use a full address such as http://192.168.1.10:7890" });
+            r.Store.PublicUrl = publicUrl;
+            r.Events.Add("admin", "dashboard", r.Store.PublicUrl is null ? "relay address reset to the detected one" : $"relay address set to {r.Store.PublicUrl}");
             return Results.Ok(new { publicUrl = r.PublicUrl });
+        });
+
+        // Addresses of this machine, best first, to choose the one machines will reach.
+        app.MapGet("/api/admin/addresses", () => Results.Ok(new
+        {
+            current = r.PublicUrl,
+            addresses = RelayAddresses.Candidates().Select(a => new
+            {
+                url = r.UrlFor(a.Address),
+                address = a.Address,
+                @interface = a.Interface,
+                kind = a.Kind,
+            }),
+        }));
+
+        // Machines that keep polling with a key nobody issued: usually an old client left behind.
+        app.MapGet("/api/admin/unknown-keys", () => Results.Ok(new
+        {
+            machines = r.UnknownKeys.Recent(DateTime.UtcNow).Select(m => new
+            {
+                peer = m.Peer,
+                name = m.Name,
+                host = m.Host,
+                path = m.Path,
+                attempts = m.Attempts,
+                firstUtc = m.FirstUtc,
+                lastUtc = m.LastUtc,
+            }),
+        }));
+
+        // Drops a machine that is gone for good from the list instead of waiting for the hourly sweep.
+        app.MapDelete("/api/admin/clients/{id}", (string id) =>
+        {
+            if (!r.Clients.TryGetValue(id, out var session)) return Results.NotFound(new { error = "No such machine" });
+            if (session.IsConnected()) return Results.Conflict(new { error = "The machine is online; revoke its key to cut it off" });
+            if (!r.Clients.TryRemove(id, out _)) return Results.NotFound(new { error = "No such machine" });
+            foreach (var pending in session.InFlight.Values)
+                pending.Tcs.TrySetResult(new CommandResult { Output = "[ERROR] Machine removed from the relay", ExitCode = -1 });
+            session.Uploads.FailAll("Machine removed from the relay");
+            session.Downloads.FailAll("Machine removed from the relay");
+            r.Events.Add("admin", session.Name, "removed from the machine list");
+            return Results.Ok();
         });
 
         app.MapPost("/api/admin/password", (HttpContext ctx, PasswordBody body) =>
@@ -182,16 +236,41 @@ public static class AdminEndpoints
 
         app.MapPost("/api/admin/pair", (PairBody body) =>
         {
+            string? serverUrl = null;
+            if (!string.IsNullOrWhiteSpace(body.ServerUrl) && (serverUrl = RelayContext.RelayUrl(body.ServerUrl)) is null)
+                return Results.BadRequest(new { error = "Use a full address such as http://192.168.1.10:7890" });
             var ttl = body.TtlMinutes is > 0 ? TimeSpan.FromMinutes(body.TtlMinutes.Value) : (TimeSpan?)null;
-            var pending = r.Pairings.Create(body.Name, ttl, DateTime.UtcNow);
+            var pending = r.Pairings.Create(body.Name, ttl, DateTime.UtcNow, serverUrl);
             r.Events.Add("pair", pending.Label ?? "-", $"pairing code issued, valid until {pending.ExpiresUtc.ToLocalTime():HH:mm}");
             return Results.Ok(Describe(r, pending));
         });
 
-        app.MapGet("/api/admin/pair", () => Results.Ok(new
+        app.MapGet("/api/admin/pair", () =>
         {
-            pending = r.Pairings.Active(DateTime.UtcNow).Select(p => Describe(r, p)),
-        }));
+            var now = DateTime.UtcNow;
+            return Results.Ok(new
+            {
+                pending = r.Pairings.Active(now).Select(p => Describe(r, p)),
+                // What became of redeemed codes: a paired machine that never polls is the failure that
+                // used to be invisible — the code was used, yet nothing ever showed up.
+                recent = r.Pairings.Recent(now).Select(c =>
+                {
+                    var sessions = r.Clients.Values.Where(s => s.CredentialId == c.CredentialId).ToList();
+                    return new
+                    {
+                        id = c.Id,
+                        name = c.Name,
+                        credentialId = c.CredentialId,
+                        peer = c.Peer,
+                        atUtc = c.AtUtc,
+                        revoked = r.Store.All().All(x => x.Id != c.CredentialId),
+                        polled = sessions.Count > 0,
+                        connected = sessions.Any(s => s.IsConnected()),
+                        sessionId = sessions.FirstOrDefault()?.Id,
+                    };
+                }),
+            });
+        });
 
         app.MapDelete("/api/admin/pair/{id}", (string id)
             => r.Pairings.Cancel(id) ? Results.Ok() : Results.NotFound());
@@ -235,19 +314,28 @@ public static class AdminEndpoints
                 return Results.Json(new { error = "Wrong pairing code" }, statusCode: 403);
             }
 
+            r.Pairings.Complete(pending, issued!.Label, issued.Id, peer, now);
             r.Events.Add("pair", name, $"paired from {peer}");
             return Results.Ok(answer);
         });
     }
 
-    private static object Describe(RelayContext r, PendingPairing p) => new
+    private static object Describe(RelayContext r, PendingPairing p)
     {
-        id = p.Id,
-        code = p.Code,
-        name = p.Label,
-        expiresUtc = p.ExpiresUtc,
-        commands = r.InstallCommands(p.Code),
-    };
+        var install = r.InstallCommands(p.Code, p.ServerUrl);
+        return new
+        {
+            id = p.Id,
+            code = p.Code,
+            name = p.Label,
+            serverUrl = p.ServerUrl ?? r.PublicUrl,
+            createdUtc = p.CreatedUtc,
+            expiresUtc = p.ExpiresUtc,
+            // Label → command, as the CLI prints it; the dashboard uses the list with stable ids.
+            commands = install.ToDictionary(c => c.Label, c => c.Command),
+            install,
+        };
+    }
 
     private static bool TryRole(string text, out CredentialRole role)
         => Enum.TryParse(text, ignoreCase: true, out role) && Enum.IsDefined(role);
