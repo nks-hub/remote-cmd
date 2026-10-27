@@ -230,7 +230,7 @@ async function loadInfo() {
   $('ver').textContent = `v${info.version}`;
   const mcp = [
     ['From this machine', `claude mcp add --transport http remote-cmd http://localhost:${info.adminPort}/mcp`],
-    [info.tls ? 'From another machine (it must trust the relay's self-signed certificate)' : 'From another machine',
+    [info.tls ? "From another machine (it must trust the relay's self-signed certificate)" : 'From another machine',
      `claude mcp add --transport http remote-cmd ${info.publicUrl}/mcp`],
   ];
   $('mcpCmds').replaceChildren(...mcp.flatMap(([label, cmd]) => {
