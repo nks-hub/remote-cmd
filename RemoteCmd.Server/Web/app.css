@@ -148,8 +148,8 @@ h3 { margin: 0; font: 600 14px/1.2 var(--display); letter-spacing: .04em; text-t
   position: relative; display: grid; gap: 3px; text-align: left; cursor: pointer; padding: 14px 16px 13px 18px;
   background: var(--panel); border: 1px solid var(--grid); border-radius: var(--radius); box-shadow: var(--shadow);
   transition: border-color .15s, transform .15s;
-  animation: rise .3s ease-out both; animation-delay: calc(var(--i, 0) * 35ms);
 }
+.port.enter { animation: rise .3s ease-out both; animation-delay: calc(var(--i, 0) * 35ms); }
 .port:hover { border-color: var(--dim); transform: translateY(-1px); }
 .port .lamp { position: absolute; top: 18px; left: -6px; width: 12px; height: 12px; border-radius: 50%; background: var(--faint); border: 3px solid var(--bg); }
 .port.on .lamp { background: var(--on); box-shadow: 0 0 10px color-mix(in oklab, var(--on) 70%, transparent); }

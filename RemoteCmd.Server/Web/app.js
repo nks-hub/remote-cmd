@@ -20,6 +20,8 @@ const button = (text, cls, onClick) => {
   if (onClick) b.addEventListener('click', onClick);
   return b;
 };
+/** Tags an element so keyboard focus can be put back on its replacement after a repaint. */
+const keyed = (node, key) => { node.dataset.key = key; return node; };
 const flat = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
 const local = {
   get(k) { try { return localStorage.getItem(k); } catch { return null; } },
@@ -188,30 +190,60 @@ function alert(kind, title, detail, actions = []) {
   return box;
 }
 
+/**
+ * Replaces a container's children only when the data behind them changed. Rebuilding every few
+ * seconds would pull buttons out from under the keyboard focus and the pointer, and make screen
+ * readers announce live regions over and over. Relative times stay out of the signature for that
+ * reason; the next real change refreshes them.
+ */
+const painted = new Map();
+function paint(container, sig, build) {
+  const key = typeof sig === 'string' ? sig : JSON.stringify(sig);
+  if (painted.get(container) === key) return;
+  painted.set(container, key);
+  const focusKey = document.activeElement?.dataset?.key;
+  container.replaceChildren(...build());
+  if (focusKey) container.querySelector(`[data-key="${CSS.escape(focusKey)}"]`)?.focus();
+}
+
 function renderAlerts() {
+  paint($('alerts'), [
+    state.oauth.map((p) => p.id),
+    state.unknown.map((m) => [m.peer, m.name, m.host]),
+    state.recent.map((r) => [r.id, r.polled, r.revoked, (Date.now() - new Date(r.atUtc)) > 60000]),
+    state.admin?.publicUrl, state.admin?.publicUrlSet, state.addresses.map((a) => a.url),
+  ], buildAlerts);
+}
+
+function buildAlerts() {
   const list = [];
   for (const p of state.oauth) {
     list.push(alert('info', `${p.client} asks to control the relay`, `code ${p.userCode} — approve only if the agent shows the same code.`,
-      [button('Review', 'small', () => { location.hash = '#agents'; })]));
+      [keyed(button('Review', 'small', () => { location.hash = '#agents'; }), `review-${p.id}`)]));
   }
   for (const m of state.unknown.slice(0, 3)) {
-    const who = m.name || m.host || m.peer;
-    list.push(alert('bad', `${who} (${m.peer}) keeps knocking with a key this relay does not know`,
-      `${m.attempts}× since ${hhmm(m.firstUtc)}. Usually an old client still running after the machine was paired again, or a revoked key.`,
-      [button('Pair it', 'small primary', () => openPair(m.name || m.host || '')), button('Details', 'small', () => { location.hash = '#access'; })]));
+    // The name is whatever the sender claims, so it is presented as a claim.
+    const who = m.name || m.host ? `A machine calling itself “${m.name || m.host}”` : 'A machine';
+    list.push(alert('bad', `${who} at ${m.peer} keeps polling with a key this relay does not know`,
+      `since ${hhmm(m.firstUtc)}. Usually an old client still running after the machine was paired again, or a revoked key.`,
+      [keyed(button('Pair it', 'small primary', () => openPair(m.name || m.host || '')), `pair-${m.peer}`),
+        keyed(button('Details', 'small', () => { location.hash = '#access'; }), `details-${m.peer}`)]));
   }
-  if (state.unknown.length > 3) list.push(alert('bad', `${state.unknown.length - 3} more machines with unknown keys`, '', [button('Show', 'small', () => { location.hash = '#access'; })]));
+  if (state.unknown.length > 3) {
+    list.push(alert('bad', `${state.unknown.length - 3} more machines with unknown keys`, '',
+      [keyed(button('Show', 'small', () => { location.hash = '#access'; }), 'unknown-more')]));
+  }
   for (const c of state.recent.filter((x) => !x.polled && !x.revoked && (Date.now() - new Date(x.atUtc)) > 60000)) {
-    list.push(alert('', `${c.name} paired ${since(c.atUtc)} but has not connected since`,
+    list.push(alert('', `${c.name} paired at ${hhmm(c.atUtc)} but has not connected since`,
       'Its client service is not running, or it cannot reach the relay address it was given.',
-      [button('What to check', 'small', () => openPairedHelp(c))]));
+      [keyed(button('What to check', 'small', () => openPairedHelp(c)), `help-${c.id}`)]));
   }
   if (state.admin && !state.admin.publicUrlSet && suspiciousAddress()) {
     list.push(alert('', 'Install commands point at a VPN or virtual address',
       `Machines on your local network may not reach ${state.admin.publicUrl}.`,
-      [button('Choose the address', 'small', () => { location.hash = '#settings'; })]));
+      [keyed(button('Choose the address', 'small', () => { location.hash = '#settings'; }), 'choose-address')]));
   }
-  $('alerts').replaceChildren(...list);
+  return list;
 }
 
 // ---------------------------------------------------------------- machines
@@ -223,7 +255,8 @@ function machineState(c) {
   return { cls: 'on', text: 'online' };
 }
 
-let portsSig = '';
+/** Cards slide in on the first paint only; later repaints must not make the panel flicker. */
+let portsShown = false;
 function renderMachines() {
   const all = state.clients;
   const shown = all.filter((c) => state.show === 'all'
@@ -236,22 +269,19 @@ function renderMachines() {
   $('noMachines').hidden = all.length > 0;
   $('machFilter').hidden = all.length === 0;
 
-  const sig = JSON.stringify([state.show, shown.map((c) => [c.id, c.name, c.host, c.user, c.os, c.version, c.outdated, c.connected, c.state, c.running, c.queued, c.served])]);
-  if (sig !== portsSig) {
-    portsSig = sig;
-    $('ports').replaceChildren(...shown.map((c, i) => port(c, i)));
-  } else {
-    for (const node of document.querySelectorAll('.port .seen')) {
-      const c = all.find((x) => x.id === node.dataset.id);
-      if (c) node.textContent = c.connected ? `seen ${ago(c.secondsAgo)}` : `last seen ${ago(c.secondsAgo)}`;
-    }
+  paint($('ports'), [state.show, shown.map((c) => [c.id, c.name, c.host, c.user, c.os, c.version, c.outdated, c.connected, c.state, c.running, c.queued, c.served])],
+    () => shown.map((c, i) => port(c, i)));
+  portsShown = true;
+  for (const node of document.querySelectorAll('.port .seen')) {
+    const c = all.find((x) => x.id === node.dataset.id);
+    if (c) node.textContent = c.connected ? `seen ${ago(c.secondsAgo)}` : `last seen ${ago(c.secondsAgo)}`;
   }
   syncTargets();
 }
 
 function port(c, i) {
   const st = machineState(c);
-  const p = el('button', `port ${st.cls}`);
+  const p = keyed(el('button', `port ${st.cls}${portsShown ? '' : ' enter'}`), `port-${c.id}`);
   p.type = 'button';
   p.style.setProperty('--i', String(i));
   p.append(el('span', 'lamp'), el('span', 'state', st.text), el('span', 'alias', c.name));
@@ -397,6 +427,7 @@ function logRow(e) {
   tr.append(el('td', 't', clock(e.at)), el('td', 'k', label), el('td', 'm', e.client), el('td', 'd', e.message));
   if (e.id && e.kind === 'exec') {
     tr.dataset.id = e.id;
+    keyed(tr, `row-${e.id}`);
     tr.tabIndex = 0;
     tr.title = 'Show the output';
     tr.addEventListener('click', () => openCommand(e));
@@ -405,7 +436,6 @@ function logRow(e) {
   return tr;
 }
 
-let logSig = '';
 function renderActivity() {
   const chip = $('pickedChip');
   chip.replaceChildren();
@@ -425,15 +455,10 @@ function renderActivity() {
     .filter((e) => !q || `${e.client} ${e.message}`.toLowerCase().includes(q))
     .slice().reverse();
   const shown = list.slice(0, state.limit);
-  const sig = JSON.stringify([state.picked, state.kind, q, state.limit, shown.length, shown[0]?.at, shown[0]?.message]);
   $('noEvents').hidden = list.length > 0;
   $('logWrap').hidden = list.length === 0;
   $('more').hidden = list.length <= state.limit;
-  // Repainting under the pointer would tear a row away from whoever is about to click it.
-  if (sig !== logSig) {
-    logSig = sig;
-    $('rows').replaceChildren(...shown.map(logRow));
-  }
+  paint($('rows'), [state.picked, state.kind, q, state.limit, shown.length, shown[0]?.at, shown[0]?.message], () => shown.map(logRow));
   renderNumbers();
 }
 
@@ -509,11 +534,13 @@ async function openCommand(e) {
 // ---------------------------------------------------------------- drawer
 let drawerReturn = null;
 function openDrawer(title, body) {
-  drawerReturn = document.activeElement;
+  // A drawer opened from inside the drawer keeps returning to what opened the first one.
+  if ($('drawer').hidden) drawerReturn = document.activeElement?.dataset?.key ?? document.activeElement;
   $('dTitle').textContent = title;
   fillDrawer(body);
   $('drawer').hidden = false;
   $('shade').hidden = false;
+  document.querySelector('.shell').inert = true;
   $('dClose').focus();
 }
 function fillDrawer(body) { $('dBody').replaceChildren(...body); }
@@ -521,7 +548,10 @@ function closeDrawer() {
   if ($('drawer').hidden) return;
   $('drawer').hidden = true;
   $('shade').hidden = true;
-  drawerReturn?.focus?.();
+  document.querySelector('.shell').inert = false;
+  // The element that opened it may have been repainted since; find its replacement by key.
+  const back = typeof drawerReturn === 'string' ? document.querySelector(`[data-key="${CSS.escape(drawerReturn)}"]`) : drawerReturn;
+  back?.focus?.();
 }
 $('dClose').addEventListener('click', closeDrawer);
 $('shade').addEventListener('click', closeDrawer);
@@ -531,42 +561,49 @@ document.addEventListener('keydown', (k) => { if (k.key === 'Escape') closeDrawe
 function renderAccess() {
   const codes = state.pending;
   $('codesCard').hidden = codes.length === 0;
-  $('codes').replaceChildren(...codes.map((p) => {
+  paint($('codes'), codes.map((p) => [p.id, p.name, p.expiresUtc]), () => codes.map((p) => {
     const tr = el('tr');
     const actions = el('td', 'num');
-    actions.append(button('Show', 'small', () => openPairFor(p)), document.createTextNode(' '),
-      button('Cancel', 'small danger', async () => { await api(`/api/admin/pair/${encodeURIComponent(p.id)}`, { method: 'DELETE' }); refreshPairing(); }));
+    actions.append(keyed(button('Show', 'small', () => openPairFor(p)), `show-${p.id}`), document.createTextNode(' '),
+      keyed(button('Cancel', 'small danger', () => act(api(`/api/admin/pair/${encodeURIComponent(p.id)}`, { method: 'DELETE' }), 'Code cancelled', refreshPairing)), `cancel-${p.id}`));
     tr.append(el('td', 'mono', p.code), el('td', '', p.name || 'its hostname'), el('td', '', hhmm(p.expiresUtc)), actions);
     return tr;
   }));
 
-  const unknown = state.unknown.map((m) => {
-    const tr = el('tr');
+  const sig = [state.unknown.map((m) => [m.peer, m.name, m.host, m.attempts]), state.creds.map((c) => [c.id, c.name, c.role, c.online, c.lastUsedUtc])];
+  paint($('creds'), sig, () => [...state.unknown.map((m) => {
+    const tr = el('tr', 'bad');
     const td = el('td', 'num');
-    td.append(button('Pair it', 'small primary', () => openPair(m.name || m.host || '')));
-    tr.append(el('td', '', m.name || m.host || '(no name)'), el('td', '', 'unknown key'),
-      el('td', '', `${m.attempts}× from ${m.peer}, last ${since(m.lastUtc)}`), el('td', 'num', '0'), td);
-    tr.classList.add('bad');
+    td.append(keyed(button('Pair it', 'small primary', () => openPair(m.name || m.host || '')), `pairrow-${m.peer}`));
+    tr.append(el('td', '', m.name || m.host ? `calls itself ${m.name || m.host}` : '(no name)'), el('td', '', 'unknown key'),
+      el('td', '', `${m.attempts}× from ${m.peer}, last at ${hhmm(m.lastUtc)}`), el('td', 'num', '0'), td);
     return tr;
-  });
-
-  $('creds').replaceChildren(...unknown, ...state.creds.map((c) => {
+  }), ...state.creds.map((c) => {
     const tr = el('tr');
     const role = c.ephemeral ? `${c.role} · command line` : c.role;
     const td = el('td', 'num');
     if (!c.ephemeral) {
-      td.append(button('Revoke', 'small danger', async () => {
+      td.append(keyed(button('Revoke', 'small danger', () => {
         if (!confirm(`Revoke "${c.name}"? Anything using it is cut off immediately.`)) return;
-        await api(`/api/admin/credentials/${encodeURIComponent(c.id)}`, { method: 'DELETE' });
-        toast('Revoked');
-        loadSlow();
-      }));
+        act(api(`/api/admin/credentials/${encodeURIComponent(c.id)}`, { method: 'DELETE' }), 'Revoked', loadSlow);
+      }), `revoke-${c.id}`));
     } else {
       td.append(el('span', 'hint', 'restart the relay without it to remove'));
     }
     tr.append(el('td', '', c.name), el('td', '', role), el('td', '', since(c.lastUsedUtc)), el('td', 'num', c.online ? String(c.online) : ''), td);
     return tr;
-  }));
+  })]);
+}
+
+/** Runs a change, then reports how it went: a toast either way, and a refresh after success. */
+async function act(promise, done, then) {
+  try {
+    await promise;
+    toast(done);
+    await then?.();
+  } catch (err) {
+    toast(err.message);
+  }
 }
 
 $('tokForm').addEventListener('submit', async (e) => {
@@ -587,27 +624,26 @@ $('tokForm').addEventListener('submit', async (e) => {
 
 // ---------------------------------------------------------------- agents
 function renderAgents() {
-  if (!state.oauth.length) {
-    $('oauthPending').replaceChildren(el('p', 'hint', 'No agent is waiting.'));
-  } else {
-    $('oauthPending').replaceChildren(...state.oauth.map((p) => {
+  paint($('oauthPending'), state.oauth.map((p) => p.id), () => (!state.oauth.length
+    ? [el('p', 'hint', 'No agent is waiting.')]
+    : state.oauth.map((p) => {
       const box = el('div', 'codeBox');
       const who = el('div', 'grow');
-      who.append(el('b', '', p.client), el('div', 'hint', `returns to ${p.redirect} · ${since(p.createdUtc)}`));
+      who.append(el('b', '', p.client), el('div', 'hint', `returns to ${p.redirect} · asked at ${hhmm(p.createdUtc)}`));
       box.append(el('span', 'code', p.userCode), who,
-        button('Approve', 'primary', () => decide(p, 'approve')), button('Deny', 'danger', () => decide(p, 'deny')));
+        keyed(button('Approve', 'primary', () => decide(p, 'approve')), `approve-${p.id}`),
+        keyed(button('Deny', 'danger', () => decide(p, 'deny')), `deny-${p.id}`));
       return box;
-    }));
-  }
+    })));
   const a = state.admin;
   if (!a) return;
   const cmds = [
     ['On this machine', `claude mcp add --transport http remote-cmd http://localhost:${a.adminPort}/mcp`],
-    [a.tls ? 'From another machine (it has to trust the relay\'s self-signed certificate)' : 'From another machine', `claude mcp add --transport http remote-cmd ${a.publicUrl}/mcp`],
+    [a.tls ? "From another machine (it has to trust the relay's self-signed certificate)" : 'From another machine', `claude mcp add --transport http remote-cmd ${a.publicUrl}/mcp`],
   ];
-  $('mcpCmds').replaceChildren(...cmds.flatMap(([label, cmd]) => {
+  paint($('mcpCmds'), cmds, () => cmds.flatMap(([label, cmd], i) => {
     const bar = el('div', 'bar');
-    bar.append(el('b', '', label), button('Copy', 'small', () => copy(cmd, 'Command copied')));
+    bar.append(el('b', '', label), keyed(button('Copy', 'small', () => copy(cmd, 'Command copied')), `mcp-${i}`));
     return [bar, el('pre', 'cmd', cmd)];
   }));
 }
@@ -700,11 +736,7 @@ $('urlForm').addEventListener('submit', async (e) => {
   } catch (err) { $('urlNote').textContent = err.message; return; }
   await loadSlow();
 });
-$('urlReset').addEventListener('click', async () => {
-  await api('/api/admin/settings', { method: 'POST', body: { publicUrl: null } });
-  toast('Using the detected address');
-  loadSlow();
-});
+$('urlReset').addEventListener('click', () => act(api('/api/admin/settings', { method: 'POST', body: { publicUrl: null } }), 'Using the detected address', loadSlow));
 
 $('pwForm').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -715,15 +747,11 @@ $('pwForm').addEventListener('submit', async (e) => {
   toast('Password set');
   loadSlow();
 });
-$('pwClear').addEventListener('click', async () => {
+$('pwClear').addEventListener('click', () => {
   if (!confirm('Remove the password? Anyone with a session on this machine can then open the dashboard.')) return;
-  await api('/api/admin/password', { method: 'POST', body: { password: null } });
-  loadSlow();
+  act(api('/api/admin/password', { method: 'POST', body: { password: null } }), 'Password removed', loadSlow);
 });
-$('logout').addEventListener('click', async () => {
-  await api('/api/admin/logout', { method: 'POST' });
-  location.href = '/login';
-});
+$('logout').addEventListener('click', () => act(api('/api/admin/logout', { method: 'POST' }), 'Signed out', () => { location.href = '/login'; }));
 
 // ---------------------------------------------------------------- pairing
 const TAB_HINT = {
@@ -764,6 +792,7 @@ function openPairFor(p) {
 function showCode(p) {
   pair.id = p.id;
   pair.entry = p;
+  pair.misses = 0;
   $('pairCode').textContent = p.code;
   $('pairExp').textContent = `${p.name ? `for ${p.name} · ` : ''}valid until ${hhmm(p.expiresUtc)} · ${p.serverUrl}`;
   const tabs = (p.install || []).map((c) => {
@@ -803,14 +832,19 @@ document.addEventListener('click', (e) => { if (e.target.closest?.('[data-action
 $('pairClose').addEventListener('click', () => $('pairDlg').close());
 $('pairDlg').addEventListener('close', () => { pair.open = false; clearInterval(pair.timer); });
 $('pairAnother').addEventListener('click', () => openPair());
-$('pairShow').addEventListener('click', () => {
+$('pairShow').addEventListener('click', async () => {
   $('pairDlg').close();
   location.hash = '#machines';
   const sessionId = pair.done?.sessionId;
-  setTimeout(() => { if (sessionId) openMachine(sessionId); }, 50);
+  if (!sessionId) return;
+  // The machine list may predate its first poll; read it fresh rather than waiting for the next tick.
+  try { state.clients = (await api('/api/clients')).clients; renderMachines(); } catch { /* tick() reports it */ }
+  openMachine(sessionId);
 });
 $('pairCancel').addEventListener('click', async () => {
-  if (pair.id) await api(`/api/admin/pair/${encodeURIComponent(pair.id)}`, { method: 'DELETE' }).catch(() => {});
+  if (pair.id) {
+    try { await api(`/api/admin/pair/${encodeURIComponent(pair.id)}`, { method: 'DELETE' }); toast('Code cancelled'); } catch (err) { toast(err.message); }
+  }
   $('pairDlg').close();
   refreshPairing();
 });
@@ -842,6 +876,8 @@ function followPairing() {
   if (state.pending.some((p) => p.id === pair.id)) return; // still waiting
   const done = state.recent.find((r) => r.id === pair.id);
   if (!done) {
+    // A list fetched just before the code was created does not have it yet; only an expired code is final.
+    if (Date.now() < new Date(pair.entry.expiresUtc) && ++pair.misses < 3) return;
     setWait('warn', 'This code is no longer valid', 'It expired or was cancelled. Create a new one.');
     clearInterval(pair.timer);
     return;
@@ -869,7 +905,7 @@ function openPairedHelp(c) {
   openDrawer(`${c.name} has not connected`, [
     el('p', 'hint', `It traded its code for a key at ${hhmm(c.atUtc)} from ${c.peer}, but no poll with that key has arrived since.`),
     el('h3', '', 'On Windows'),
-    el('pre', 'cmd', 'Get-Service RemoteCmd* | Format-Table Name,Status,StartType\nGet-Content "$env:ProgramData\\RemoteCmd\\client.json"'),
+    el('pre', 'cmd', 'Get-Service RemoteCmd* | Format-Table Name,Status,StartType\nTest-Path "$env:ProgramData\\RemoteCmd\\client.json"   # its key lives here; do not paste it anywhere'),
     el('h3', '', 'On Linux / macOS'),
     el('pre', 'cmd', 'systemctl status RemoteCmdClient   # Linux\nsudo launchctl print system/cz.nks.remotecmd.RemoteCmdClient   # macOS'),
     el('p', 'hint', 'If an older client is still running under another service name, it keeps using its old key and shows up under Access as an unknown key. Stop it, or pair again — the install replaces the service.'),
