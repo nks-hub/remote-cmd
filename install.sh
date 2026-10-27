@@ -89,5 +89,5 @@ if [ "$role" = client ]; then
   fi
 else
   [ "$no_service" = 1 ] || "$dir/$project" install-service ${service_name:+--service-name "$service_name"}
-  echo "Open the dashboard on this machine: http://localhost:7891  (Pair & manage -> Create code)"
+  echo "Open the dashboard on this machine: http://localhost:7891  (press \"Pair a machine\")"
 fi

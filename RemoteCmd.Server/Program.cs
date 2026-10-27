@@ -100,6 +100,7 @@ var events = new EventLog();
 var commands = new CommandLog();
 var stats = new RelayStats();
 var authThrottle = new AuthThrottle();
+var unknownKeys = new UnknownKeys();
 var releases = new ReleaseCheck();
 releases.Start(app.Lifetime.ApplicationStopping);
 
@@ -212,7 +213,10 @@ app.Use(async (context, next) =>
         }
 
         var signedIn = !store.HasPassword || adminGate.IsValid(context.Request.Cookies[AdminGate.CookieName], now);
+        // The sign-in page needs its own script and styles before anyone is signed in; they are the
+        // same static files for everybody and hold no relay data.
         var signInPath = path.Equals("/login", StringComparison.OrdinalIgnoreCase)
+                         || path.StartsWith("/assets/", StringComparison.OrdinalIgnoreCase)
                          || path.Equals("/api/admin/login", StringComparison.OrdinalIgnoreCase)
                          || path.Equals("/api/admin/session", StringComparison.OrdinalIgnoreCase);
         if (!signedIn && !signInPath)
@@ -242,11 +246,13 @@ app.Use(async (context, next) =>
         return;
     }
 
-    if (dashboardOnly.Contains(path) || path.StartsWith("/api/admin", StringComparison.OrdinalIgnoreCase))
+    if (dashboardOnly.Contains(path)
+        || path.StartsWith("/api/admin", StringComparison.OrdinalIgnoreCase)
+        || path.StartsWith("/assets", StringComparison.OrdinalIgnoreCase))
     {
         // An old bookmark to the relay port's /ui, opened on this machine, lands on the dashboard.
         // From anywhere else the dashboard does not exist as far as the network is concerned.
-        if (HttpMethods.IsGet(context.Request.Method) && !path.StartsWith("/api", StringComparison.OrdinalIgnoreCase)
+        if (HttpMethods.IsGet(context.Request.Method) && dashboardOnly.Contains(path)
             && context.Connection.RemoteIpAddress is { } peer && System.Net.IPAddress.IsLoopback(peer.IsIPv4MappedToIPv6 ? peer.MapToIPv4() : peer))
         {
             context.Response.Redirect($"http://localhost:{adminPort}{(path.Equals("/ui", StringComparison.OrdinalIgnoreCase) ? "/" : path)}");
@@ -267,7 +273,18 @@ app.Use(async (context, next) =>
         var credential = store.Authenticate(reqToken);
         if (credential is null)
         {
-            await RejectAsync(context, authThrottle, stats, events, $"401 on {path}", 401, "Invalid token");
+            var what = $"401 on {path}";
+            var peerAddress = context.Connection.RemoteIpAddress?.ToString() ?? "?";
+            if (clientPaths.Contains(path) && !string.IsNullOrEmpty(reqToken) && !authThrottle.IsLockedOut(peerAddress, now))
+            {
+                // A client with a key nobody issued: almost always an old client left running after
+                // its machine was re-paired, or one whose key was revoked. Name it, so the dashboard
+                // can offer to pair it rather than just counting it as an attack.
+                var claimed = UnknownKeys.Clean(context.Request.Query["name"].FirstOrDefault());
+                unknownKeys.Record(peerAddress, claimed, context.Request.Query["host"].FirstOrDefault(), path, now);
+                if (claimed.Length > 0) what += $" (machine calls itself '{claimed}', unknown key)";
+            }
+            await RejectAsync(context, authThrottle, stats, events, what, 401, "Invalid token");
             return;
         }
 
@@ -535,6 +552,7 @@ object ClientList()
         {
             id = c.Id,
             name = c.Name,
+            credentialId = c.CredentialId,
             ip = c.RemoteIp,
             token = c.TokenLabel,
             lastPoll = c.LastPoll,
@@ -676,9 +694,13 @@ app.MapGet("/api/command", (HttpRequest req) =>
         : Results.Ok(record);
 });
 
-// Browser status page, on the dashboard listener only (see the middleware). Everything it shows
-// comes from the JSON endpoints above.
-app.MapGet("/ui", () => Results.Content(StatusPage.Html, "text/html; charset=utf-8"));
+// The dashboard, on its own listener only (see the middleware). Everything it shows comes from the
+// JSON endpoints; /ui and /manage are older addresses of it.
+app.MapGet("/ui", (HttpContext context) => WebAssets.Serve(context, "index.html"));
+app.MapGet("/manage", (HttpContext context) => WebAssets.Serve(context, "index.html"));
+app.MapGet("/login", (HttpContext context) => WebAssets.Serve(context, "login.html"));
+app.MapGet("/assets/{file}", (HttpContext context, string file)
+    => file.EndsWith(".html", StringComparison.OrdinalIgnoreCase) ? Results.NotFound() : WebAssets.Serve(context, file));
 
 app.MapGet("/api/status", (HttpRequest req) =>
 {
@@ -712,17 +734,15 @@ app.MapGet("/api/status", (HttpRequest req) =>
 });
 
 var relay = new RelayContext(store, storePath, pairings, adminGate, authThrottle, stats, clients, events,
-    port, adminPort, noTls, certSha256);
+    unknownKeys, port, adminPort, noTls, certSha256);
 AdminEndpoints.Map(app, relay);
 McpEndpoints.Map(app, relay, new OAuthServer(store), new McpOps(
     name => ResolveClient(name, clients), RunCommand, PushFile, PullFile, ClientList));
-app.MapGet("/manage", () => Results.Content(AdminPage.Manage, "text/html; charset=utf-8"));
-app.MapGet("/login", () => Results.Content(AdminPage.Login, "text/html; charset=utf-8"));
 
 // The dashboard on its own listener; on the relay port, a plain note of what this is and nothing
 // about who is connected.
 app.MapGet("/", (HttpContext context) => IsDashboardRequest(context, adminPort)
-    ? Results.Content(StatusPage.Html, "text/html; charset=utf-8")
+    ? WebAssets.Serve(context, "index.html")
     : Results.Text(
         $"Remote CMD Relay Server {RemoteCmd.Shared.VersionInfo.Version}\n" +
         $"Encryption: AES-256-GCM | TLS: {(noTls ? "off" : "self-signed")}\n" +

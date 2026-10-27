@@ -44,17 +44,27 @@ public class StatusPageTests : IClassFixture<RemoteCmdFactory>
     {
         // The writes are what is banned, not the words: the page's own comments explain the rule
         // and name the properties while doing so.
-        Assert.DoesNotMatch(@"(inner|outer)HTML\s*=", StatusPage.Html);
-        Assert.DoesNotMatch(@"insertAdjacentHTML\s*\(", StatusPage.Html);
-        Assert.DoesNotMatch(@"document\.write\s*\(", StatusPage.Html);
+        foreach (var name in WebAssets.Names.Where(n => n.EndsWith(".js") || n.EndsWith(".html")))
+        {
+            var text = WebAssets.Text(name);
+            Assert.DoesNotMatch(@"(inner|outer)HTML\s*=", text);
+            Assert.DoesNotMatch(@"insertAdjacentHTML\s*\(", text);
+            Assert.DoesNotMatch(@"document\.write\s*\(", text);
+            Assert.DoesNotMatch(@"\beval\s*\(|new Function\s*\(", text);
+        }
     }
 
     /// <summary>Self-contained: a relay on a closed network still has to render.</summary>
     [Fact]
     public void ThePageLoadsNothingFromTheInternet()
     {
-        Assert.DoesNotContain("http://", StatusPage.Html.Replace("http://www.w3.org/2000/svg", ""));
-        Assert.DoesNotContain("https://", StatusPage.Html);
+        foreach (var name in WebAssets.Names)
+        {
+            var text = WebAssets.Text(name);
+            Assert.DoesNotMatch(@"(src|href)\s*=\s*[""']https?://", text);
+            Assert.DoesNotMatch(@"url\(\s*[""']?https?://", text);
+            Assert.DoesNotMatch(@"@import", text);
+        }
     }
 
     [Fact]

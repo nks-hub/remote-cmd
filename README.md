@@ -60,8 +60,10 @@ address. Open **http://localhost:7891** on that machine.
 
 ### Add machines
 
-On the dashboard press **Pair & manage → Create code**. You get a one-time code and ready-made
-commands with it filled in; run the one for the machine's system:
+On the dashboard press **Pair a machine**, pick the address the machine reaches the relay at (LAN
+addresses come first, VPN and virtual adapters are labelled) and create a code. You get a one-time
+code and ready-made commands with it filled in; run the one for the machine's system. The dialog
+follows the machine until its client is online, and says so if it paired but never connected:
 
 ```powershell
 # Windows, elevated PowerShell
@@ -102,7 +104,7 @@ nothing extra.
 
 ### Scripts and curl
 
-Create a controller token on the dashboard (**Access → New controller token**) or with
+Create a controller token on the dashboard (**Access → New controller key**) or with
 `RemoteCmd.Server token add --name ci`, then:
 
 ```bash
@@ -119,11 +121,20 @@ Add `-k` while the relay uses its self-signed certificate.
 
 Listens on `http://localhost:7891` and nowhere else.
 
-- **Status**: machines with their alias, real host name, account, system and client version
-  (flagged when a newer release exists), live activity, command output, transfer volume.
-- **Pair & manage**: pairing codes with install commands, AI agents waiting for approval, every
-  credential with when it was last used and a revoke button, the relay's public address, and the
-  dashboard password.
+- **Machines**: alias, real host name, account, system and client version (flagged when a newer
+  release exists). A machine's panel has its recent activity, a command line, re-pairing, and
+  removal from the list once it is offline.
+- **Activity**: every command with its output, transfers, connections and refused requests, with
+  search and filters.
+- **Access**: every key with when it was last used and a revoke button, open pairing codes, and
+  machines that keep polling with a key the relay does not know (usually an old client left running
+  after a re-pairing), each with a button to pair it again.
+- **AI agents**: MCP sign-ins waiting for approval and the `claude mcp add` commands.
+- **Settings**: the relay address used in install commands, chosen from this machine's addresses,
+  the dashboard password, and TLS details.
+
+The pages are files in `RemoteCmd.Server/Web`, embedded in the binary and served with a
+Content-Security-Policy that allows only their own scripts and styles.
 
 With no password the dashboard is open to anyone who has a session on the relay's machine. Set one
 on the page or with `RemoteCmd.Server set-password`.

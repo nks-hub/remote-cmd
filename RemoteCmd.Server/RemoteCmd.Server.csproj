@@ -11,6 +11,13 @@
     <PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="9.0.0" />
   </ItemGroup>
 
+  <!-- The dashboard ships inside the binary, so a single-file relay needs nothing beside it. -->
+  <ItemGroup>
+    <Content Remove="Web\**" />
+    <None Remove="Web\**" />
+    <EmbeddedResource Include="Web\*" LogicalName="RemoteCmd.Server.Web.%(Filename)%(Extension)" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\RemoteCmd.Shared\RemoteCmd.Shared.csproj" />
   </ItemGroup>
