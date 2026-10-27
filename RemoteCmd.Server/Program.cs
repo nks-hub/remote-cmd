@@ -274,14 +274,14 @@ app.Use(async (context, next) =>
         if (credential is null)
         {
             var what = $"401 on {path}";
-            if (clientPaths.Contains(path) && !string.IsNullOrEmpty(reqToken))
+            var peerAddress = context.Connection.RemoteIpAddress?.ToString() ?? "?";
+            if (clientPaths.Contains(path) && !string.IsNullOrEmpty(reqToken) && !authThrottle.IsLockedOut(peerAddress, now))
             {
                 // A client with a key nobody issued: almost always an old client left running after
                 // its machine was re-paired, or one whose key was revoked. Name it, so the dashboard
                 // can offer to pair it rather than just counting it as an attack.
                 var claimed = UnknownKeys.Clean(context.Request.Query["name"].FirstOrDefault());
-                unknownKeys.Record(context.Connection.RemoteIpAddress?.ToString() ?? "?", claimed,
-                    context.Request.Query["host"].FirstOrDefault(), path, now);
+                unknownKeys.Record(peerAddress, claimed, context.Request.Query["host"].FirstOrDefault(), path, now);
                 if (claimed.Length > 0) what += $" (machine calls itself '{claimed}', unknown key)";
             }
             await RejectAsync(context, authThrottle, stats, events, what, 401, "Invalid token");

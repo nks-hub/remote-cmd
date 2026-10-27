@@ -123,9 +123,11 @@ public class DashboardWebTests
         Assert.Contains("Windows (PowerShell as admin)", root.GetProperty("commands").EnumerateObject().Select(p => p.Name));
 
         Assert.Equal(400, (await relay.Dashboard("POST", "/api/admin/pair", new { serverUrl = "ftp://192.0.2.10" })).Status);
-        // Only scheme, host and port reach a command the operator runs as administrator.
-        var (_, sneaky, _) = await relay.Dashboard("POST", "/api/admin/pair", new { serverUrl = "http://192.0.2.10:7890/x';calc;'" });
-        Assert.Equal("http://192.0.2.10:7890", JsonDocument.Parse(sneaky).RootElement.GetProperty("serverUrl").GetString());
+        // The address lands in a command the operator runs as administrator.
+        foreach (var sneaky in new[] { "http://192.0.2.10:7890/x';calc;'", "http://192.0.2.10:7890/?a=$(id)", "http://u:p@192.0.2.10:7890" })
+            Assert.Equal(400, (await relay.Dashboard("POST", "/api/admin/pair", new { serverUrl = sneaky })).Status);
+        var (_, proxied, _) = await relay.Dashboard("POST", "/api/admin/pair", new { serverUrl = "https://relay.example/remote-cmd/" });
+        Assert.Equal("https://relay.example/remote-cmd", JsonDocument.Parse(proxied).RootElement.GetProperty("serverUrl").GetString());
         Assert.Equal(400, (await relay.Dashboard("POST", "/api/admin/settings", new { publicUrl = "not a url" })).Status);
     }
 
@@ -172,15 +174,50 @@ public class DashboardWebTests
     }
 
     [Theory]
-    [InlineData(NetworkInterfaceType.Ethernet, "Ethernet", "Intel(R) Ethernet Connection", "192.168.88.254", RelayAddresses.Lan)]
-    [InlineData(NetworkInterfaceType.Unknown, "chatujme_wg", "WireGuard Tunnel", "10.254.0.7", RelayAddresses.Vpn)]
-    [InlineData(NetworkInterfaceType.Ppp, "NKS-L2TP", "WAN Miniport (L2TP)", "10.66.6.200", RelayAddresses.Vpn)]
-    [InlineData(NetworkInterfaceType.Ethernet, "vEthernet (Default Switch)", "Hyper-V Virtual Ethernet Adapter", "172.19.48.1", RelayAddresses.Virtual)]
-    [InlineData(NetworkInterfaceType.Ethernet, "docker0", "docker0", "172.17.0.1", RelayAddresses.Virtual)]
-    [InlineData(NetworkInterfaceType.Ethernet, "eth0", "eth0", "203.0.113.5", RelayAddresses.Public)]
-    [InlineData(NetworkInterfaceType.Wireless80211, "Wi-Fi", "Intel(R) Wi-Fi 6E", "10.0.0.20", RelayAddresses.Lan)]
-    public void AddressesAreSortedOutByWhatTheyLeadTo(NetworkInterfaceType type, string name, string description, string ip, string kind)
-        => Assert.Equal(kind, RelayAddresses.Classify(type, name, description, IPAddress.Parse(ip)));
+    [InlineData(NetworkInterfaceType.Ethernet, "Ethernet", "Intel(R) Ethernet Connection", "192.168.88.254", true, RelayAddresses.Lan)]
+    [InlineData(NetworkInterfaceType.Unknown, "chatujme_wg", "WireGuard Tunnel", "10.254.0.7", false, RelayAddresses.Vpn)]
+    [InlineData(NetworkInterfaceType.Ppp, "NKS-L2TP", "WAN Miniport (L2TP)", "10.66.6.200", false, RelayAddresses.Vpn)]
+    [InlineData(NetworkInterfaceType.Ethernet, "vEthernet (Default Switch)", "Hyper-V Virtual Ethernet Adapter", "172.19.48.1", false, RelayAddresses.Virtual)]
+    [InlineData(NetworkInterfaceType.Ethernet, "vEthernet (External)", "Hyper-V Virtual Ethernet Adapter #2", "192.168.1.20", true, RelayAddresses.Lan)]
+    [InlineData(NetworkInterfaceType.Ethernet, "docker0", "docker0", "172.17.0.1", false, RelayAddresses.Virtual)]
+    [InlineData(NetworkInterfaceType.Ethernet, "eth0", "eth0", "203.0.113.5", true, RelayAddresses.Public)]
+    [InlineData(NetworkInterfaceType.Wireless80211, "Wi-Fi", "Intel(R) Wi-Fi 6E", "10.0.0.20", true, RelayAddresses.Lan)]
+    public void AddressesAreSortedOutByWhatTheyLeadTo(NetworkInterfaceType type, string name, string description, string ip, bool gateway, string kind)
+        => Assert.Equal(kind, RelayAddresses.Classify(type, name, description, IPAddress.Parse(ip), gateway));
+
+    /// <summary>
+    /// Between claiming a code and recording what it became, the key is written to disk. A dashboard
+    /// polling in that moment must still see the code somewhere, or it reports it as expired.
+    /// </summary>
+    [Fact]
+    public void ACodeBeingRedeemedNeverDropsOutOfBothLists()
+    {
+        var codes = new PairingCodes();
+        var now = DateTime.UtcNow;
+        var pending = codes.Create("pc", null, now);
+
+        Assert.True(codes.Consume(pending));
+        Assert.False(codes.Consume(pending));            // single use while in flight
+        Assert.Null(codes.Find(pending.Id, now));         // and not offered to anyone else
+        Assert.Contains(codes.Active(now), p => p.Id == pending.Id);
+
+        codes.Complete(pending, "pc", "cred1", "198.51.100.4", now);
+        Assert.DoesNotContain(codes.Active(now), p => p.Id == pending.Id);
+        Assert.Equal("cred1", Assert.Single(codes.Recent(now)).CredentialId);
+    }
+
+    [Fact]
+    public void AnUnknownKeySenderCannotFillTheListOrDisguiseItsName()
+    {
+        var keys = new UnknownKeys();
+        var now = DateTime.UtcNow;
+        for (var i = 0; i < 500; i++) keys.Record("198.51.100.9", $"name-{i}", null, "/api/poll", now);
+        var only = Assert.Single(keys.Recent(now));
+        Assert.Equal(500, only.Attempts);
+        Assert.Equal("name-499", only.Name);
+        // Right-to-left override and zero-width space would make the name read as something else.
+        Assert.Equal("evilgnp.exe", UnknownKeys.Clean("evil‮gnp.exe​"));
+    }
 
     private static async Task<JsonElement> Recent(DashboardRelay relay)
     {

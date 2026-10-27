@@ -30,16 +30,22 @@ public sealed record RelayContext(
            ?? UrlFor(RelayAddresses.Candidates().FirstOrDefault()?.Address ?? Environment.MachineName);
 
     /// <summary>
-    /// Reduces an address to scheme, host and port — all a client polls. The result is pasted into
-    /// install commands that run as administrator, so nothing else from the input (path, query,
-    /// quotes) may reach them. Null when it is not an http(s) address.
+    /// The address in the form clients poll: scheme, host, port and an optional path for a relay
+    /// behind a reverse proxy. It is pasted into install commands that run as administrator, so a
+    /// path may hold only letters, digits and <c>/._~-</c>, and a query, fragment or user name is
+    /// refused outright. Null when the address does not qualify.
     /// </summary>
     public static string? RelayUrl(string url)
-        => Uri.TryCreate(url.Trim(), UriKind.Absolute, out var uri)
-           && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
-           && uri.UserInfo.Length == 0
-            ? uri.GetLeftPart(UriPartial.Authority)
+    {
+        if (!Uri.TryCreate(url.Trim(), UriKind.Absolute, out var uri)
+            || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
+            || uri.UserInfo.Length > 0 || uri.Query.Length > 0 || uri.Fragment.Length > 0)
+            return null;
+        var path = uri.AbsolutePath.TrimEnd('/');
+        return path.All(c => char.IsAsciiLetterOrDigit(c) || c is '/' or '.' or '_' or '~' or '-')
+            ? uri.GetLeftPart(UriPartial.Authority) + path
             : null;
+    }
 
     public string UrlFor(string address) => $"{(NoTls ? "http" : "https")}://{address}:{Port}";
 
@@ -256,6 +262,7 @@ public static class AdminEndpoints
                 recent = r.Pairings.Recent(now).Select(c =>
                 {
                     var sessions = r.Clients.Values.Where(s => s.CredentialId == c.CredentialId).ToList();
+                    var credential = r.Store.All().FirstOrDefault(x => x.Id == c.CredentialId);
                     return new
                     {
                         id = c.Id,
@@ -263,8 +270,10 @@ public static class AdminEndpoints
                         credentialId = c.CredentialId,
                         peer = c.Peer,
                         atUtc = c.AtUtc,
-                        revoked = r.Store.All().All(x => x.Id != c.CredentialId),
-                        polled = sessions.Count > 0,
+                        revoked = credential is null,
+                        // A client key is only ever used to poll, so any use means the machine arrived —
+                        // even if its session has since been removed from the list.
+                        polled = credential?.LastUsedUtc != null || sessions.Count > 0,
                         connected = sessions.Any(s => s.IsConnected()),
                         sessionId = sessions.FirstOrDefault()?.Id,
                     };
@@ -301,8 +310,14 @@ public static class AdminEndpoints
             var answer = Pairing.Answer(pending.Code, request, () =>
             {
                 if (!r.Pairings.Consume(pending)) return null; // someone else used it a moment ago
-                var (credential, token) = r.Store.Issue(name, CredentialRole.Client);
+                Credential credential;
+                string token;
+                try { (credential, token) = r.Store.Issue(name, CredentialRole.Client); }
+                catch { r.Pairings.Release(pending); throw; } // the code stays usable if the key could not be saved
                 issued = credential;
+                r.Pairings.Complete(pending, credential.Label, credential.Id, peer, now);
+                // Whatever this address was knocking with before is being replaced right now.
+                r.UnknownKeys.ForgetPeer(peer);
                 return new PairGrant { Token = token, CredentialId = credential.Id, Name = credential.Label, CertSha256 = r.CertSha256 };
             });
 
@@ -314,7 +329,6 @@ public static class AdminEndpoints
                 return Results.Json(new { error = "Wrong pairing code" }, statusCode: 403);
             }
 
-            r.Pairings.Complete(pending, issued!.Label, issued.Id, peer, now);
             r.Events.Add("pair", name, $"paired from {peer}");
             return Results.Ok(answer);
         });

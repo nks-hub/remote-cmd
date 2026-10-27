@@ -22,15 +22,24 @@ public static class RelayAddresses
     public static IReadOnlyList<RelayAddress> Candidates()
         => NetworkInterface.GetAllNetworkInterfaces()
             .Where(n => n.OperationalStatus == OperationalStatus.Up && n.NetworkInterfaceType != NetworkInterfaceType.Loopback)
-            .SelectMany(n => n.GetIPProperties().UnicastAddresses
-                .Where(a => a.Address.AddressFamily == AddressFamily.InterNetwork && !IsLinkLocal(a.Address))
-                .Select(a => new RelayAddress(a.Address.ToString(), n.Name,
-                    Classify(n.NetworkInterfaceType, n.Name, n.Description, a.Address))))
+            .SelectMany(n =>
+            {
+                var ip = n.GetIPProperties();
+                var hasGateway = ip.GatewayAddresses.Any(g => g.Address.AddressFamily == AddressFamily.InterNetwork && !g.Address.Equals(IPAddress.Any));
+                return ip.UnicastAddresses
+                    .Where(a => a.Address.AddressFamily == AddressFamily.InterNetwork && !IsLinkLocal(a.Address))
+                    .Select(a => new RelayAddress(a.Address.ToString(), n.Name,
+                        Classify(n.NetworkInterfaceType, n.Name, n.Description, a.Address, hasGateway)));
+            })
             .OrderBy(a => Array.IndexOf(Order, a.Kind))
             .ToList();
 
-    /// <summary>What kind of network an interface address belongs to, from what the OS says about it.</summary>
-    public static string Classify(NetworkInterfaceType type, string name, string description, IPAddress address)
+    /// <summary>
+    /// What kind of network an interface address belongs to, from what the OS says about it. A
+    /// virtual adapter with a default gateway is the way out to a real network — a Hyper-V external
+    /// switch carries the machine's LAN address — so only gateway-less ones count as virtual.
+    /// </summary>
+    public static string Classify(NetworkInterfaceType type, string name, string description, IPAddress address, bool hasGateway)
     {
         var text = $"{name} {description}".ToLowerInvariant();
         if (type is NetworkInterfaceType.Tunnel or NetworkInterfaceType.Ppp
@@ -39,9 +48,10 @@ public static class RelayAddresses
             || (name.StartsWith("wg", StringComparison.OrdinalIgnoreCase) && name.Length <= 4)
             || name.StartsWith("tun", StringComparison.OrdinalIgnoreCase))
             return Vpn;
-        if (ContainsAny(text, "vethernet", "hyper-v", "virtual", "vmware", "virtualbox", "vbox", "docker", "wsl", "default switch")
-            || name.StartsWith("br-", StringComparison.OrdinalIgnoreCase)
-            || name.StartsWith("veth", StringComparison.OrdinalIgnoreCase))
+        if (!hasGateway
+            && (ContainsAny(text, "vethernet", "hyper-v", "virtual", "vmware", "virtualbox", "vbox", "docker", "wsl", "default switch")
+                || name.StartsWith("br-", StringComparison.OrdinalIgnoreCase)
+                || name.StartsWith("veth", StringComparison.OrdinalIgnoreCase)))
             return Virtual;
         return IsPrivate(address) ? Lan : Public;
     }

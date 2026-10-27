@@ -13,6 +13,8 @@ public sealed class PendingPairing
     public DateTime CreatedUtc { get; init; }
     public DateTime ExpiresUtc { get; init; }
     public int Failures;
+    /// <summary>1 while a request is trading this code for a key; it then moves to the completed list.</summary>
+    public int Redeeming;
 }
 
 /// <summary>A code that was redeemed: which machine it became and from where.</summary>
@@ -54,7 +56,7 @@ public sealed class PairingCodes
     public PendingPairing? Find(string id, DateTime nowUtc)
     {
         Prune(nowUtc);
-        return _pending.TryGetValue(id, out var p) ? p : null;
+        return _pending.TryGetValue(id, out var p) && Volatile.Read(ref p.Redeeming) == 0 ? p : null;
     }
 
     /// <summary>Counts a wrong proof; the code is withdrawn once it has seen too many.</summary>
@@ -63,12 +65,23 @@ public sealed class PairingCodes
         if (Interlocked.Increment(ref pending.Failures) >= MaxFailures) _pending.TryRemove(pending.Id, out _);
     }
 
-    /// <summary>Takes the code out for good. False when another request already used it.</summary>
-    public bool Consume(PendingPairing pending) => _pending.TryRemove(pending.Id, out _);
+    /// <summary>
+    /// Claims the code for one request; false when another request already has it. The code stays
+    /// listed until <see cref="Complete"/> moves it, so a dashboard polling in between never sees it
+    /// in neither list and takes it for expired.
+    /// </summary>
+    public bool Consume(PendingPairing pending)
+        => _pending.ContainsKey(pending.Id) && Interlocked.CompareExchange(ref pending.Redeeming, 1, 0) == 0;
 
-    /// <summary>Records what a redeemed code turned into.</summary>
+    /// <summary>Gives a claimed code back when issuing the key failed.</summary>
+    public void Release(PendingPairing pending) => Interlocked.Exchange(ref pending.Redeeming, 0);
+
+    /// <summary>Records what a redeemed code turned into and withdraws it for good.</summary>
     public void Complete(PendingPairing pending, string name, string credentialId, string peer, DateTime nowUtc)
-        => _completed[pending.Id] = new CompletedPairing(pending.Id, name, credentialId, peer, nowUtc);
+    {
+        _completed[pending.Id] = new CompletedPairing(pending.Id, name, credentialId, peer, nowUtc);
+        _pending.TryRemove(pending.Id, out _);
+    }
 
     public bool Cancel(string id) => _pending.TryRemove(id, out _);
 
