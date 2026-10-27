@@ -121,7 +121,7 @@ Add `-k` while the relay uses its self-signed certificate.
 
 Listens on `http://localhost:7891` and nowhere else.
 
-- **Overview**: one page with the machines table (alias, real host name, account, system, client
+- **Overview**: one page with a card per machine (alias, real host name, account, system, client
   version flagged when a newer release exists), a command line, and the activity log below it:
   every command with its output, transfers, connections and refused requests, with search and
   filters. Clicking a machine narrows the log to it; its details panel has re-pairing and removal

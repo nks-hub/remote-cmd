@@ -41,10 +41,7 @@
             <button type="button" data-show="update" aria-pressed="false">outdated</button>
           </div>
         </div>
-        <table class="grid machines">
-          <thead><tr><th class="st"></th><th>name</th><th>host \ account</th><th>system</th><th>client</th><th>address</th><th class="num">seen</th><th class="num">done</th><th></th></tr></thead>
-          <tbody id="ports"></tbody>
-        </table>
+        <div class="ports" id="ports"></div>
         <div class="empty" id="noMachines" hidden>
           <p>No machine has connected yet. Pairing takes one command on the machine you want to add.</p>
           <button class="btn primary" type="button" data-action="pair">+ pair the first machine</button>

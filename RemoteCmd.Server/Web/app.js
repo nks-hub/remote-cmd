@@ -267,46 +267,42 @@ function renderMachines() {
   $('machCount').textContent = all.length ? `${online}/${all.length} online${outdated ? ` · ${outdated} outdated` : ''}` : '';
   $('noMachines').hidden = all.length > 0;
   $('machFilter').hidden = all.length === 0;
-  document.querySelector('table.machines').hidden = all.length === 0;
 
   paint($('ports'), [state.show, state.picked, shown.map((c) => [c.id, c.name, c.host, c.user, c.os, c.version, c.outdated, c.connected, c.state, c.running, c.queued, c.served, c.ip])],
-    () => shown.map(machineRow));
+    () => shown.map(machineCard));
   for (const node of document.querySelectorAll('#ports .seen')) {
     const c = all.find((x) => x.id === node.dataset.id);
-    if (c) node.textContent = ago(c.secondsAgo).replace(' ago', '');
+    if (c) node.textContent = c.connected ? `seen ${ago(c.secondsAgo)}` : `last seen ${ago(c.secondsAgo)}`;
   }
   syncTargets();
 }
 
-/** One machine per row. Clicking its name narrows the activity below to it, as a second click undoes. */
-function machineRow(c) {
+/** One card per machine. Clicking it narrows the activity below to that machine; a second click undoes it. */
+function machineCard(c) {
   const st = machineState(c);
-  const tr = el('tr', `${st.cls}${state.picked === c.name ? ' picked' : ''}`);
-  const status = el('td', 'st');
-  status.append(el('span', 'dot', ''));
-  status.title = st.text;
-  const name = keyed(el('button', 'link', c.name), `pick-${c.id}`);
-  name.type = 'button';
-  name.title = state.picked === c.name ? 'Show every machine\'s activity' : 'Show only its activity';
-  name.addEventListener('click', () => pickMachine(state.picked === c.name ? null : c.name));
-  const nameCell = el('td', 'name');
-  nameCell.append(name);
-  if (st.cls !== 'on') nameCell.append(el('span', `state ${st.cls}`, st.text));
-  const seen = el('td', 'num seen', ago(c.secondsAgo).replace(' ago', ''));
+  const card = keyed(el('div', `port ${st.cls}${state.picked === c.name ? ' picked' : ''}`), `card-${c.id}`);
+  card.tabIndex = 0;
+  card.setAttribute('role', 'button');
+  card.setAttribute('aria-pressed', String(state.picked === c.name));
+  card.title = state.picked === c.name ? 'Show every machine\'s activity' : 'Show only its activity';
+  const toggle = () => pickMachine(state.picked === c.name ? null : c.name);
+  card.addEventListener('click', (e) => { if (!e.target.closest('button')) toggle(); });
+  card.addEventListener('keydown', (k) => { if ((k.key === 'Enter' || k.key === ' ') && k.target === card) { k.preventDefault(); toggle(); } });
+
+  const head = el('div', 'phd');
+  head.append(el('span', 'dot'), el('span', 'alias', c.name), el('span', `state ${st.cls}`, st.text));
+  card.append(head);
+  card.append(el('div', 'host', [c.host, c.user].filter(Boolean).join(' \\ ') || c.ip || '—'));
+  card.append(el('div', 'sys', [system(c.os) || 'client too old to report its system', c.ip].filter(Boolean).join(' · ')));
+  const foot = el('div', 'foot');
+  foot.append(el('span', c.outdated ? 'tag old' : 'tag', c.version ? `v${c.version}${c.outdated ? ' ↑' : ''}` : 'v?'));
+  const seen = el('span', 'seen', c.connected ? `seen ${ago(c.secondsAgo)}` : `last seen ${ago(c.secondsAgo)}`);
   seen.dataset.id = c.id;
-  const actions = el('td', 'act');
-  if (c.connected) {
-    actions.append(keyed(button('run', 'small', () => { $('target').value = c.name; $('cmd').focus(); }), `run-${c.id}`));
-  }
-  actions.append(keyed(button('details', 'small ghost', () => openMachine(c.id)), `detail-${c.id}`));
-  tr.append(status, nameCell,
-    el('td', 'dim', [c.host, c.user].filter(Boolean).join(' \\ ') || '—'),
-    el('td', '', system(c.os) || '—'),
-    el('td', '', c.version ? `${c.version}${c.outdated ? ' ↑' : ''}` : '?'),
-    el('td', 'dim', c.ip || '—'), seen,
-    el('td', 'num', c.queued ? `${c.served} +${c.queued}` : String(c.served)), actions);
-  if (c.outdated) tr.children[4].className = 'warn';
-  return tr;
+  foot.append(seen, el('span', '', c.queued ? `${c.served} done · ${c.queued} queued` : `${c.served} done`), el('span', 'grow'));
+  if (c.connected) foot.append(keyed(button('run', 'small', () => { $('target').value = c.name; $('cmd').focus(); }), `run-${c.id}`));
+  foot.append(keyed(button('details', 'small ghost', () => openMachine(c.id)), `detail-${c.id}`));
+  card.append(foot);
+  return card;
 }
 
 function pickMachine(name) {

@@ -123,25 +123,30 @@ tbody tr:hover td { background: var(--raise); }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .tableWrap { border: 1px solid var(--line); border-radius: 3px; overflow: auto; }
 
-.machines td { white-space: nowrap; vertical-align: middle; }
-.machines td.st, .machines th.st { width: 22px; padding-right: 0; }
-.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
-.machines tr.on .dot { background: var(--on); box-shadow: 0 0 6px color-mix(in oklab, var(--on) 70%, transparent); }
-.machines tr.busy .dot { background: var(--xfer); box-shadow: 0 0 6px color-mix(in oklab, var(--xfer) 70%, transparent); }
-.machines tr.lost .dot { background: var(--bad); }
-.machines tr.lost td { color: var(--dim); }
-.machines tr.picked td { background: color-mix(in oklab, var(--on) 8%, var(--panel)); }
-.machines td.name { font-weight: 700; }
-.link { border: 0; background: none; padding: 0; color: var(--ink); cursor: pointer; font-weight: 700; }
-.link:hover { color: var(--on); text-decoration: underline; }
-.machines tr.picked .link { color: var(--on); }
-.state { margin-left: 8px; font-weight: 400; font-size: 12px; }
-.state.busy { color: var(--xfer); } .state.lost { color: var(--bad); }
-.machines td.act { text-align: right; }
-.machines td.act .btn + .btn { margin-left: 4px; }
-@media (max-width: 900px) {
-  .machines th:nth-child(3), .machines td:nth-child(3), .machines th:nth-child(6), .machines td:nth-child(6), .machines th:nth-child(8), .machines td:nth-child(8) { display: none; }
+/* machine cards: one port on the panel each, status light on the left edge */
+.ports { display: grid; gap: 8px; padding: 10px 12px; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); }
+.port {
+  position: relative; display: grid; gap: 2px; padding: 9px 11px 8px 14px; cursor: pointer;
+  background: var(--raise); border: 1px solid var(--line2); border-radius: 4px; transition: border-color .12s;
 }
+.port::before { content: ""; position: absolute; left: -1px; top: 8px; bottom: 8px; width: 3px; border-radius: 0 2px 2px 0; background: var(--faint); }
+.port.on::before { background: var(--on); box-shadow: 0 0 8px color-mix(in oklab, var(--on) 60%, transparent); }
+.port.busy::before { background: var(--xfer); box-shadow: 0 0 8px color-mix(in oklab, var(--xfer) 60%, transparent); }
+.port.lost::before { background: var(--bad); }
+.port:hover { border-color: var(--dim); }
+.port.picked { border-color: var(--on); background: color-mix(in oklab, var(--on) 7%, var(--raise)); }
+.port.lost { opacity: .75; }
+.phd { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
+.port.on .dot { background: var(--on); } .port.busy .dot { background: var(--xfer); } .port.lost .dot { background: var(--bad); }
+.alias { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.port.picked .alias { color: var(--on); }
+.state { font-size: 12px; color: var(--on); }
+.state.busy { color: var(--xfer); } .state.lost { color: var(--bad); }
+.port .host, .port .sys { color: var(--dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.port .foot { display: flex; align-items: center; gap: 10px; margin-top: 5px; font-size: 12px; color: var(--dim); white-space: nowrap; }
+.port .foot .btn { flex: none; }
+.port .foot .btn + .btn { margin-left: -4px; }
 
 .log { table-layout: fixed; }
 .log td { overflow: hidden; text-overflow: ellipsis; }
