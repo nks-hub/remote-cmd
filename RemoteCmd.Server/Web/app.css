@@ -54,13 +54,16 @@ label > input, label > select { color: var(--ink); }
 
 /* ---------- top bar ---------- */
 .top {
-  position: sticky; top: 0; z-index: 30; display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
-  padding: 0 var(--gut); min-height: 44px; border-bottom: 1px solid var(--line); background: var(--bg);
+  position: sticky; top: 0; z-index: 30; display: flex; align-items: center; gap: 18px; flex-wrap: nowrap;
+  padding: 0 var(--gut); height: 44px; border-bottom: 1px solid var(--line); background: var(--bg);
 }
+.top > * { flex: none; }
+.top > .grow { flex: 1; }
 .brand { display: flex; align-items: center; gap: 8px; color: var(--ink); text-decoration: none; font-weight: 700; letter-spacing: .02em; }
 .mark { color: var(--on); font-weight: 700; }
-.tabs-top { display: flex; align-self: stretch; }
-.tabs-top a { display: flex; align-items: center; gap: 7px; padding: 0 12px; color: var(--dim); text-decoration: none; border-bottom: 2px solid transparent; }
+.tabs-top { display: flex; align-self: stretch; min-width: 0; flex: 0 1 auto !important; overflow-x: auto; scrollbar-width: none; }
+.tabs-top::-webkit-scrollbar { display: none; }
+.tabs-top a { display: flex; align-items: center; gap: 7px; padding: 0 12px; white-space: nowrap; color: var(--dim); text-decoration: none; border-bottom: 2px solid transparent; }
 .tabs-top a:hover { color: var(--ink); }
 .tabs-top a[aria-current="page"] { color: var(--ink); border-bottom-color: var(--on); }
 .tabs-top b { font-weight: 400; color: var(--faint); }
@@ -253,9 +256,14 @@ dialog::backdrop { background: rgba(0, 0, 0, .65); }
 .signin { min-height: 100vh; display: grid; place-items: center; padding: 20px; }
 .signin .card { width: min(360px, 100%); }
 
+/* Version and uptime are also under Settings; on narrower screens the bar keeps only what acts. */
+@media (max-width: 1150px) { .relay .pill:not(.bad) { display: none; } }
 @media (max-width: 760px) {
-  .top { gap: 10px; padding-block: 6px; }
-  .tabs-top { order: 9; width: 100%; overflow-x: auto; scrollbar-width: none; }
+  .top { height: auto; flex-wrap: wrap; gap: 8px 12px; padding-block: 6px; }
+  .relay { display: none; }
+  .tabs-top { order: 9; flex: 1 1 100% !important; }
   .tabs-top a { padding: 6px 10px; }
+  .top .grow { display: none; }
+  #pairOpen { margin-left: auto; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }

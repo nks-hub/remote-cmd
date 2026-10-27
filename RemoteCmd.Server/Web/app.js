@@ -277,6 +277,17 @@ function renderMachines() {
   syncTargets();
 }
 
+/**
+ * Who the client runs as, in plain words. A Windows service runs as SYSTEM, which Windows reports
+ * as the computer's own account name with a trailing "$".
+ */
+function account(c) {
+  if (!c.user) return '';
+  if (c.user.endsWith('$')) return 'service (SYSTEM)';
+  if (c.user === 'root') return 'root';
+  return `user ${c.user}`;
+}
+
 /** One card per machine. Clicking it narrows the activity below to that machine; a second click undoes it. */
 function machineCard(c) {
   const st = machineState(c);
@@ -292,10 +303,10 @@ function machineCard(c) {
   const head = el('div', 'phd');
   head.append(el('span', 'dot'), el('span', 'alias', c.name), el('span', `state ${st.cls}`, st.text));
   card.append(head);
-  card.append(el('div', 'host', [c.host, c.user].filter(Boolean).join(' \\ ') || c.ip || '—'));
-  card.append(el('div', 'sys', [system(c.os) || 'client too old to report its system', c.ip].filter(Boolean).join(' · ')));
+  card.append(el('div', 'host', c.host ? [c.host, account(c)].filter(Boolean).join(' · ') : 'client older than 2.6, reports no host'));
+  card.append(el('div', 'sys', [system(c.os) || 'system unknown', c.ip].filter(Boolean).join(' · ')));
   const foot = el('div', 'foot');
-  foot.append(el('span', c.outdated ? 'tag old' : 'tag', c.version ? `v${c.version}${c.outdated ? ' ↑' : ''}` : 'v?'));
+  foot.append(el('span', c.outdated || !c.version ? 'tag old' : 'tag', c.version ? `v${c.version}${c.outdated ? ' ↑' : ''}` : 'old client'));
   const seen = el('span', 'seen', c.connected ? `seen ${ago(c.secondsAgo)}` : `last seen ${ago(c.secondsAgo)}`);
   seen.dataset.id = c.id;
   foot.append(seen, el('span', '', c.queued ? `${c.served} done · ${c.queued} queued` : `${c.served} done`), el('span', 'grow'));
@@ -329,7 +340,7 @@ function openMachine(id) {
   body.push(tags);
   const kv = el('dl', 'kv');
   for (const [k, v] of [
-    ['Host', c.host || '—'], ['Account', c.user || '—'], ['System', c.os || '—'], ['Address', c.ip || '—'],
+    ['Host', c.host || '—'], ['Runs as', account(c) || '—'], ['System', c.os || '—'], ['Address', c.ip || '—'],
     ['Key', c.token || '—'], ['Online for', c.connected ? dur(c.connectedForSeconds) : '—'],
     ['Last seen', ago(c.secondsAgo)], ['Commands done', String(c.served)], ['Queued / running', `${c.queued} / ${c.running}`],
   ]) kv.append(el('dt', '', k), el('dd', '', v));
