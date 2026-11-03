@@ -55,6 +55,11 @@ namespace RemoteCmd.Client48
             {
                 ServerCertificateCustomValidationCallback = (msg, cert, chain, errors) => true
             };
+            // A relay restart leaves pooled connections dead without a reset; recycle them as the .NET 9 client does.
+            var servicePoint = ServicePointManager.FindServicePoint(new Uri(baseUrl));
+            servicePoint.ConnectionLeaseTimeout = 30000;
+            servicePoint.MaxIdleTime = 15000;
+
             using (var http = new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(5) })
             {
                 http.DefaultRequestHeaders.Add("X-Token", config.Token);
@@ -65,7 +70,7 @@ namespace RemoteCmd.Client48
                 {
                     try
                     {
-                        var pollJson = http.GetStringAsync(pollUrl).GetAwaiter().GetResult();
+                        var pollJson = GetPolled(http, pollUrl, ct);
                         var encCommand = Json.GetString(pollJson, "command");
                         if (!string.IsNullOrEmpty(encCommand))
                         {
@@ -80,7 +85,7 @@ namespace RemoteCmd.Client48
                                 http.PostAsync(resultUrl, content).GetAwaiter().GetResult();
                         }
 
-                        var filePollJson = http.GetStringAsync(filePollUrl).GetAwaiter().GetResult();
+                        var filePollJson = GetPolled(http, filePollUrl, ct);
                         var encMeta = Json.GetString(filePollJson, "e");
                         if (!string.IsNullOrEmpty(encMeta))
                         {
@@ -109,6 +114,25 @@ namespace RemoteCmd.Client48
                     }
                 }
                 log("Remote CMD Client48 stopped.");
+            }
+        }
+
+        private static readonly TimeSpan PollTimeout = TimeSpan.FromSeconds(30);
+
+        /// <summary>
+        /// A poll answers at once, so one that hangs is a dead connection; give up after
+        /// <see cref="PollTimeout"/> and let the loop retry instead of waiting the 5-minute transfer limit.
+        /// </summary>
+        private static string GetPolled(HttpClient http, string url, CancellationToken ct)
+        {
+            using (var cts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            {
+                cts.CancelAfter(PollTimeout);
+                using (var response = http.GetAsync(url, cts.Token).GetAwaiter().GetResult())
+                {
+                    response.EnsureSuccessStatusCode();
+                    return response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                }
             }
         }
 
