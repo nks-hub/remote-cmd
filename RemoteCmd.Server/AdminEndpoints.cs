@@ -191,10 +191,10 @@ public static class AdminEndpoints
                 {
                     pending.Cancelled = true;
                     session.InFlight.TryRemove(pending.RequestId, out _);
-                    pending.Tcs.TrySetResult(new CommandResult { Output = "[ERROR] Machine disabled on the relay", ExitCode = -1 });
+                    pending.Tcs.TrySetResult(new CommandResult { Output = "[ERROR] " + ClientDisabled.Message(session.Name), ExitCode = -1 });
                 }
-                session.Uploads.FailAll("Machine disabled on the relay");
-                session.Downloads.FailAll("Machine disabled on the relay");
+                session.Uploads.FailAll(ClientDisabled.Message(session.Name));
+                session.Downloads.FailAll(ClientDisabled.Message(session.Name));
             }
             r.Events.Add("admin", session.Name, body.Disabled ? "disabled: commands and transfers refused" : "enabled again");
             return Results.Ok(new { disabled = body.Disabled });

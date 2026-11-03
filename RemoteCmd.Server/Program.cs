@@ -586,7 +586,7 @@ app.MapPost("/api/upload", async (HttpRequest req) =>
 
     var target = ResolveTarget(req, clients, store);
     if (target.Error != null)
-        return Results.BadRequest(new { error = target.Error });
+        return target.Refusal();
 
     var session = target.Session!;
 
@@ -611,7 +611,7 @@ app.MapGet("/api/download", async (HttpRequest req) =>
 
     var target = ResolveTarget(req, clients, store);
     if (target.Error != null)
-        return Results.BadRequest(new { error = target.Error });
+        return target.Refusal();
 
     var session = target.Session!;
 
@@ -629,7 +629,7 @@ app.MapPost("/api/screenshot", async (HttpRequest req) =>
 {
     var target = ResolveTarget(req, clients, store);
     if (target.Error != null)
-        return Results.BadRequest(new { error = target.Error });
+        return target.Refusal();
 
     var session = target.Session!;
     var destination = req.Query["path"].FirstOrDefault() ?? "";
@@ -997,7 +997,7 @@ static TargetResolution ResolveClient(string? clientParam, ConcurrentDictionary<
             return new TargetResolution { Error = $"Unknown client '{clientParam}' — {hint}" };
         }
         if (store.IsClientDisabled(s.Id))
-            return new TargetResolution { Error = $"Client '{s.Name}' is disabled on the relay; enable it in the dashboard to use it" };
+            return new TargetResolution { Error = ClientDisabled.Message(s.Name), Disabled = true };
         if (!s.IsConnected()) return new TargetResolution { Error = $"Client '{s.Name}' not connected" };
         return new TargetResolution { Session = s };
     }
@@ -1009,7 +1009,9 @@ static TargetResolution ResolveClient(string? clientParam, ConcurrentDictionary<
         {
             Error = online.Count == 0
                 ? "No client connected"
-                : $"No enabled client connected ({string.Join(", ", online.Select(c => c.Name))} disabled on the relay)",
+                : $"No enabled client connected: {string.Join(", ", online.Select(c => c.Name))} disabled by the relay administrator. " +
+                  "Only an administrator can enable a machine again, in the relay dashboard.",
+            Disabled = online.Count > 0,
         };
     if (connected.Count == 1) return new TargetResolution { Session = connected[0] };
 
@@ -1088,6 +1090,21 @@ public class TargetResolution
 {
     public ClientSession? Session { get; set; }
     public string? Error { get; set; }
+    /// <summary>The machine exists but an administrator switched it off; REST answers 403.</summary>
+    public bool Disabled { get; set; }
+
+    /// <summary>The error response for file transfers and screenshots.</summary>
+    public IResult Refusal() => Disabled
+        ? Results.Json(new { error = Error, disabled = true }, statusCode: StatusCodes.Status403Forbidden)
+        : Results.BadRequest(new { error = Error });
+}
+
+/// <summary>What callers are told about a machine switched off in the dashboard.</summary>
+public static class ClientDisabled
+{
+    public static string Message(string name)
+        => $"Client '{name}' is disabled by the relay administrator and refuses all commands, file transfers and screenshots. " +
+           "Only an administrator can enable it again, in the relay dashboard.";
 }
 
 public partial class Program { }

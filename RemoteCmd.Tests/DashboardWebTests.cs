@@ -198,10 +198,18 @@ public class DashboardWebTests
         await machine.GetAsync("/api/poll");
 
         var byName = await Exec(controller, "/api/exec?client=box");
-        Assert.Contains("disabled", byName.Output);
+        Assert.Equal(-1, byName.ExitCode);
+        Assert.Contains("disabled by the relay administrator", byName.Output);
+        Assert.Contains("Only an administrator can enable it again", byName.Output);
         var implicitly = await Exec(controller, "/api/exec");
         Assert.Contains("No enabled client connected", implicitly.Output);
-        Assert.Equal(HttpStatusCode.BadRequest, (await controller.GetAsync("/api/download?client=box&path=/etc/hostname")).StatusCode);
+        Assert.Contains("administrator", implicitly.Output);
+        var download = await controller.GetAsync("/api/download?client=box&path=/etc/hostname");
+        Assert.Equal(HttpStatusCode.Forbidden, download.StatusCode);
+        var refusal = await download.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.True(refusal.GetProperty("disabled").GetBoolean());
+        Assert.Contains("administrator", refusal.GetProperty("error").GetString());
+        Assert.Equal(HttpStatusCode.BadRequest, (await controller.GetAsync("/api/download?client=nobody&path=/etc/hostname")).StatusCode);
 
         var (_, list, _) = await relay.Dashboard("GET", "/api/clients");
         var row = JsonDocument.Parse(list).RootElement.GetProperty("clients").EnumerateArray().Single();
@@ -231,7 +239,7 @@ public class DashboardWebTests
         await relay.Dashboard("POST", $"/api/admin/clients/{id}/disabled", new { disabled = true });
         var result = await queued.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(-1, result.ExitCode);
-        Assert.Contains("disabled", result.Output);
+        Assert.Contains("disabled by the relay administrator", result.Output);
 
         var poll = await (await machine.GetAsync("/api/poll")).Content.ReadFromJsonAsync<JsonElement>();
         Assert.Equal(JsonValueKind.Null, poll.GetProperty("command").ValueKind);

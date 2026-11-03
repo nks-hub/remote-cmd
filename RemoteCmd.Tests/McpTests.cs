@@ -149,6 +149,31 @@ public class McpTests
         Assert.Contains("ran: hostname", result.GetProperty("content")[0].GetProperty("text").GetString());
     }
 
+    /// <summary>An agent is told plainly that the machine is switched off and that only an administrator can change that.</summary>
+    [Fact]
+    public async Task AnAgentIsRefusedADisabledMachine()
+    {
+        using var relay = new DashboardRelay();
+        var http = relay.CreateClient();
+        var token = await SignIn(relay, http);
+        var machine = relay.CreateClient();
+        machine.DefaultRequestHeaders.Add("X-Token", await relay.IssueToken("client", "box"));
+        await machine.GetAsync("/api/poll");
+        var (_, list, _) = await relay.Dashboard("GET", "/api/clients");
+        var id = JsonDocument.Parse(list).RootElement.GetProperty("clients")[0].GetProperty("id").GetString();
+        await relay.Dashboard("POST", $"/api/admin/clients/{id}/disabled", new { disabled = true });
+
+        var listed = await Rpc(http, token, "tools/call", new { name = "remote_list_clients", arguments = new { } });
+        Assert.Contains("\"disabled\": true", listed.GetProperty("result").GetProperty("content")[0].GetProperty("text").GetString()!.Replace("\"disabled\":true", "\"disabled\": true"));
+
+        var call = await Rpc(http, token, "tools/call", new { name = "remote_exec", arguments = new { command = "hostname", client = "box" } });
+        var result = call.GetProperty("result");
+        Assert.True(result.GetProperty("isError").GetBoolean());
+        var text = result.GetProperty("content")[0].GetProperty("text").GetString();
+        Assert.Contains("disabled by the relay administrator", text);
+        Assert.Contains("Only an administrator can enable it again", text);
+    }
+
     [Fact]
     public async Task ADeniedAgentGetsNoToken()
     {
