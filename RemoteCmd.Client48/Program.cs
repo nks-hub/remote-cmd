@@ -70,6 +70,7 @@ namespace RemoteCmd.Client48
         {
             serviceName = DefaultServiceName;
             string name = null;
+            string configPath = null;
             var positional = new List<string>();
 
             int start = (args[0] == "install-service" || args[0] == "uninstall-service" || args[0] == "--service") ? 1 : 0;
@@ -77,7 +78,18 @@ namespace RemoteCmd.Client48
             {
                 if (args[i] == "--name" && i + 1 < args.Length) { name = args[++i]; }
                 else if (args[i] == "--service-name" && i + 1 < args.Length) { serviceName = args[++i]; }
+                else if (args[i] == "--config" && i + 1 < args.Length) { configPath = args[++i]; }
                 else positional.Add(args[i]);
+            }
+
+            // Services installed by this version keep the token in a protected file, not on the command line.
+            if (configPath != null)
+            {
+                ClientConfig stored = null;
+                try { stored = ServiceInstall.ReadConfig(configPath); }
+                catch (Exception ex) { Console.Error.WriteLine("Error: cannot read " + configPath + ": " + ex.Message); }
+                if (stored == null) Console.Error.WriteLine("Error: " + configPath + " has no server and token.");
+                return stored;
             }
 
             string server = positional.Count >= 1 ? positional[0] : null;
@@ -106,7 +118,7 @@ namespace RemoteCmd.Client48
             Console.WriteLine("  RemoteCmd.Client48.exe <server> <token> [--name <alias>]");
             Console.WriteLine();
             Console.WriteLine("Run as service host (used internally by SCM):");
-            Console.WriteLine("  RemoteCmd.Client48.exe --service <server> <token> [--name <alias>]");
+            Console.WriteLine("  RemoteCmd.Client48.exe --service --config <file>");
             Console.WriteLine();
             Console.WriteLine("Register as Windows Service (needs admin):");
             Console.WriteLine("  RemoteCmd.Client48.exe install-service <server> <token> [--name <alias>] [--service-name <name>]");

@@ -19,6 +19,20 @@ namespace RemoteCmd.Client48
             return sb.ToString();
         }
 
+        /// <summary>Serialize the service configuration: {"server":"...","token":"...","name":"..."}.</summary>
+        public static string Config(string server, string token, string name)
+        {
+            var sb = new StringBuilder();
+            sb.Append("{\"server\":");
+            AppendEscaped(sb, server);
+            sb.Append(",\"token\":");
+            AppendEscaped(sb, token);
+            sb.Append(",\"name\":");
+            AppendEscaped(sb, name);
+            sb.Append('}');
+            return sb.ToString();
+        }
+
         /// <summary>Extract a string property value (handles escapes). Null if absent.</summary>
         public static string GetString(string json, string key)
         {

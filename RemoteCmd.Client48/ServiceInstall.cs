@@ -1,5 +1,8 @@
 using System;
 using System.Diagnostics;
+using System.IO;
+using System.Security.AccessControl;
+using System.Security.Principal;
 
 namespace RemoteCmd.Client48
 {
@@ -8,9 +11,18 @@ namespace RemoteCmd.Client48
     {
         public static int Install(string serviceName, ClientConfig config)
         {
+            // The service command line is readable by every local user (sc qc), so the token goes
+            // into a file only SYSTEM and administrators can open; the service gets its path.
+            string configPath;
+            try { configPath = WriteConfig(serviceName, config); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("Could not save the service configuration: " + ex.Message);
+                return 1;
+            }
+
             var exePath = Process.GetCurrentProcess().MainModule.FileName;
-            var args = "--service \"" + config.ServerArg + "\" \"" + config.Token + "\" --name \"" + config.Name + "\"";
-            var binPath = "\"" + exePath + "\" " + args;
+            var binPath = "\"" + exePath + "\" --service --config \"" + configPath + "\"";
             var escaped = binPath.Replace("\"", "\\\"");
 
             int create = RunSc("create " + serviceName + " binPath= \"" + escaped + "\" start= auto obj= LocalSystem DisplayName= \"RemoteCmd Client (" + config.Name + ")\"");
@@ -30,10 +42,49 @@ namespace RemoteCmd.Client48
         {
             RunSc("stop " + serviceName);
             int delete = RunSc("delete " + serviceName);
+            try { File.Delete(ConfigPath(serviceName)); } catch { /* nothing to remove */ }
             Console.WriteLine(delete == 0
                 ? "Service '" + serviceName + "' removed."
                 : "Failed to remove service '" + serviceName + "' (code " + delete + ").");
             return delete;
+        }
+
+        /// <summary>Reads a configuration written by <see cref="Install"/>; null when the file is missing or incomplete.</summary>
+        public static ClientConfig ReadConfig(string path)
+        {
+            var json = File.ReadAllText(path);
+            var server = Json.GetString(json, "server");
+            var token = Json.GetString(json, "token");
+            if (string.IsNullOrEmpty(server) || string.IsNullOrEmpty(token)) return null;
+            return new ClientConfig
+            {
+                ServerArg = server,
+                Token = token,
+                Name = Json.GetString(json, "name") ?? Environment.MachineName
+            };
+        }
+
+        private static string ConfigPath(string serviceName)
+            => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                "RemoteCmd", "client48-" + serviceName + ".json");
+
+        private static string WriteConfig(string serviceName, ClientConfig config)
+        {
+            var path = ConfigPath(serviceName);
+            Directory.CreateDirectory(Path.GetDirectoryName(path));
+            File.WriteAllText(path, Json.Config(config.ServerArg, config.Token, config.Name));
+            Restrict(path);
+            return path;
+        }
+
+        // Only SYSTEM and administrators, without the inherited read access ProgramData gives every user.
+        private static void Restrict(string path)
+        {
+            var security = new FileSecurity();
+            security.SetAccessRuleProtection(true, false);
+            security.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null), FileSystemRights.FullControl, AccessControlType.Allow));
+            security.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null), FileSystemRights.FullControl, AccessControlType.Allow));
+            File.SetAccessControl(path, security);
         }
 
         private static int RunSc(string arguments)
