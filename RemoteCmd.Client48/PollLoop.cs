@@ -76,8 +76,10 @@ namespace RemoteCmd.Client48
                         {
                             var command = Crypto.DecryptString(encCommand);
                             log("[CMD] " + command);
+                            // The relay sends how long this command may run (older relays omit it: 60 s).
+                            var timeoutSeconds = (int)Math.Max(1, Math.Min(3600, Json.GetLong(pollJson, "timeoutSeconds", 60)));
                             int exitCode;
-                            var output = ExecuteCommand(command, out exitCode);
+                            var output = ExecuteCommand(command, timeoutSeconds, out exitCode);
 
                             var resultJson = Json.Result(output, exitCode);
                             var encrypted = Crypto.Encrypt(Encoding.UTF8.GetBytes(resultJson));
@@ -179,7 +181,7 @@ namespace RemoteCmd.Client48
             }
         }
 
-        private static string ExecuteCommand(string command, out int exitCode)
+        private static string ExecuteCommand(string command, int timeoutSeconds, out int exitCode)
         {
             try
             {
@@ -201,11 +203,11 @@ namespace RemoteCmd.Client48
                     var outputTask = process.StandardOutput.ReadToEndAsync();
                     var errorTask = process.StandardError.ReadToEndAsync();
 
-                    if (!process.WaitForExit(60000))
+                    if (!process.WaitForExit(timeoutSeconds * 1000))
                     {
                         try { process.Kill(); } catch { }
                         exitCode = -1;
-                        return "[KILLED] Command exceeded 60s timeout";
+                        return "[KILLED] Command exceeded " + timeoutSeconds + "s timeout";
                     }
 
                     var stdout = outputTask.GetAwaiter().GetResult();
