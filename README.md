@@ -124,8 +124,14 @@ Listens on `http://localhost:7891` and nowhere else.
 - **Overview**: one page with a card per machine (alias, real host name, account, system, client
   version flagged when a newer release exists), a command line, and the activity log below it:
   every command with its output, transfers, connections and refused requests, with search and
-  filters. Clicking a machine narrows the log to it; its details panel has re-pairing and removal
-  from the list once it is offline.
+  filters. Clicking a machine narrows the log to it; its details panel has re-pairing, **Disable /
+  Enable** and removal from the list once it is offline.
+- **Disabled machines** stay connected and keep their key, but the relay refuses every command,
+  file transfer and screenshot for them, whether it comes from the REST API, an MCP agent or the
+  dashboard itself. Requests that name the machine get an error saying it is disabled, a request
+  without `?client=` never falls back to it, and anything already queued for it is cancelled. The
+  setting is stored in `server.json` and survives restarts and reconnects. `/api/clients` and
+  `remote_list_clients` report it as `"disabled": true`.
 - **Access**: every key with when it was last used and a revoke button, open pairing codes, and
   machines that keep polling with a key the relay does not know (usually an old client left running
   after a re-pairing), each with a button to pair it again.

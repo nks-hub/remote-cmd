@@ -136,6 +136,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .port.on::before { background: var(--on); box-shadow: 0 0 8px color-mix(in oklab, var(--on) 60%, transparent); }
 .port.busy::before { background: var(--xfer); box-shadow: 0 0 8px color-mix(in oklab, var(--xfer) 60%, transparent); }
 .port.lost::before { background: var(--bad); }
+.port.off::before { background: var(--warn); }
+.port.off .dot { background: var(--warn); } .state.off { color: var(--warn); }
 .port:hover { border-color: var(--dim); }
 .port.picked { border-color: var(--on); background: color-mix(in oklab, var(--on) 7%, var(--raise)); }
 .port.lost { opacity: .75; }

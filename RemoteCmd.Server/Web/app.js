@@ -269,6 +269,7 @@ function buildAlerts() {
 
 // ---------------------------------------------------------------- machines
 function machineState(c) {
+  if (c.disabled) return { cls: 'off', text: c.connected ? 'disabled' : 'disabled · offline' };
   if (!c.connected) return { cls: 'lost', text: c.secondsAgo < 0 ? 'never seen' : 'offline' };
   if (c.state === 'upload') return { cls: 'busy', text: 'receiving file' };
   if (c.state === 'download') return { cls: 'busy', text: 'sending file' };
@@ -284,11 +285,12 @@ function renderMachines() {
     || (state.show === 'update' && c.outdated));
   const online = all.filter((c) => c.connected).length;
   const outdated = all.filter((c) => c.outdated).length;
-  $('machCount').textContent = all.length ? `${online}/${all.length} online${outdated ? ` · ${outdated} outdated` : ''}` : '';
+  const disabled = all.filter((c) => c.disabled).length;
+  $('machCount').textContent = all.length ? `${online}/${all.length} online${outdated ? ` · ${outdated} outdated` : ''}${disabled ? ` · ${disabled} disabled` : ''}` : '';
   $('noMachines').hidden = all.length > 0;
   $('machFilter').hidden = all.length === 0;
 
-  paint($('ports'), [state.show, state.picked, shown.map((c) => [c.id, c.name, c.host, c.user, c.os, c.shells, c.execShell, c.version, c.outdated, c.connected, c.state, c.running, c.queued, c.served, c.ip])],
+  paint($('ports'), [state.show, state.picked, shown.map((c) => [c.id, c.name, c.host, c.user, c.os, c.shells, c.execShell, c.version, c.outdated, c.connected, c.disabled, c.state, c.running, c.queued, c.served, c.ip])],
     () => shown.map(machineCard));
   for (const node of document.querySelectorAll('#ports .seen')) {
     const c = all.find((x) => x.id === node.dataset.id);
@@ -332,7 +334,7 @@ function machineCard(c) {
   const seen = el('span', 'seen', c.connected ? `seen ${ago(c.secondsAgo)}` : `last seen ${ago(c.secondsAgo)}`);
   seen.dataset.id = c.id;
   foot.append(seen, el('span', '', c.queued ? `${c.served} done · ${c.queued} queued` : `${c.served} done`), el('span', 'grow'));
-  if (c.connected) foot.append(keyed(button('run', 'small', () => { $('target').value = c.name; $('cmd').focus(); }), `run-${c.id}`));
+  if (c.connected && !c.disabled) foot.append(keyed(button('run', 'small', () => { $('target').value = c.name; $('cmd').focus(); }), `run-${c.id}`));
   foot.append(keyed(button('details', 'small ghost', () => openMachine(c.id)), `detail-${c.id}`));
   card.append(foot);
   return card;
@@ -358,8 +360,9 @@ function openMachine(id) {
   const st = machineState(c);
   const body = [];
   const tags = el('div', 'row');
-  tags.append(el('span', `tag ${st.cls === 'lost' ? 'bad' : 'on'}`, st.text), el('span', c.outdated ? 'tag old' : 'tag', c.version ? `client v${c.version}` : 'client version unknown'));
+  tags.append(el('span', `tag ${st.cls === 'lost' ? 'bad' : st.cls === 'off' ? 'old' : 'on'}`, st.text), el('span', c.outdated ? 'tag old' : 'tag', c.version ? `client v${c.version}` : 'client version unknown'));
   body.push(tags);
+  if (c.disabled) body.push(el('p', 'hint warn', 'Disabled: the relay refuses every command, file transfer and screenshot for this machine, from the API, MCP agents and this dashboard. It stays connected.'));
   const kv = el('dl', 'kv');
   for (const [k, v] of [
     ['Host', c.host || '—'], ['Runs as', account(c) || '—'], ['System', c.os || '—'],
@@ -384,7 +387,7 @@ function openMachine(id) {
   }
 
   const actions = el('div', 'row');
-  if (c.connected) {
+  if (c.connected && !c.disabled) {
     actions.append(button('Run a command here', 'primary', () => {
       closeDrawer(); location.hash = '#overview';
       $('target').value = c.name; $('cmd').focus();
@@ -392,6 +395,13 @@ function openMachine(id) {
   }
   actions.append(button('Its activity', '', () => { closeDrawer(); pickMachine(c.name); $('activity').scrollIntoView(); }));
   actions.append(button('Pair again', '', () => { closeDrawer(); openPair(c.name); }));
+  actions.append(button(c.disabled ? 'Enable' : 'Disable', c.disabled ? 'primary' : 'danger', async () => {
+    if (!c.disabled && !confirm(`Disable ${c.name}? It stays connected, but nothing can run commands or move files on it until you enable it again. Queued commands are cancelled.`)) return;
+    try {
+      await api(`/api/admin/clients/${encodeURIComponent(c.id)}/disabled`, { method: 'POST', body: { disabled: !c.disabled } });
+      closeDrawer(); toast(c.disabled ? `${c.name} enabled` : `${c.name} disabled`); tick();
+    } catch (err) { toast(err.message); }
+  }));
   if (!c.connected) {
     actions.append(button('Remove from list', 'danger', async () => {
       if (!confirm(`Remove ${c.name} from the list? If it comes back, it reappears on its own. To lock it out, revoke its key in Access.`)) return;
@@ -410,7 +420,7 @@ function openMachine(id) {
 function syncTargets() {
   const sel = $('target');
   const current = sel.value || local.get('rcmd-target') || '';
-  const names = state.clients.filter((c) => c.connected).map((c) => c.name);
+  const names = state.clients.filter((c) => c.connected && !c.disabled).map((c) => c.name);
   const sig = names.join('\n');
   if (sel.dataset.sig === sig) return;
   sel.dataset.sig = sig;

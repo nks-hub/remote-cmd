@@ -178,6 +178,104 @@ public class DashboardWebTests
         Assert.Equal(404, (await relay.Dashboard("DELETE", "/api/admin/clients/nobody")).Status);
     }
 
+    /// <summary>
+    /// A machine switched off in the dashboard stays connected, but no controller can reach it — not by
+    /// name, and not as the "only machine online" either — until it is switched back on.
+    /// </summary>
+    [Fact]
+    public async Task ADisabledMachineTakesNoCommandsUntilEnabled()
+    {
+        using var relay = new DashboardRelay();
+        var machine = relay.CreateClient();
+        machine.DefaultRequestHeaders.Add("X-Token", await relay.IssueToken("client", "box"));
+        var controller = relay.CreateClient();
+        controller.DefaultRequestHeaders.Add("X-Token", await relay.IssueToken("controller", "ci"));
+        await machine.GetAsync("/api/poll");
+        var id = await OnlyMachineId(relay);
+
+        Assert.Equal(200, (await relay.Dashboard("POST", $"/api/admin/clients/{id}/disabled", new { disabled = true })).Status);
+        Assert.Equal(404, (await relay.Dashboard("POST", "/api/admin/clients/nobody/disabled", new { disabled = true })).Status);
+        await machine.GetAsync("/api/poll");
+
+        var byName = await Exec(controller, "/api/exec?client=box");
+        Assert.Contains("disabled", byName.Output);
+        var implicitly = await Exec(controller, "/api/exec");
+        Assert.Contains("No enabled client connected", implicitly.Output);
+        Assert.Equal(HttpStatusCode.BadRequest, (await controller.GetAsync("/api/download?client=box&path=/etc/hostname")).StatusCode);
+
+        var (_, list, _) = await relay.Dashboard("GET", "/api/clients");
+        var row = JsonDocument.Parse(list).RootElement.GetProperty("clients").EnumerateArray().Single();
+        Assert.True(row.GetProperty("disabled").GetBoolean());
+        Assert.True(row.GetProperty("connected").GetBoolean());
+
+        Assert.Equal(200, (await relay.Dashboard("POST", $"/api/admin/clients/{id}/disabled", new { disabled = false })).Status);
+        var running = controller.PostAsJsonAsync("/api/exec?client=box", new { command = "hostname", timeoutSeconds = 1 });
+        Assert.NotNull(await WaitForCommand(machine));
+        await running;
+    }
+
+    /// <summary>Commands queued for the machine fail at once instead of waiting out their timeout.</summary>
+    [Fact]
+    public async Task DisablingCancelsWhatIsQueued()
+    {
+        using var relay = new DashboardRelay();
+        var machine = relay.CreateClient();
+        machine.DefaultRequestHeaders.Add("X-Token", await relay.IssueToken("client", "box"));
+        var controller = relay.CreateClient();
+        controller.DefaultRequestHeaders.Add("X-Token", await relay.IssueToken("controller", "ci"));
+        await machine.GetAsync("/api/poll");
+        var id = await OnlyMachineId(relay);
+
+        var queued = Exec(controller, "/api/exec?client=box", timeoutSeconds: 60);
+        await Task.Delay(200);
+        await relay.Dashboard("POST", $"/api/admin/clients/{id}/disabled", new { disabled = true });
+        var result = await queued.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(-1, result.ExitCode);
+        Assert.Contains("disabled", result.Output);
+
+        var poll = await (await machine.GetAsync("/api/poll")).Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal(JsonValueKind.Null, poll.GetProperty("command").ValueKind);
+    }
+
+    [Fact]
+    public void TheDisabledListSurvivesARestart()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"rcmd-{Guid.NewGuid():N}.json");
+        try
+        {
+            var store = ServerStore.Open(path);
+            Assert.True(store.SetClientDisabled("c-abc", true));
+            Assert.False(store.SetClientDisabled("c-abc", true));
+            Assert.True(ServerStore.Open(path).IsClientDisabled("c-abc"));
+            Assert.True(store.SetClientDisabled("c-abc", false));
+            Assert.False(ServerStore.Open(path).IsClientDisabled("c-abc"));
+        }
+        finally { File.Delete(path); }
+    }
+
+    private static async Task<string> OnlyMachineId(DashboardRelay relay)
+    {
+        var (_, list, _) = await relay.Dashboard("GET", "/api/clients");
+        return JsonDocument.Parse(list).RootElement.GetProperty("clients").EnumerateArray().Single().GetProperty("id").GetString()!;
+    }
+
+    private static async Task<CommandResult> Exec(HttpClient controller, string url, int timeoutSeconds = 1)
+    {
+        var res = await controller.PostAsJsonAsync(url, new { command = "hostname", timeoutSeconds });
+        return (await res.Content.ReadFromJsonAsync<CommandResult>(new JsonSerializerOptions { PropertyNameCaseInsensitive = true }))!;
+    }
+
+    private static async Task<string?> WaitForCommand(HttpClient machine)
+    {
+        for (var i = 0; i < 20; i++)
+        {
+            var poll = await (await machine.GetAsync("/api/poll")).Content.ReadFromJsonAsync<JsonElement>();
+            if (poll.GetProperty("command").ValueKind == JsonValueKind.String) return poll.GetProperty("command").GetString();
+            await Task.Delay(50);
+        }
+        return null;
+    }
+
     [Fact]
     public async Task TheDashboardListsThisMachinesAddresses()
     {

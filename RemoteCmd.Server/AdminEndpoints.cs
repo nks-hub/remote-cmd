@@ -80,6 +80,7 @@ public static class AdminEndpoints
     private sealed record CredentialBody(string? Name, string? Role);
     private sealed record ImportBody(string? Token, string? Name, string? Role);
     private sealed record PairBody(string? Name, int? TtlMinutes, string? ServerUrl);
+    private sealed record DisabledBody(bool Disabled);
 
     public static void Map(WebApplication app, RelayContext r)
     {
@@ -175,6 +176,28 @@ public static class AdminEndpoints
             session.Downloads.FailAll("Machine removed from the relay");
             r.Events.Add("admin", session.Name, "removed from the machine list");
             return Results.Ok();
+        });
+
+        // Switches a machine off without cutting it loose: it keeps polling and stays in the list, but
+        // no controller, MCP agent or dashboard command reaches it until it is switched back on.
+        app.MapPost("/api/admin/clients/{id}/disabled", (string id, DisabledBody body) =>
+        {
+            if (!r.Clients.TryGetValue(id, out var session)) return Results.NotFound(new { error = "No such machine" });
+            if (!r.Store.SetClientDisabled(id, body.Disabled)) return Results.Ok(new { disabled = body.Disabled });
+            if (body.Disabled)
+            {
+                // Work queued but not yet picked up would otherwise wait out its full timeout.
+                while (session.CommandQueue.TryDequeue(out var pending))
+                {
+                    pending.Cancelled = true;
+                    session.InFlight.TryRemove(pending.RequestId, out _);
+                    pending.Tcs.TrySetResult(new CommandResult { Output = "[ERROR] Machine disabled on the relay", ExitCode = -1 });
+                }
+                session.Uploads.FailAll("Machine disabled on the relay");
+                session.Downloads.FailAll("Machine disabled on the relay");
+            }
+            r.Events.Add("admin", session.Name, body.Disabled ? "disabled: commands and transfers refused" : "enabled again");
+            return Results.Ok(new { disabled = body.Disabled });
         });
 
         app.MapPost("/api/admin/password", (HttpContext ctx, PasswordBody body) =>

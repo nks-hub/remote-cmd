@@ -309,6 +309,8 @@ app.Use(async (context, next) =>
 app.MapGet("/api/poll", (HttpRequest req) =>
 {
     var session = TouchSession(req, clients, events);
+    // A disabled machine stays connected but is handed nothing, even what was queued just before.
+    if (store.IsClientDisabled(session.Id)) return Results.Ok(new { command = (string?)null });
     // Hand out one queued command per poll. Skip any that timed out before being delivered.
     while (session.CommandQueue.TryDequeue(out var pending))
     {
@@ -350,6 +352,7 @@ app.MapPost("/api/result", async (HttpRequest req) =>
 app.MapGet("/api/file-poll", (HttpRequest req) =>
 {
     var session = TouchSession(req, clients, events);
+    if (store.IsClientDisabled(session.Id)) return Results.Ok(new { e = (string?)null });
 
     var upload = session.Uploads.Lease();
     if (upload != null)
@@ -434,7 +437,7 @@ app.MapPost("/api/exec", async (HttpRequest req) =>
     if (body?.Command == null)
         return Results.BadRequest(new { error = "Missing command" });
 
-    var target = ResolveTarget(req, clients);
+    var target = ResolveTarget(req, clients, store);
     if (target.Error != null)
         return Results.Ok(new CommandResult { Output = $"[ERROR] {target.Error}", ExitCode = -1 });
 
@@ -558,6 +561,7 @@ object ClientList()
             lastPoll = c.LastPoll,
             secondsAgo = c.LastPoll == DateTime.MinValue ? -1 : (int)(DateTime.UtcNow - c.LastPoll).TotalSeconds,
             connected = c.IsConnected(),
+            disabled = store.IsClientDisabled(c.Id),
             running = c.InFlight.Count,
             queued = c.CommandQueue.Count,
             served = Interlocked.Read(ref c.CommandsServed),
@@ -580,7 +584,7 @@ app.MapPost("/api/upload", async (HttpRequest req) =>
     if (string.IsNullOrEmpty(remotePath))
         return Results.BadRequest(new { error = "Missing ?path= parameter" });
 
-    var target = ResolveTarget(req, clients);
+    var target = ResolveTarget(req, clients, store);
     if (target.Error != null)
         return Results.BadRequest(new { error = target.Error });
 
@@ -605,7 +609,7 @@ app.MapGet("/api/download", async (HttpRequest req) =>
     if (string.IsNullOrEmpty(remotePath))
         return Results.BadRequest(new { error = "Missing ?path= parameter" });
 
-    var target = ResolveTarget(req, clients);
+    var target = ResolveTarget(req, clients, store);
     if (target.Error != null)
         return Results.BadRequest(new { error = target.Error });
 
@@ -623,7 +627,7 @@ app.MapGet("/api/download", async (HttpRequest req) =>
 // afterwards so repeated screenshots do not fill the client's disk.
 app.MapPost("/api/screenshot", async (HttpRequest req) =>
 {
-    var target = ResolveTarget(req, clients);
+    var target = ResolveTarget(req, clients, store);
     if (target.Error != null)
         return Results.BadRequest(new { error = target.Error });
 
@@ -739,7 +743,7 @@ var relay = new RelayContext(store, storePath, pairings, adminGate, authThrottle
     unknownKeys, port, adminPort, noTls, certSha256);
 AdminEndpoints.Map(app, relay);
 McpEndpoints.Map(app, relay, new OAuthServer(store), new McpOps(
-    name => ResolveClient(name, clients), RunCommand, PushFile, PullFile, ClientList));
+    name => ResolveClient(name, clients, store), RunCommand, PushFile, PullFile, ClientList));
 
 // The dashboard on its own listener; on the relay port, a plain note of what this is and nothing
 // about who is connected.
@@ -972,13 +976,14 @@ static void CompleteCommand(ClientSession session, string? requestId, CommandRes
     pending.Tcs.TrySetResult(result);
 }
 
-static TargetResolution ResolveTarget(HttpRequest req, ConcurrentDictionary<string, ClientSession> clients)
-    => ResolveClient(req.Query["client"].FirstOrDefault(), clients);
+static TargetResolution ResolveTarget(HttpRequest req, ConcurrentDictionary<string, ClientSession> clients, ServerStore store)
+    => ResolveClient(req.Query["client"].FirstOrDefault(), clients, store);
 
 /// <summary>
 /// The session a command goes to: the named one, or the only connected one when no name is given.
+/// Machines switched off in the dashboard are refused by name and never picked implicitly.
 /// </summary>
-static TargetResolution ResolveClient(string? clientParam, ConcurrentDictionary<string, ClientSession> clients)
+static TargetResolution ResolveClient(string? clientParam, ConcurrentDictionary<string, ClientSession> clients, ServerStore store)
 {
     if (!string.IsNullOrEmpty(clientParam))
     {
@@ -986,17 +991,26 @@ static TargetResolution ResolveClient(string? clientParam, ConcurrentDictionary<
         if (s == null)
         {
             var available = string.Join(", ", clients.Values
-                .Where(c => c.IsConnected())
+                .Where(c => c.IsConnected() && !store.IsClientDisabled(c.Id))
                 .Select(c => $"{c.Name} ({c.Id[..Math.Min(8, c.Id.Length)]})"));
             var hint = string.IsNullOrEmpty(available) ? "no clients connected" : $"connected: {available}";
             return new TargetResolution { Error = $"Unknown client '{clientParam}' — {hint}" };
         }
+        if (store.IsClientDisabled(s.Id))
+            return new TargetResolution { Error = $"Client '{s.Name}' is disabled on the relay; enable it in the dashboard to use it" };
         if (!s.IsConnected()) return new TargetResolution { Error = $"Client '{s.Name}' not connected" };
         return new TargetResolution { Session = s };
     }
 
-    var connected = clients.Values.Where(c => c.IsConnected()).ToList();
-    if (connected.Count == 0) return new TargetResolution { Error = "No client connected" };
+    var online = clients.Values.Where(c => c.IsConnected()).ToList();
+    var connected = online.Where(c => !store.IsClientDisabled(c.Id)).ToList();
+    if (connected.Count == 0)
+        return new TargetResolution
+        {
+            Error = online.Count == 0
+                ? "No client connected"
+                : $"No enabled client connected ({string.Join(", ", online.Select(c => c.Name))} disabled on the relay)",
+        };
     if (connected.Count == 1) return new TargetResolution { Session = connected[0] };
 
     var names = string.Join(", ", connected.Select(c => c.Name));

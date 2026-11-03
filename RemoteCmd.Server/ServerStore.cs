@@ -54,6 +54,11 @@ public sealed class ServerSettings
     public List<Credential> Credentials { get; set; } = [];
     /// <summary>MCP clients that registered for OAuth; kept so they need not register again after a restart.</summary>
     public List<OAuthClient> OAuthClients { get; set; } = [];
+    /// <summary>
+    /// Session ids of machines switched off in the dashboard: they may stay connected, but the relay
+    /// sends them no commands, transfers or screenshots until they are switched back on.
+    /// </summary>
+    public List<string> DisabledClients { get; set; } = [];
 }
 
 /// <summary>
@@ -201,6 +206,26 @@ public sealed class ServerStore
     public OAuthClient? FindOAuthClient(string clientId)
     {
         lock (_gate) return _settings.OAuthClients.FirstOrDefault(c => c.ClientId == clientId);
+    }
+
+    public bool IsClientDisabled(string sessionId)
+    {
+        lock (_gate) return _settings.DisabledClients.Contains(sessionId);
+    }
+
+    /// <summary>Switches a machine off or back on. False when it was already in that state.</summary>
+    public bool SetClientDisabled(string sessionId, bool disabled)
+    {
+        lock (_gate)
+        {
+            var changed = disabled
+                ? !_settings.DisabledClients.Contains(sessionId)
+                : _settings.DisabledClients.Remove(sessionId);
+            if (!changed) return false;
+            if (disabled) _settings.DisabledClients.Add(sessionId);
+            Save();
+            return true;
+        }
     }
 
     public bool Revoke(string id)
