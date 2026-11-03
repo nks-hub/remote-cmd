@@ -335,9 +335,21 @@ function machineCard(c) {
   seen.dataset.id = c.id;
   foot.append(seen, el('span', '', c.queued ? `${c.served} done · ${c.queued} queued` : `${c.served} done`), el('span', 'grow'));
   if (c.connected && !c.disabled) foot.append(keyed(button('run', 'small', () => { $('target').value = c.name; $('cmd').focus(); }), `run-${c.id}`));
+  foot.append(keyed(button(c.disabled ? 'enable' : 'disable', c.disabled ? 'small' : 'small ghost', () => setDisabled(c)), `toggle-${c.id}-${c.disabled}`));
   foot.append(keyed(button('details', 'small ghost', () => openMachine(c.id)), `detail-${c.id}`));
   card.append(foot);
   return card;
+}
+
+/** Switches a machine off or back on; a disabled machine stays connected but takes no work from anyone. */
+async function setDisabled(c, fromDrawer = false) {
+  if (!c.disabled && !confirm(`Disable ${c.name}? It stays connected, but nothing can run commands or move files on it until you enable it again. Queued commands are cancelled.`)) return;
+  try {
+    await api(`/api/admin/clients/${encodeURIComponent(c.id)}/disabled`, { method: 'POST', body: { disabled: !c.disabled } });
+    if (fromDrawer) closeDrawer();
+    toast(c.disabled ? `${c.name} enabled` : `${c.name} disabled`);
+    tick();
+  } catch (err) { toast(err.message); }
 }
 
 function pickMachine(name) {
@@ -395,13 +407,7 @@ function openMachine(id) {
   }
   actions.append(button('Its activity', '', () => { closeDrawer(); pickMachine(c.name); $('activity').scrollIntoView(); }));
   actions.append(button('Pair again', '', () => { closeDrawer(); openPair(c.name); }));
-  actions.append(button(c.disabled ? 'Enable' : 'Disable', c.disabled ? 'primary' : 'danger', async () => {
-    if (!c.disabled && !confirm(`Disable ${c.name}? It stays connected, but nothing can run commands or move files on it until you enable it again. Queued commands are cancelled.`)) return;
-    try {
-      await api(`/api/admin/clients/${encodeURIComponent(c.id)}/disabled`, { method: 'POST', body: { disabled: !c.disabled } });
-      closeDrawer(); toast(c.disabled ? `${c.name} enabled` : `${c.name} disabled`); tick();
-    } catch (err) { toast(err.message); }
-  }));
+  actions.append(button(c.disabled ? 'Enable' : 'Disable', c.disabled ? 'primary' : 'danger', () => setDisabled(c, true)));
   if (!c.connected) {
     actions.append(button('Remove from list', 'danger', async () => {
       if (!confirm(`Remove ${c.name} from the list? If it comes back, it reappears on its own. To lock it out, revoke its key in Access.`)) return;
