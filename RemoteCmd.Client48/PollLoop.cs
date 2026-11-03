@@ -36,7 +36,9 @@ namespace RemoteCmd.Client48
                      + "&v=" + Uri.EscapeDataString(typeof(PollLoop).Assembly.GetName().Version.ToString(3))
                      + "&host=" + Uri.EscapeDataString(Environment.MachineName)
                      + "&user=" + Uri.EscapeDataString(Environment.UserName)
-                     + "&os=" + Uri.EscapeDataString(Environment.OSVersion.VersionString + " (.NET Framework)");
+                     + "&os=" + Uri.EscapeDataString(Environment.OSVersion.VersionString + " (.NET Framework)")
+                     + "&sh=" + Uri.EscapeDataString(ShellInfo.Summary())
+                     + "&exec=" + Uri.EscapeDataString(ShellInfo.Exec);
 
             var pollUrl = baseUrl + "/api/poll" + qs;
             var resultUrl = baseUrl + "/api/result" + qs;
@@ -161,8 +163,10 @@ namespace RemoteCmd.Client48
                 {
                     process.StartInfo = new ProcessStartInfo
                     {
-                        FileName = "powershell.exe",
-                        Arguments = "-NoProfile -NonInteractive -Command \"" + command.Replace("\"", "\\\"") + "\"",
+                        FileName = ShellInfo.HasPowerShell ? "powershell.exe" : "cmd.exe",
+                        Arguments = ShellInfo.HasPowerShell
+                            ? "-NoProfile -NonInteractive -Command \"" + command.Replace("\"", "\\\"") + "\""
+                            : "/c " + command,
                         RedirectStandardOutput = true,
                         RedirectStandardError = true,
                         UseShellExecute = false,

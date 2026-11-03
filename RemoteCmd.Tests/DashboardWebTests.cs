@@ -147,6 +147,22 @@ public class DashboardWebTests
         Assert.Equal(1, machine.GetProperty("attempts").GetInt32());
     }
 
+    /// <summary>The dashboard shows which shells a machine has and which one runs its commands.</summary>
+    [Fact]
+    public async Task AMachineReportsItsShells()
+    {
+        using var relay = new DashboardRelay();
+        var token = await relay.IssueToken("client", "reactos-box");
+        var http = relay.CreateClient();
+        http.DefaultRequestHeaders.Add("X-Token", token);
+        await http.GetAsync("/api/poll?clientId=abc&name=reactos-box&sh=cmd%2010.0.26100.1&exec=cmd");
+
+        var (_, list, _) = await relay.Dashboard("GET", "/api/clients");
+        var machine = JsonDocument.Parse(list).RootElement.GetProperty("clients").EnumerateArray().Single();
+        Assert.Equal("cmd 10.0.26100.1", machine.GetProperty("shells").GetString());
+        Assert.Equal("cmd", machine.GetProperty("execShell").GetString());
+    }
+
     [Fact]
     public async Task AnOnlineMachineCannotBeRemovedFromTheList()
     {

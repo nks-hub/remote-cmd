@@ -262,7 +262,8 @@ public sealed class PollWorker : BackgroundService
     }
 
     internal static string DefaultShell()
-        => RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "powershell.exe" : "/bin/bash";
+        => !RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "/bin/bash"
+            : ShellInfo.HasPowerShell ? "powershell.exe" : "cmd.exe";
 
     private static async Task<(string output, int exitCode)> ExecuteCommand(string command, int timeoutSeconds, CancellationToken ct)
     {
@@ -273,8 +274,10 @@ public sealed class PollWorker : BackgroundService
             process.StartInfo = isWindows
                 ? new ProcessStartInfo
                 {
-                    FileName = "powershell.exe",
-                    Arguments = $"-NoProfile -NonInteractive -Command \"{command.Replace("\"", "\\\"")}\"",
+                    FileName = ShellInfo.HasPowerShell ? "powershell.exe" : "cmd.exe",
+                    Arguments = ShellInfo.HasPowerShell
+                        ? $"-NoProfile -NonInteractive -Command \"{command.Replace("\"", "\\\"")}\""
+                        : $"/c {command}",
                     RedirectStandardInput = true,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,

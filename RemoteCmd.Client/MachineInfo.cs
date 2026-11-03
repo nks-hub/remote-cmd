@@ -14,7 +14,9 @@ public static class MachineInfo
         Pair("v", VersionInfo.Version),
         Pair("host", Environment.MachineName),
         Pair("user", Environment.UserName),
-        Pair("os", $"{RuntimeInformation.OSDescription} {RuntimeInformation.OSArchitecture}".Trim())));
+        Pair("os", $"{RuntimeInformation.OSDescription} {RuntimeInformation.OSArchitecture}".Trim()),
+        Pair("sh", ShellInfo.Summary()),
+        Pair("exec", ShellInfo.Exec)));
 
     public static string Query() => Cached.Value;
 

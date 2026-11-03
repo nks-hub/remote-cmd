@@ -67,6 +67,26 @@ function system(os) {
   return s.split('#')[0].slice(0, 56);
 }
 
+const SHELL_NAMES = { powershell: 'Windows PowerShell', pwsh: 'PowerShell (pwsh)', cmd: 'cmd.exe', bash: 'bash' };
+
+/** Shells a client found, "powershell 5.1.26100.1|cmd 10.0.26100.1" → [{ name, version }]. */
+function shellsOf(c) {
+  return (c.shells || '').split('|').filter(Boolean).map((s) => {
+    const i = s.indexOf(' ');
+    return i < 0 ? { name: s, version: '' } : { name: s.slice(0, i), version: s.slice(i + 1) };
+  });
+}
+const shellLabel = (s) => `${SHELL_NAMES[s.name] || s.name}${s.version ? ` ${s.version}` : ''}`;
+
+/** Where commands run on this machine, and what is missing when it falls back (older clients report nothing). */
+function commandShell(c) {
+  const list = shellsOf(c);
+  if (!c.execShell && !list.length) return '';
+  const used = list.find((s) => s.name === c.execShell) || { name: c.execShell, version: '' };
+  const missing = /windows/i.test(c.os || '') && !list.some((s) => s.name === 'powershell' || s.name === 'pwsh');
+  return `${shellLabel(used)}${missing ? ' · no PowerShell here' : ''}`;
+}
+
 let toastTimer = 0;
 function toast(text) {
   let t = document.querySelector('.toast');
@@ -268,7 +288,7 @@ function renderMachines() {
   $('noMachines').hidden = all.length > 0;
   $('machFilter').hidden = all.length === 0;
 
-  paint($('ports'), [state.show, state.picked, shown.map((c) => [c.id, c.name, c.host, c.user, c.os, c.version, c.outdated, c.connected, c.state, c.running, c.queued, c.served, c.ip])],
+  paint($('ports'), [state.show, state.picked, shown.map((c) => [c.id, c.name, c.host, c.user, c.os, c.shells, c.execShell, c.version, c.outdated, c.connected, c.state, c.running, c.queued, c.served, c.ip])],
     () => shown.map(machineCard));
   for (const node of document.querySelectorAll('#ports .seen')) {
     const c = all.find((x) => x.id === node.dataset.id);
@@ -305,6 +325,8 @@ function machineCard(c) {
   card.append(head);
   card.append(el('div', 'host', c.host ? [c.host, account(c)].filter(Boolean).join(' · ') : 'client older than 2.6, reports no host'));
   card.append(el('div', 'sys', [system(c.os) || 'system unknown', c.ip].filter(Boolean).join(' · ')));
+  const shell = commandShell(c);
+  if (shell) card.append(el('div', 'sys', `commands run in ${shell}`));
   const foot = el('div', 'foot');
   foot.append(el('span', c.outdated || !c.version ? 'tag old' : 'tag', c.version ? `v${c.version}${c.outdated ? ' ↑' : ''}` : 'old client'));
   const seen = el('span', 'seen', c.connected ? `seen ${ago(c.secondsAgo)}` : `last seen ${ago(c.secondsAgo)}`);
@@ -340,7 +362,9 @@ function openMachine(id) {
   body.push(tags);
   const kv = el('dl', 'kv');
   for (const [k, v] of [
-    ['Host', c.host || '—'], ['Runs as', account(c) || '—'], ['System', c.os || '—'], ['Address', c.ip || '—'],
+    ['Host', c.host || '—'], ['Runs as', account(c) || '—'], ['System', c.os || '—'],
+    ['Commands run in', commandShell(c) || 'unknown (client older than 2.8)'],
+    ['Shells found', shellsOf(c).map(shellLabel).join(', ') || '—'], ['Address', c.ip || '—'],
     ['Key', c.token || '—'], ['Online for', c.connected ? dur(c.connectedForSeconds) : '—'],
     ['Last seen', ago(c.secondsAgo)], ['Commands done', String(c.served)], ['Queued / running', `${c.queued} / ${c.running}`],
   ]) kv.append(el('dt', '', k), el('dd', '', v));

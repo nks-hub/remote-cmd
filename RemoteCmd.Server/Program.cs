@@ -566,6 +566,8 @@ object ClientList()
             host = c.HostName,
             user = c.User,
             os = c.Os,
+            shells = c.Shells,
+            execShell = c.ExecShell,
             version = c.Version,
             outdated = releases.IsOutdated(c.Version),
         }).ToList();
@@ -894,6 +896,8 @@ static ClientSession TouchSession(HttpRequest req, ConcurrentDictionary<string, 
     if (q["host"].FirstOrDefault() is { Length: > 0 } host) session.HostName = Clip(host);
     if (q["user"].FirstOrDefault() is { Length: > 0 } user) session.User = Clip(user);
     if (q["os"].FirstOrDefault() is { Length: > 0 } os) session.Os = Clip(os);
+    if (q["sh"].FirstOrDefault() is { Length: > 0 } shells) session.Shells = Clip(shells);
+    if (q["exec"].FirstOrDefault() is { Length: > 0 } execShell) session.ExecShell = Clip(execShell);
     session.LastPoll = DateTime.UtcNow;
     return session;
 }
@@ -1030,6 +1034,8 @@ public class ClientSession
     public string HostName { get; set; } = "";
     public string User { get; set; } = "";
     public string Os { get; set; } = "";
+    public string Shells { get; set; } = "";      // "powershell 5.1.26100.1|cmd 10.0.26100.1": shells found on the machine
+    public string ExecShell { get; set; } = "";   // the one commands actually run in
     public string RemoteIp { get; set; } = "";    // address the client last polled from
     public long CommandsServed;   // total results delivered; mutable field for Interlocked
 
