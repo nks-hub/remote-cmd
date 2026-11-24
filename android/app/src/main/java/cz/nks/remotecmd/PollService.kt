@@ -36,11 +36,14 @@ class PollService : Service() {
         prefs.enabled = true
 
         val name = prefs.name
+        val server = prefs.server
         val pc = PollClient(
-            server = prefs.server,
+            server = server,
             token = prefs.token,
             name = name,
             clientId = prefs.clientId(name),
+            certPin = prefs.certPin(server),
+            onCertPinned = { pin -> prefs.setCertPin(server, pin) },
             log = { line -> onLog(line) },
         )
         client = pc

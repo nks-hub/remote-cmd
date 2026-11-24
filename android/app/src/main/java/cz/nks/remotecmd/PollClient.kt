@@ -4,24 +4,28 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
-import java.security.cert.X509Certificate
 import javax.net.ssl.HostnameVerifier
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLContext
-import javax.net.ssl.X509TrustManager
 
 /**
  * Polling client mirroring the .NET RemoteCmd client: fetches commands and file
  * jobs from the relay, runs them as root, and posts results back. AES-256-GCM on
- * every payload; self-signed TLS is trusted explicitly.
+ * every payload; the relay's self-signed TLS certificate is pinned on first use.
  */
 class PollClient(
     private val server: String,
     private val token: String,
     private val name: String,
     private val clientId: String,
+    certPin: String?,
+    onCertPinned: (String) -> Unit,
     private val log: (String) -> Unit,
 ) {
+    private val sslFactory = SSLContext.getInstance("TLS").apply {
+        init(null, arrayOf(PinningTrustManager(certPin, onCertPinned)), java.security.SecureRandom())
+    }.socketFactory
+
     @Volatile var running = true
 
     private val baseUrl: String =
@@ -113,7 +117,8 @@ class PollClient(
     private fun open(urlStr: String): HttpURLConnection {
         val conn = URL(urlStr).openConnection() as HttpURLConnection
         if (conn is HttpsURLConnection) {
-            conn.sslSocketFactory = trustAllFactory
+            conn.sslSocketFactory = sslFactory
+            // The pinned certificate identifies the relay; its self-signed name never matches the host.
             conn.hostnameVerifier = HostnameVerifier { _, _ -> true }
         }
         conn.connectTimeout = 10_000
@@ -162,15 +167,5 @@ class PollClient(
 
     companion object {
         private fun enc(s: String): String = java.net.URLEncoder.encode(s, "UTF-8")
-
-        private val trustAllFactory by lazy {
-            val tm = object : X509TrustManager {
-                override fun checkClientTrusted(c: Array<out X509Certificate>?, a: String?) {}
-                override fun checkServerTrusted(c: Array<out X509Certificate>?, a: String?) {}
-                override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
-            }
-            SSLContext.getInstance("TLS").apply { init(null, arrayOf(tm), java.security.SecureRandom()) }
-                .socketFactory
-        }
     }
 }

@@ -27,6 +27,11 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("enabled", false)
         set(v) = sp.edit().putBoolean("enabled", v).apply()
 
+    /** SHA-256 of the relay's TLS certificate, pinned on the first connection to that server URL. */
+    fun certPin(server: String): String? = sp.getString("certPin_$server", null)
+
+    fun setCertPin(server: String, pin: String) = sp.edit().putString("certPin_$server", pin).apply()
+
     /** Stable client id scoped per name, so multiple devices/aliases don't collide. */
     fun clientId(forName: String): String {
         val key = "clientId_" + forName.replace(Regex("[^A-Za-z0-9_-]"), "_")
