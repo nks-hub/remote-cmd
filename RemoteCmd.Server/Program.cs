@@ -19,7 +19,14 @@ if (cli.Verb != null) return await ServerCli.RunAsync(cli);
 // Key under which the auth middleware stashes the credential that matched, for the handlers to pick up.
 const string CredentialItemKey = "remotecmd.credential";
 
-var builder = WebApplication.CreateBuilder(args);
+// appsettings.json ships next to the executable and nothing rereads it while the relay runs. The
+// default looks for it in the working directory and watches every folder below that for changes;
+// a service starts in the filesystem root, so the file was not found and the whole disk was watched.
+var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+{
+    Args = [.. args, "--hostBuilder:reloadConfigOnChange=false"],
+    ContentRootPath = AppContext.BaseDirectory,
+});
 builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 200_000_000);
 // No-ops unless the service manager started the process, so console runs are unaffected.
 builder.Services.AddWindowsService(o => o.ServiceName = "RemoteCmdServer");

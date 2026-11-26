@@ -84,7 +84,11 @@ static int InstallService(string serviceName, string configPath, ClientConfig co
 
 static async Task RunHost(ClientConfig config, bool dashboard)
 {
-    var builder = Host.CreateApplicationBuilder();
+    // Not the default builder: that one looks for appsettings.json in the working directory and
+    // watches every folder below it for changes. A service starts in the filesystem root, so the
+    // client was told about each file written anywhere on the machine and walked every renamed
+    // folder to its end - which, with links leading back into the folder, it never reached.
+    var builder = Host.CreateEmptyApplicationBuilder(null);
     builder.Services.AddSingleton(config);
     builder.Services.AddHostedService<PollWorker>();
 

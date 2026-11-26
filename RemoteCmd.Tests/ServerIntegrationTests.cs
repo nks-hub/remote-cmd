@@ -3,6 +3,8 @@ using System.Net.Http.Json;
 using System.Text;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using RemoteCmd.Shared;
 using Xunit;
@@ -38,6 +40,20 @@ public class ServerIntegrationTests : IClassFixture<RemoteCmdFactory>
     {
         var res = await _http.GetAsync("/api/status?token=wrong");
         Assert.Equal(HttpStatusCode.Unauthorized, res.StatusCode);
+    }
+
+    /// <summary>
+    /// Reloading settings on change means watching every folder below the content root, and for a
+    /// relay started by a service manager that root was the whole filesystem.
+    /// </summary>
+    [Fact]
+    public void SettingsFiles_AreNotWatchedForChanges()
+    {
+        var configuration = (IConfigurationRoot)_factory.Services.GetRequiredService<IConfiguration>();
+        var files = configuration.Providers.OfType<FileConfigurationProvider>().ToList();
+
+        Assert.NotEmpty(files);
+        Assert.All(files, file => Assert.False(file.Source.ReloadOnChange, $"{file.Source.Path} is reloaded on change"));
     }
 
     [Fact]
