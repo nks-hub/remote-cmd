@@ -38,6 +38,23 @@ public sealed class PollWorker : BackgroundService
     /// </summary>
     public TimeSpan PollTimeout { get; init; } = TimeSpan.FromSeconds(30);
 
+    /// <summary>
+    /// The window in which the loop has to make at least two passes, or the process gives up. A
+    /// failed poll is a pass too, and with the relay unreachable there is still one a minute, so
+    /// only a loop that is stuck or barely moving trips this. Exiting then hands the problem to the
+    /// service manager, which starts a fresh client.
+    /// </summary>
+    public TimeSpan StallTimeout { get; init; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>What to do about a stalled loop. Tests replace it, as they cannot exit the process.</summary>
+    public Action<string> OnStall { get; init; } = message =>
+    {
+        Console.Error.WriteLine(message);
+        Environment.Exit(1);
+    };
+
+    private long _passes;
+
     public PollWorker(ClientConfig config, ILogger<PollWorker> log, ClientStats? stats = null)
     {
         _config = config;
@@ -76,9 +93,14 @@ public sealed class PollWorker : BackgroundService
         _log.LogInformation("Remote CMD Client started. Server={Server} Name={Name} Id={Id} Shell={Shell}",
             baseUrl, _config.Name, clientId, DefaultShell());
 
+        // A thread of its own, not a timer: timers fire on the thread pool, and a pool with no free
+        // thread is one of the ways the loop stalls.
+        new Thread(() => WatchForStall(stoppingToken)) { IsBackground = true, Name = "Poll watchdog" }.Start();
+
         var retryDelay = 1;
         while (!stoppingToken.IsCancellationRequested)
         {
+            Interlocked.Increment(ref _passes);
             try
             {
                 var gotWork = false;
@@ -142,6 +164,28 @@ public sealed class PollWorker : BackgroundService
         }
 
         _log.LogInformation("Remote CMD Client stopped.");
+    }
+
+    /// <summary>
+    /// Ends the process when the loop made fewer than two passes in <see cref="StallTimeout"/>. The
+    /// window is a number of its own checks, not a reading of the clock, so a machine that slept
+    /// does not look like a stall.
+    /// </summary>
+    private void WatchForStall(CancellationToken stopping)
+    {
+        var passesAtCheck = new long[10];
+        for (var check = 0; !stopping.WaitHandle.WaitOne(StallTimeout / passesAtCheck.Length); check++)
+        {
+            var passes = Interlocked.Read(ref _passes);
+            var windowAgo = passesAtCheck[check % passesAtCheck.Length];
+            passesAtCheck[check % passesAtCheck.Length] = passes;
+            if (check < passesAtCheck.Length || passes - windowAgo >= 2) continue;
+
+            OnStall($"{DateTime.Now:HH:mm:ss} [FATAL] The poll loop made {passes - windowAgo} passes in {StallTimeout.TotalSeconds:0} s " +
+                    $"(working set {Environment.WorkingSet / (1024 * 1024)} MB, {ThreadPool.ThreadCount} pool threads, " +
+                    $"{ThreadPool.PendingWorkItemCount} queued). Exiting so the service manager restarts the client.");
+            return;
+        }
     }
 
     /// <summary>

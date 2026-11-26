@@ -55,6 +55,35 @@ public class PollWorkerTests
     }
 
     /// <summary>
+    /// Nothing noticed a loop that had stopped running: the process stayed up without a word and
+    /// the relay showed the machine as gone until somebody killed it. A loop that makes no pass is
+    /// now reported, which outside of tests ends the process so the service manager restarts it.
+    /// </summary>
+    [Fact]
+    public async Task A_loop_that_stops_running_is_reported()
+    {
+        // Accepts the connection and never answers, with no poll timeout to rescue the loop.
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var stalled = new TaskCompletionSource<string>();
+
+        var worker = new PollWorker(new ClientConfig($"http://127.0.0.1:{port}", "test-token", "stall-test"), NullLogger<PollWorker>.Instance)
+        {
+            PollTimeout = Timeout.InfiniteTimeSpan,
+            StallTimeout = TimeSpan.FromSeconds(1),
+            OnStall = message => stalled.TrySetResult(message),
+        };
+        await worker.StartAsync(CancellationToken.None);
+        var reported = await Task.WhenAny(stalled.Task, Task.Delay(TimeSpan.FromSeconds(15))) == stalled.Task;
+        await worker.StopAsync(CancellationToken.None);
+        listener.Stop();
+
+        Assert.True(reported, "a loop stuck in a single poll was never reported");
+        Assert.Contains("0 passes", await stalled.Task);
+    }
+
+    /// <summary>
     /// A command's output pipes were read to the end and then left for a finalizer to close. A
     /// client allocates little and so collects rarely; in between, every command held two descriptors.
     /// </summary>
