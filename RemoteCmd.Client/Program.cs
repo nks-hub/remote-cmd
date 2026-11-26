@@ -100,6 +100,11 @@ static async Task RunHost(ClientConfig config, bool dashboard)
         ? KeepAwake.Start(message => Console.Error.WriteLine(message))
         : null;
 
+    // The host winds down on the thread pool, so a process that is wedged there never gets to act
+    // on a stop request. A deadline on a thread of its own ends it regardless.
+    using var stopDeadline = PosixSignalRegistration.Create(PosixSignal.SIGTERM, _ =>
+        new Thread(() => { Thread.Sleep(5_000); Environment.Exit(0); }) { IsBackground = true }.Start());
+
     if (dashboard && !Console.IsOutputRedirected)
     {
         // Split-screen console: a fixed stats header + a scrolling log fed by ILogger.
