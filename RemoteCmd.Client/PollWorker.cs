@@ -109,7 +109,8 @@ public sealed class PollWorker : BackgroundService
 
                 // 1. Poll for a command. Never block the loop on execution: run it on its own task
                 //    and post the result (with its requestId) when it finishes, so the heartbeat
-                //    keeps ticking and further commands are picked up concurrently.
+                //    keeps ticking and further commands are picked up concurrently. Task.Run, as
+                //    starting the process is synchronous and a slow spawn would hold the loop too.
                 var response = await http.GetFromJsonAsync<PollResponse>(pollUrl, poll.Token);
                 _stats?.MarkPoll();
                 if (response?.Command != null)
@@ -121,7 +122,7 @@ public sealed class PollWorker : BackgroundService
                         requestId is null ? "" : " " + requestId[..Math.Min(8, requestId.Length)], command);
                     // A relay older than this field sends nothing, and Clamp turns that into the default.
                     var timeoutSeconds = ExecLimits.Clamp(response.TimeoutSeconds);
-                    _ = HandleCommandAsync(http, resultUrl, command, requestId, timeoutSeconds, stoppingToken);
+                    _ = Task.Run(() => HandleCommandAsync(http, resultUrl, command, requestId, timeoutSeconds, stoppingToken), CancellationToken.None);
                 }
 
                 // 2. Poll for a file transfer, also dispatched off-loop (single-flight) so a large
