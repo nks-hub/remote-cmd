@@ -265,7 +265,7 @@ public sealed class PollWorker : BackgroundService
         => !RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "/bin/bash"
             : ShellInfo.HasPowerShell ? "powershell.exe" : "cmd.exe";
 
-    private static async Task<(string output, int exitCode)> ExecuteCommand(string command, int timeoutSeconds, CancellationToken ct)
+    public static async Task<(string output, int exitCode)> ExecuteCommand(string command, int timeoutSeconds, CancellationToken ct)
     {
         try
         {
@@ -302,8 +302,8 @@ public sealed class PollWorker : BackgroundService
 
             // Pump the pipes incrementally. ReadToEnd would hang forever when a detached grandchild
             // inherits the write end and keeps it open (the classic `nohup long_running &` case).
-            var stdout = new StringBuilder();
-            var stderr = new StringBuilder();
+            var stdout = new Capture();
+            var stderr = new Capture();
             var outPump = PumpAsync(process.StandardOutput, stdout, ct);
             var errPump = PumpAsync(process.StandardError, stderr, ct);
 
@@ -318,9 +318,8 @@ public sealed class PollWorker : BackgroundService
             // Wait for the pipes to drain, but only briefly — a detached child may hold them open.
             await Task.WhenAny(Task.WhenAll(outPump, errPump), Task.Delay(OutputGraceMs, ct));
 
-            string outStr, errStr;
-            lock (stdout) outStr = stdout.ToString();
-            lock (stderr) errStr = stderr.ToString();
+            var outStr = stdout.Take();
+            var errStr = stderr.Take();
 
             var combined = outStr;
             if (!string.IsNullOrWhiteSpace(errStr))
@@ -346,12 +345,32 @@ public sealed class PollWorker : BackgroundService
     }
 
     /// <summary>
-    /// Copy a redirected stream into <paramref name="sink"/> until EOF, tolerating pipe teardown.
+    /// What one stream of a command has written so far. Taking the text ends the collecting: a
+    /// detached child can keep the pipe open for days, and its output is then read and dropped
+    /// instead of being held for a result nobody will ask for.
+    /// </summary>
+    public sealed class Capture
+    {
+        public StringBuilder? Text = new();
+
+        public string Take()
+        {
+            lock (this)
+            {
+                var text = Text?.ToString() ?? "";
+                Text = null;
+                return text;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Copy a redirected stream into <paramref name="capture"/> until EOF, tolerating pipe teardown.
     /// Keeps at most <see cref="MaxStreamChars"/>: a chatty command left running for an hour would
     /// otherwise grow this buffer until the machine we are a guest on runs out of memory. The pipe
     /// is still drained after the cap, so the child never blocks on a full one.
     /// </summary>
-    private static async Task PumpAsync(StreamReader reader, StringBuilder sink, CancellationToken ct)
+    public static async Task PumpAsync(StreamReader reader, Capture capture, CancellationToken ct)
     {
         var buffer = new char[4096];
         try
@@ -359,9 +378,10 @@ public sealed class PollWorker : BackgroundService
             int n;
             while ((n = await reader.ReadAsync(buffer.AsMemory(), ct)) > 0)
             {
-                lock (sink)
+                lock (capture)
                 {
-                    if (sink.Length >= MaxStreamChars) continue;
+                    var sink = capture.Text;
+                    if (sink is null || sink.Length >= MaxStreamChars) continue;
                     var room = Math.Min(n, MaxStreamChars - sink.Length);
                     sink.Append(buffer, 0, room);
                     if (sink.Length >= MaxStreamChars) sink.Append(StreamCappedNote);
@@ -370,6 +390,13 @@ public sealed class PollWorker : BackgroundService
         }
         catch (OperationCanceledException) { }
         catch (Exception) { /* pipe closed / process disposed */ }
+        finally
+        {
+            // Disposing the Process leaves a stream alone once it has been handed out, so our end of
+            // the pipe is closed here instead of whenever a finalizer gets to it. An idle client
+            // collects rarely, and until then every command held on to two descriptors.
+            reader.Dispose();
+        }
     }
 
     /// <summary>Wait for exit up to <paramref name="timeoutMs"/>. Returns false on timeout; rethrows real cancellation.</summary>

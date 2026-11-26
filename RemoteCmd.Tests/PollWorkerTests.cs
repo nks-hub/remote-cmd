@@ -1,3 +1,4 @@
+using System.IO.Pipes;
 using System.Net;
 using System.Net.Sockets;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -51,5 +52,56 @@ public class PollWorkerTests
         await serving;
 
         Assert.True(Volatile.Read(ref polls) >= 2, $"the worker stopped polling after the timed-out request ({polls} polls)");
+    }
+
+    /// <summary>
+    /// A command's output pipes were read to the end and then left for a finalizer to close. A
+    /// client allocates little and so collects rarely; in between, every command held two descriptors.
+    /// </summary>
+    [Fact]
+    public async Task Commands_do_not_leave_their_output_pipes_open()
+    {
+        if (OperatingSystem.IsWindows()) return; // handles are closed by the finalizer there, at no fixed time
+
+        await PollWorker.ExecuteCommand("echo warm-up", 30, CancellationToken.None);
+        var before = Directory.GetFileSystemEntries("/dev/fd").Length;
+        for (var i = 0; i < 20; i++)
+        {
+            var (output, exitCode) = await PollWorker.ExecuteCommand("echo hello", 30, CancellationToken.None);
+            Assert.Equal((0, "hello"), (exitCode, output));
+        }
+        var after = Directory.GetFileSystemEntries("/dev/fd").Length;
+
+        Assert.True(after - before < 10, $"20 commands left {after - before} descriptors open");
+    }
+
+    /// <summary>
+    /// A detached child keeps the command's pipe open after the command has returned. What it writes
+    /// from then on must be read, so it never blocks on a full pipe, but not kept: nobody will ask
+    /// for it, and one such child per build added up over a week.
+    /// </summary>
+    [Fact]
+    public async Task Output_written_after_the_result_was_taken_is_dropped()
+    {
+        var child = new AnonymousPipeServerStream(PipeDirection.Out);
+        var reader = new StreamReader(new AnonymousPipeClientStream(PipeDirection.In, child.ClientSafePipeHandle));
+        var capture = new PollWorker.Capture();
+        var pump = PollWorker.PumpAsync(reader, capture, CancellationToken.None);
+
+        await child.WriteAsync("before"u8.ToArray());
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (DateTime.UtcNow < deadline)
+        {
+            lock (capture) if (capture.Text!.Length == 6) break;
+            await Task.Delay(20);
+        }
+        Assert.Equal("before", capture.Take());
+
+        await child.WriteAsync("after"u8.ToArray());
+        child.Dispose();
+        await pump.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Null(capture.Text);
+        Assert.Throws<ObjectDisposedException>(() => reader.Peek());
     }
 }
