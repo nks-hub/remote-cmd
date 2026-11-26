@@ -66,6 +66,40 @@ jobs:
           done
           exit 1
 
+      # A service starts in the filesystem root. The client once watched every folder below its
+      # working directory for a settings file, so file activity anywhere on the machine cost it most
+      # of a core, and a renamed folder with links leading back into itself cost it its memory.
+      - name: A busy disk leaves the client alone
+        run: |
+          PID=$(pgrep -f 'RemoteCmd.Client --service' | head -1)
+          cpu() { ps -o time= -p "$PID" | python3 -c "import sys; print(int(sum(float(p) * 60 ** i for i, p in enumerate(reversed(sys.stdin.read().strip().split(':'))))))"; }
+          before=$(cpu)
+          python3 - <<'EOF'
+          import os, shutil, time
+          root = "/tmp/remotecmd-ci"
+          end, n = time.time() + 20, 0
+          while time.time() < end:
+              d = "%s/tree%d" % (root, n)
+              os.makedirs(d + "/a")
+              for i in range(2000):
+                  open("%s/a/f%d" % (d, i), "w").close()
+              os.rename(d, d + ".moved")
+              shutil.rmtree(d + ".moved")
+              n += 1
+          os.makedirs(root + "/looped/a")
+          os.symlink("..", root + "/looped/a/up1")
+          os.symlink("..", root + "/looped/a/up2")
+          os.rename(root + "/looped", root + "/looped.moved")
+          EOF
+          sleep 20
+          used=$(( $(cpu) - before ))
+          rss=$(( $(ps -o rss= -p "$PID") / 1024 ))
+          echo "client: ${used} s of CPU and ${rss} MB resident after 40 s of disk activity"
+          test "$used" -lt 5
+          test "$rss" -lt 300
+          curl -sk -m 30 -H "X-Token: $TOKEN" -H 'Content-Type: application/json' \
+            'https://localhost:7890/api/exec?client=ci-client' -d '{"command":"echo still-ok"}' | grep -q still-ok
+
       - name: Settings files are private
         run: |
           sudo ls -l /etc/remotecmd/
